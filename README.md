@@ -159,6 +159,30 @@ Nothing here distributes a built kernel: CI publishes the comparison tables,
 the metrics and the snapshots, and keeps its build cache inside the GitHub
 Actions cache.
 
+## The vmalloc path, unresolved
+
+The caches SPL grows through `__vmalloc` are a third route that neither patch
+above touches. `vm_area_alloc_pages()` tries a high order before falling back to
+single pages and derives the flags for that attempt from the caller, dropping
+`__GFP_DIRECT_RECLAIM` but keeping `__GFP_KSWAPD_RECLAIM`. So a cache whose slab
+is large enough wakes kswapd whenever the order it wanted is gone, and on this
+module that runs the ARC shrinker, freeing what the cache was being grown to
+hold. See openzfs/zfs#18893.
+
+`patches/zfs/no-kswapd-wake.patch` clears that one flag in `kv_alloc`.
+
+**It is not confirmed, and the trigger may not be common.** No measurement here
+shows it changing anything. Filling memory until high orders were nearly gone
+still left `pgscan_kswapd` at zero, and reading `/proc/spl/kmem/slab` on a
+machine with 783 MiB of these caches showed why: the caches that are actually
+large have slabs of four to thirty two pages, an order two to five request that
+never fails. The one cache whose slab reaches 4096 pages was empty.
+
+So a lot of vmalloc traffic from ZFS is not the same thing as a lot of high
+order requests from ZFS, and only the second drives the loop. That distinction
+is what `packages.kvmem` exists to test, once someone finds a configuration
+where the large slabs are actually populated.
+
 ## Caveats
 
 - OpenZFS 2.4.3 refuses at configure time to build against a kernel newer than

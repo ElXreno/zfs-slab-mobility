@@ -32,6 +32,8 @@ type snapMetrics struct {
 	types    map[string]uint64
 	arcSize  uint64
 	slabAll  uint64
+	kswapd   uint64
+	direct   uint64
 }
 
 func measure(f *frame) snapMetrics {
@@ -46,6 +48,8 @@ func measure(f *frame) snapMetrics {
 		types:   map[string]uint64{},
 		arcSize: f.arc["size"],
 		slabAll: f.mem["Slab"],
+		kswapd:  f.vm["pgscan_kswapd"],
+		direct:  f.vm["pgscan_direct"],
 	}
 
 	for i, c := range f.m.counts {
@@ -80,16 +84,18 @@ func measure(f *frame) snapMetrics {
 
 func (m snapMetrics) fields() map[string]float64 {
 	out := map[string]float64{
-		"mixed":     float64(m.mixed),
-		"hostage":   float64(m.hostage),
-		"pinned":    float64(m.pinned),
-		"slab_in":   float64(m.slabIn),
-		"arc_in":    float64(m.arcIn),
-		"order10":   float64(m.order10),
-		"unusable":  m.unusable,
-		"arc_size":  float64(m.arcSize),
-		"slab_size": float64(m.slabAll),
-		"blocks":    float64(m.nblocks),
+		"mixed":       float64(m.mixed),
+		"hostage":     float64(m.hostage),
+		"pinned":      float64(m.pinned),
+		"slab_in":     float64(m.slabIn),
+		"arc_in":      float64(m.arcIn),
+		"order10":     float64(m.order10),
+		"unusable":    m.unusable,
+		"arc_size":    float64(m.arcSize),
+		"slab_size":   float64(m.slabAll),
+		"kswapd_scan": float64(m.kswapd),
+		"direct_scan": float64(m.direct),
+		"blocks":      float64(m.nblocks),
 	}
 	for name, n := range m.types {
 		out["blocks_"+strings.ToLower(name)] = float64(n)
@@ -115,6 +121,8 @@ var metricRows = []struct {
 	{key: "blocks_unmovable", title: "Unmovable blocks"},
 	{key: "blocks_movable", title: "Movable blocks"},
 	{key: "blocks_reclaimable", title: "Reclaimable blocks", gapAfter: true},
+	{key: "kswapd_scan", title: "pages scanned by kswapd"},
+	{key: "direct_scan", title: "pages scanned directly", gapAfter: true},
 	{key: "arc_size", title: "ARC", bytes: true},
 	{key: "slab_size", title: "Slab", bytes: true},
 	{key: "blocks", title: "blocks total"},

@@ -1,0 +1,40 @@
+From e402e432210a91259f3c9e9287c98bc462897428 Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Mon, 17 Aug 2026 14:33:22 +0300
+Subject: [PATCH] spl: stop waking kswapd to grow a cache
+
+---
+ module/os/linux/spl/spl-kmem-cache.c | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/module/os/linux/spl/spl-kmem-cache.c b/module/os/linux/spl/spl-kmem-cache.c
+index 6d496e6..a5cd5e3 100644
+--- a/module/os/linux/spl/spl-kmem-cache.c
++++ b/module/os/linux/spl/spl-kmem-cache.c
+@@ -142,6 +142,23 @@ kv_alloc(spl_kmem_cache_t *skc, int size, int flags)
+ 	gfp_t lflags = kmem_flags_convert(flags | KM_VMEM);
+ 	void *ptr;
+ 
++	/*
++	 * Growing a cache must not ask the kernel to reclaim in the background.
++	 *
++	 * vm_area_alloc_pages() opportunistically tries a high order allocation
++	 * before falling back to single pages, and derives the flags for that
++	 * attempt from ours. It drops __GFP_DIRECT_RECLAIM but keeps
++	 * __GFP_KSWAPD_RECLAIM, so a slab of a large enough cache wakes kswapd
++	 * whenever the order it wanted is unavailable. That runs the arc
++	 * shrinker, which frees the very buffers the slab was being grown to
++	 * hold, and the next allocation asks again.
++	 *
++	 * Direct reclaim is left alone: an allocation that cannot be served is
++	 * still free to pay for itself in its own context, which is where the
++	 * cost belongs.
++	 */
++	lflags &= ~__GFP_KSWAPD_RECLAIM;
++
+ 	ptr = spl_vmalloc(size, lflags);
+ 
+ 	/* Resulting allocated memory will be page aligned */
+-- 
+2.55.0
+

@@ -21,6 +21,7 @@
 {
   variant,
   seed ? 1,
+  recordSize ? "128k",
   files ? 50000,
   fileSize ? 131072,
   memoryMB ? 6144,
@@ -33,7 +34,7 @@
 }:
 
 let
-  name = "${variant}-seed${toString seed}";
+  name = "${variant}-${recordSize}-seed${toString seed}";
   setBytes = files * fileSize;
 in
 pkgs.testers.runNixOSTest {
@@ -79,7 +80,7 @@ pkgs.testers.runNixOSTest {
     machine.succeed("modprobe slabwho")
     machine.succeed("zpool create -f -o ashift=12 tank /dev/vdb")
     machine.succeed(
-        "zfs create -o recordsize=128k -o compression=off -o atime=off tank/data"
+        "zfs create -o recordsize=${recordSize} -o compression=off -o atime=off tank/data"
     )
 
     # Half of memory for the ARC, and a dirty limit well below it. At three
@@ -163,6 +164,26 @@ pkgs.testers.runNixOSTest {
         machine.succeed("echo 1 > /proc/sys/vm/compact_memory")
         machine.sleep(duration=timedelta(seconds=10))
         snapshot("compacted")
+
+    # Everything above leaves memory fragmented and free. The loop this phase
+    # looks for needs it fragmented and busy: a cache growing through vmalloc
+    # asks for a high order, and only wakes kswapd when that order is gone. So
+    # the ceiling goes back up and the set is read again.
+    # The ceiling goes higher than anywhere else here. Half of memory is what
+    # the write phase can survive, and it leaves the other half free, so the
+    # allocator never has to look past the Normal zone and DMA32 keeps a supply
+    # of high orders to fall back on. Reading cannot dirty anything, so the ARC
+    # can be allowed to take almost all of it.
+    with subtest("reread"):
+        machine.succeed(
+            f"echo {allmem - allmem // 8} > /sys/module/zfs/parameters/zfs_arc_max"
+        )
+        machine.succeed(
+            "fragload -mode read -dir /tank/data/set"
+            " -files ${toString files} -size ${toString fileSize} -seed ${toString seed}",
+            timeout=timedelta(seconds=1800),
+        )
+        snapshot("reread")
 
     os.makedirs(os.environ["out"], exist_ok=True)
     machine.copy_from_machine("/tmp/proc", "")

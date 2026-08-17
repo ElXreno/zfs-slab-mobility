@@ -48,7 +48,7 @@
           inherit fragview fragload;
           default = fragview;
         }
-        // lib.optionalAttrs (system == "x86_64-linux") suite.runs;
+        // lib.optionalAttrs (system == "x86_64-linux") (suite.runs // suite.local);
 
         devShells.default = pkgs.mkShell {
           packages = [

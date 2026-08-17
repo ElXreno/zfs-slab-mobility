@@ -40,6 +40,7 @@ let
       modulePageMobility ? false,
       noReclaimAccount ? false,
       slabMobilityZfs ? false,
+      noKswapdWake ? false,
     }:
     let
       extraPatches =
@@ -59,10 +60,13 @@ let
           };
 
       zfsExtra =
-        if slabMobilityZfs then
-          map zfsPatch mobilityZfsPatches
-        else
-          lib.optional noReclaimAccount (zfsPatch "no-reclaim-account");
+        (
+          if slabMobilityZfs then
+            map zfsPatch mobilityZfsPatches
+          else
+            lib.optional noReclaimAccount (zfsPatch "no-reclaim-account")
+        )
+        ++ lib.optional noKswapdWake (zfsPatch "no-kswapd-wake");
 
       packages = pkgs.linuxPackagesFor kernel;
     in
@@ -93,6 +97,14 @@ in
   # One line removed from spl_kmem_cache_create, so that the slab caches stop
   # asking for the pageblocks the data pages live in.
   separation = mkVariant { noReclaimAccount = true; };
+
+  # Separation plus one line that stops a cache growing through vmalloc from
+  # waking kswapd, which on this module runs the arc shrinker and frees what the
+  # cache was being grown to hold.
+  nokswapd = mkVariant {
+    noReclaimAccount = true;
+    noKswapdWake = true;
+  };
 
   # The above plus object relocation in SLUB and movable pages for the scatter
   # ABD, so that what is left in a block can be moved out of the way.
