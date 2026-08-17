@@ -353,6 +353,7 @@ type verdict struct {
 	a, b, ratio float64
 	ok          bool
 	missing     string
+	nosignal    bool
 }
 
 func judge(gs []*group, specs []expectation) []verdict {
@@ -372,9 +373,14 @@ func judge(gs []*group, specs []expectation) []verdict {
 			v.missing = e.to
 		default:
 			v.a, v.b = from.median[e.metric], to.median[e.metric]
-			if v.a != 0 {
-				v.ratio = v.b / v.a
+			if v.a == 0 {
+				// Nothing to compare against. A ratio of zero would satisfy any
+				// upper bound and the assertion would pass having measured
+				// nothing, which is worse than no assertion at all.
+				v.nosignal = true
+				break
 			}
+			v.ratio = v.b / v.a
 			v.ok = v.ratio <= e.bound
 			if !e.atMost {
 				v.ok = v.ratio >= e.bound
@@ -395,6 +401,9 @@ func (v verdict) op() string {
 func (v verdict) state() string {
 	if v.missing != "" {
 		return "MISSING " + v.missing
+	}
+	if v.nosignal {
+		return "NO SIGNAL"
 	}
 	if v.ok {
 		return "ok"
@@ -418,7 +427,9 @@ func verdictMarkdown(vs []verdict) string {
 	b.WriteString("|---|---|---|---:|---:|---|\n")
 	for _, v := range vs {
 		mark := "✅"
-		if !v.ok {
+		if v.nosignal {
+			mark = "⚠️"
+		} else if !v.ok {
 			mark = "❌"
 		}
 		fmt.Fprintf(&b, "| %s | %s %s | %s %s | %.3f | %s %g | %s |\n",
