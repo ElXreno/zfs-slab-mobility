@@ -124,7 +124,8 @@ pkgs.testers.runNixOSTest {
         for f in ("hostname", "osrelease"):
             machine.succeed(f"cat /proc/sys/kernel/{f} > {d}/sys/kernel/{f}")
         machine.succeed(f"cat /proc/slabwho > {d}/slabwho || true")
-        machine.succeed(f"gzip -1 -c /proc/kpageflags > {d}/kpageflags.gz")
+        for f in ("kpageflags", "kpagecount"):
+            machine.succeed(f"gzip -1 -c /proc/{f} > {d}/{f}.gz")
 
     # Read in a seeded shuffle rather than in order: sequential reads let the
     # prefetcher answer most of them and the ARC never holds much at once.

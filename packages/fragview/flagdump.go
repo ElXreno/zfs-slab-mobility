@@ -54,9 +54,9 @@ func dumpFlags(m *blockMap, ppb uint64, top int) {
 	buf := make([]byte, 1<<20)
 	cbuf := make([]byte, 1<<20)
 
-	counts, err := openProc("kpagecount")
-	if err == nil {
-		defer counts.Close()
+	counts, err := openPageFile("kpagecount")
+	if err != nil {
+		counts = nil
 	}
 
 	for _, r := range m.ranges {

@@ -252,7 +252,7 @@ func newBlockMap(pagesPerBlock uint64) (*blockMap, error) {
 	if err != nil {
 		return nil, err
 	}
-	f, err := openFlags()
+	f, err := openPageFile("kpageflags")
 	if err != nil {
 		return nil, fmt.Errorf("%w (needs root)", err)
 	}

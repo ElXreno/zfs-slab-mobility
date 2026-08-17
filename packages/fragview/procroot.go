@@ -19,19 +19,19 @@ func procPath(rel string) string { return filepath.Join(procRoot, rel) }
 
 func openProc(rel string) (*os.File, error) { return os.Open(procPath(rel)) }
 
-// The page flag file is read at offsets rather than in order, so a collected
-// copy is loaded whole. It is a few megabytes, and gzip makes it a fraction of
-// that in a store that does not compress.
+// The per page files are read at offsets rather than in order, so a collected
+// copy is loaded whole. They are a few megabytes each, and gzip makes that a
+// fraction in a store that does not compress.
 type flagSource interface {
 	ReadAt(p []byte, off int64) (int, error)
 }
 
-func openFlags() (flagSource, error) {
+func openPageFile(rel string) (flagSource, error) {
 	if procRoot == "/proc" {
-		return os.Open(procPath("kpageflags"))
+		return os.Open(procPath(rel))
 	}
 
-	if f, err := os.Open(procPath("kpageflags.gz")); err == nil {
+	if f, err := os.Open(procPath(rel + ".gz")); err == nil {
 		defer f.Close()
 		zr, err := gzip.NewReader(f)
 		if err != nil {
@@ -45,7 +45,7 @@ func openFlags() (flagSource, error) {
 		return bytes.NewReader(b), nil
 	}
 
-	b, err := os.ReadFile(procPath("kpageflags"))
+	b, err := os.ReadFile(procPath(rel))
 	if err != nil {
 		return nil, err
 	}
