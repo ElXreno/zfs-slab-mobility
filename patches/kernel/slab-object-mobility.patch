@@ -1,0 +1,955 @@
+From f499a27fc6f49d4a3b3c00cee16115895233eeff Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Sat, 15 Aug 2026 18:29:24 +0300
+Subject: [PATCH] mm/slub: let caches relocate their own objects
+
+Compaction can move a page cache folio or an anonymous page, but a slab
+page stays where it was allocated. A pageblock holding a handful of long
+lived objects therefore never becomes free, and on a machine with a few
+gigabytes of slab spread thinly this costs far more than it looks:
+measured on a 62G desktop, 553M of slab kept 17.3G of free memory out of
+reach of any high order allocation.
+
+Add an opt-in interface for caches that know how to relocate their
+objects. A cache registers a move callback, and compaction can then ask
+it to empty the slabs holding the fewest objects: the slabs are taken off
+the partial list so the allocation fast path stops handing out objects
+from the very slabs being emptied, what is still live on each of them is
+listed, a replacement is allocated for every object and both are handed
+to the callback. An emptied slab goes back to the page allocator,
+otherwise it returns to the partial list.
+
+Emptying a slab starts by claiming its free objects the same way the
+allocator does when it hands a slab to a cpu, in one atomic step. That
+gives a snapshot of what is live which cannot go stale, since a
+concurrent free goes to the freelist that was left behind and an
+allocation can only be served from it. It also keeps the slab accounted
+as in use for as long as the claimed objects are held, so the page cannot
+be handed back to the buddy allocator while the callback is looking at
+it. A slab without a single free object offers no such hold and is left
+alone, which costs nothing: it is also the one that would gain the least.
+
+The callback runs without allocator locks and has to tolerate the object
+having been freed in the meantime, which is what lets the subsystem take
+its own locks and validate what it was given. The signature deliberately
+matches the move callback subsystems already implement for the illumos
+allocator, so existing implementations can be wired up as is.
+
+Accounted caches are refused: the replacement is charged to whoever runs
+the relocation rather than to the owner of the object being moved, and
+billing the wrong cgroup is worse than not defragmenting.
+
+Relocation runs before the page scan in compact_node(), and also from
+kcompactd when the proactive pass stands down, because neither reason it
+stands down says anything about slab. The fragmentation score is derived
+from how free pages are spread and cannot see a cache sitting at a
+quarter occupancy across a thousand pageblocks, so the node looks healthy
+at the very moment its slabs are sparsest; the other reason is kswapd
+running, which a cache relocating its own objects does not compete with.
+Without this the relocation never sees that state: measured on a desktop
+after a cache shrink, one cache sat at 3126 pageblocks and 28% occupancy
+until it was allowed to run, which brought it to 1065 blocks at 94%. In a
+virtual machine driven the same way, that cache went from 777 slabs to 12
+with the page scanner never once running.
+
+A cache that relocates cannot keep its sheaves: a sheaf holds a freed
+object outside its slab freelist while the slab still counts it as in
+use, so an object freed during an evacuation pass reads as live and is
+handed to the callback after its owner let go. Take them away when
+mobility is established, which is before the cache has any slabs.
+---
+ include/linux/slab.h |  67 +++++
+ mm/compaction.c      |  39 +++
+ mm/internal.h        |  26 ++
+ mm/slab.h            |  18 +-
+ mm/slub.c            | 623 ++++++++++++++++++++++++++++++++++++++++++-
+ 5 files changed, 768 insertions(+), 5 deletions(-)
+
+diff --git a/include/linux/slab.h b/include/linux/slab.h
+index 739f474..a1bbea9 100644
+--- a/include/linux/slab.h
++++ b/include/linux/slab.h
+@@ -482,6 +482,73 @@ __kmem_cache_default_args(const char *name, unsigned int size,
+ void kmem_cache_destroy(struct kmem_cache *s);
+ int kmem_cache_shrink(struct kmem_cache *s);
+ 
++/*
++ * Announce the interface, so that a module built against this header can tell
++ * whether the allocator it will be loaded into knows how to relocate objects.
++ */
++#define KMEM_CACHE_MOBILITY 1
++
++/* What a move callback has to say about one object. */
++enum kmem_move_result {
++	KMEM_MOVE_DONE,		/* relocated, the old copy may be freed */
++	KMEM_MOVE_NO,		/* cannot be relocated */
++	KMEM_MOVE_LATER,	/* busy right now, worth retrying */
++	KMEM_MOVE_UNKNOWN,	/* not a live object of this subsystem */
++};
++
++/**
++ * typedef kmem_cache_move_func - relocate one object
++ * @s: cache the object belongs to
++ * @old: the object to move away from
++ * @new: a freshly allocated object of the same cache to move into
++ * @size: object size, for callbacks shared with other allocators
++ * @private: cookie passed to kmem_cache_setup_mobility()
++ *
++ * Called without any allocator lock held, so it may sleep and take whatever
++ * locks the subsystem needs. It must cope with @old having been freed and
++ * possibly handed out again in the meantime; validating that is the whole
++ * reason the callback lives in the subsystem and not here. Such an @old is
++ * still a valid object slot of this cache on a page that cannot go away while
++ * the callback runs, but its contents are whatever a free left behind, so the
++ * check has to be one that dead memory cannot pass by accident. Note that
++ * reading such an object is exactly what KASAN is there to catch, and it will
++ * report it, as a use after free or as an out of bounds access depending on
++ * what has happened to the object by the time the report is printed. On
++ * success the subsystem has repointed everything at @new and must not free
++ * @old itself, that is done by the allocator. On failure the allocator frees
++ * @new instead.
++ *
++ * The signature matches the move callback subsystems already implement for
++ * the illumos allocator, so existing implementations can be wired up as is.
++ *
++ * Return: one of enum kmem_move_result.
++ */
++typedef int kmem_cache_move_func(struct kmem_cache *s, void *old, void *new,
++				 size_t size, void *private);
++
++/**
++ * typedef kmem_cache_init_func - put one unused object into a known state
++ * @s: cache the object belongs to
++ * @object: the object
++ * @private: cookie passed to kmem_cache_setup_mobility()
++ *
++ * Runs once per object, when the slab holding it is created, in the same
++ * place and for the same reason as the cache constructor. Relocation needs
++ * it because the move callback can be handed an object that its owner has
++ * taken from the allocator but not finished initialising yet, and without
++ * this that object would hold whatever the page happened to contain. With
++ * it, it holds whatever this left behind, which the subsystem can be made
++ * to recognise. Must not sleep or allocate.
++ */
++typedef void kmem_cache_init_func(struct kmem_cache *s, void *object,
++				  void *private);
++
++int kmem_cache_setup_mobility(struct kmem_cache *s,
++			      kmem_cache_move_func *move,
++			      kmem_cache_init_func *init, void *private);
++int kmem_cache_defrag(struct kmem_cache *s, int node,
++		      unsigned int max_occupancy);
++
+ /*
+  * Please use this macro to create slab caches. Simply specify the
+  * name of the structure and maybe some flags that are listed above.
+diff --git a/mm/compaction.c b/mm/compaction.c
+index 42eec51..f9225de 100644
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@ -2919,6 +2919,13 @@ static int compact_node(pg_data_t *pgdat, bool proactive)
+ 		.proactive_compaction = proactive,
+ 	};
+ 
++	/*
++	 * Slab pages cannot be migrated below, so hand the caches that can
++	 * relocate their own objects a chance to give their pages back first.
++	 * Both callers of this are sleepable, which the callbacks need.
++	 */
++	slab_defrag(pgdat->node_id, READ_ONCE(sysctl_slab_defrag_occupancy));
++
+ 	for (zoneid = 0; zoneid < MAX_NR_ZONES; zoneid++) {
+ 		zone = &pgdat->node_zones[zoneid];
+ 		if (!populated_zone(zone))
+@@ -3236,6 +3243,29 @@ static int kcompactd(void *p)
+ 			if (unlikely(score >= prev_score))
+ 				timeout =
+ 				   default_timeout << COMPACT_MAX_DEFER_SHIFT;
++		} else if (sysctl_compaction_proactiveness) {
++			/*
++			 * Neither reason the proactive pass stands down says
++			 * anything about slab.
++			 *
++			 * The fragmentation score is derived from how the
++			 * free pages are spread, so it cannot see a cache
++			 * sitting at a quarter occupancy across a thousand
++			 * pageblocks: by that measure the node looks healthy
++			 * at the very moment its slabs are sparsest.
++			 *
++			 * The other reason is kswapd running, on the grounds
++			 * that moving pages competes with freeing them.
++			 * Asking a cache to relocate its own objects does not
++			 * compete, and a shrinker having just run is exactly
++			 * what leaves those objects spread thinnest.
++			 *
++			 * Either way, pages a cache does not give back now
++			 * are pages compaction can never move later, so do
++			 * that part regardless, at the cadence of this loop.
++			 */
++			slab_defrag(pgdat->node_id,
++				    READ_ONCE(sysctl_slab_defrag_occupancy));
+ 		}
+ 		if (unlikely(pgdat->proactive_compact_trigger))
+ 			pgdat->proactive_compact_trigger = false;
+@@ -3316,6 +3346,15 @@ static const struct ctl_table vm_compaction[] = {
+ 		.extra1		= SYSCTL_ZERO,
+ 		.extra2		= SYSCTL_ONE_HUNDRED,
+ 	},
++	{
++		.procname	= "slab_defrag_occupancy",
++		.data		= &sysctl_slab_defrag_occupancy,
++		.maxlen		= sizeof(sysctl_slab_defrag_occupancy),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE_HUNDRED,
++	},
+ 	{
+ 		.procname	= "extfrag_threshold",
+ 		.data		= &sysctl_extfrag_threshold,
+diff --git a/mm/internal.h b/mm/internal.h
+index 5a2ddcf..b9a81c7 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -1082,6 +1082,32 @@ isolate_migratepages_range(struct compact_control *cc,
+ /* Free whole pageblock and set its migration type to MIGRATE_CMA. */
+ void init_cma_reserved_pageblock(struct page *page);
+ 
++/*
++ * Compaction cannot move a slab page, so a block holding a couple of long
++ * lived objects stays useless for high order allocations no matter how often
++ * it is scanned. Ask the caches that can relocate their objects to empty their
++ * sparsest slabs instead. A slab fuller than the given occupancy is left
++ * alone, since moving its objects costs more than the part of a page it would
++ * give back, and vm.slab_defrag_occupancy says where that line is. Sleeps, so
++ * only the synchronous compaction paths may call this.
++ *
++ * Where the line belongs is not obvious and was measured rather than guessed.
++ * Sampling a desktop under a metadata heavy load once a second showed the
++ * sparse state to be short lived: it appears the moment a cache gives memory
++ * back, is tidied up by the cache's own eviction within minutes, and while it
++ * lasts the cache sits between half and three quarters full, never below that.
++ * A limit that only took the emptiest slabs would therefore almost never let
++ * anything through. Hence the default, and hence no separate, lower limit for
++ * the background pass: that pass is the only one that runs on its own, so it
++ * is the one that has to catch the window, and it already runs only when the
++ * fragmentation score says the memory is in a bad way.
++ *
++ * Zero turns the whole thing off without a reboot.
++ */
++extern unsigned int sysctl_slab_defrag_occupancy;
++
++unsigned long slab_defrag(int node, unsigned int max_occupancy);
++
+ #endif /* CONFIG_COMPACTION || CONFIG_CMA */
+ 
+ struct cma;
+diff --git a/mm/slab.h b/mm/slab.h
+index 50414bd..76e6efe 100644
+--- a/mm/slab.h
++++ b/mm/slab.h
+@@ -215,6 +215,12 @@ struct kmem_cache {
+ 	unsigned int inuse;		/* Offset to metadata */
+ 	unsigned int align;		/* Alignment */
+ 	unsigned int red_left_pad;	/* Left redzone padding size */
++	/* Object mobility; move is NULL unless kmem_cache_setup_mobility() ran */
++	kmem_cache_move_func *move;
++	kmem_cache_init_func *move_init;
++	void *move_private;
++	struct list_head mobile_list;	/* List of caches that can relocate */
++	unsigned int defrag_defer;	/* Passes to skip after a fruitless one */
+ 	const char *name;		/* Name (only for display!) */
+ 	struct list_head list;		/* List of slab caches */
+ #ifdef CONFIG_SYSFS
+@@ -419,7 +425,8 @@ void flush_rcu_sheaves_on_cache(struct kmem_cache *s);
+ 			 SLAB_TYPESAFE_BY_RCU | SLAB_DEBUG_OBJECTS | \
+ 			 SLAB_NOLEAKTRACE | SLAB_RECLAIM_ACCOUNT | \
+ 			 SLAB_TEMPORARY | SLAB_ACCOUNT | \
+-			 SLAB_NO_USER_FLAGS | SLAB_KMALLOC | SLAB_NO_MERGE)
++			 SLAB_NO_USER_FLAGS | SLAB_KMALLOC | SLAB_NO_MERGE | \
++			 SLAB_NO_SHEAVES)
+ 
+ #define SLAB_DEBUG_FLAGS (SLAB_RED_ZONE | SLAB_POISON | SLAB_STORE_USER | \
+ 			  SLAB_TRACE | SLAB_CONSISTENCY_CHECKS)
+@@ -701,7 +708,12 @@ static inline bool slab_want_init_on_alloc(gfp_t flags, struct kmem_cache *c)
+ {
+ 	if (static_branch_maybe(CONFIG_INIT_ON_ALLOC_DEFAULT_ON,
+ 				&init_on_alloc)) {
+-		if (c->ctor)
++		/*
++		 * move_init leaves behind a state the cache needs to still be
++		 * there when it is asked to relocate the object, for the same
++		 * reason a constructor does.
++		 */
++		if (c->ctor || c->move_init)
+ 			return false;
+ 		if (c->flags & (SLAB_TYPESAFE_BY_RCU | SLAB_POISON))
+ 			return flags & __GFP_ZERO;
+@@ -714,7 +726,7 @@ static inline bool slab_want_init_on_free(struct kmem_cache *c)
+ {
+ 	if (static_branch_maybe(CONFIG_INIT_ON_FREE_DEFAULT_ON,
+ 				&init_on_free))
+-		return !(c->ctor ||
++		return !(c->ctor || c->move_init ||
+ 			 (c->flags & (SLAB_TYPESAFE_BY_RCU | SLAB_POISON)));
+ 	return false;
+ }
+diff --git a/mm/slub.c b/mm/slub.c
+index b2fdb10..75209c0 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -2710,9 +2710,12 @@ static void *setup_object(struct kmem_cache *s, void *object)
+ {
+ 	setup_object_debug(s, object);
+ 	object = kasan_init_slab_obj(s, object);
+-	if (unlikely(s->ctor)) {
++	if (unlikely(s->ctor || s->move_init)) {
+ 		kasan_unpoison_new_object(s, object);
+-		s->ctor(object);
++		if (s->ctor)
++			s->ctor(object);
++		if (s->move_init)
++			s->move_init(s, object, s->move_private);
+ 		kasan_poison_new_object(s, object);
+ 	}
+ 	return object;
+@@ -7956,6 +7959,8 @@ bool __kmem_cache_empty(struct kmem_cache *s)
+ 	return true;
+ }
+ 
++static void kmem_cache_teardown_mobility(struct kmem_cache *s);
++
+ /*
+  * Release all resources used by a slab cache.
+  */
+@@ -7964,6 +7969,9 @@ int __kmem_cache_shutdown(struct kmem_cache *s)
+ 	int node;
+ 	struct kmem_cache_node *n;
+ 
++	/* Before anything is torn down, and before any slab is freed. */
++	kmem_cache_teardown_mobility(s);
++
+ 	flush_all_cpus_locked(s);
+ 
+ 	/* we might have rcu sheaves in flight */
+@@ -8165,6 +8173,617 @@ void __check_heap_object(const void *ptr, unsigned long n,
+ }
+ #endif /* CONFIG_HARDENED_USERCOPY */
+ 
++/*
++ * Object mobility.
++ *
++ * Shrinking a cache can only hand back slabs that happened to lose their last
++ * object. Everything else stays where it is, and a slab holding even a single
++ * object keeps its whole pageblock from ever being handed out as a high order
++ * allocation. Caches that know how to relocate their objects can register a
++ * callback and have their sparsest slabs emptied on demand instead.
++ */
++static LIST_HEAD(mobile_caches);
++static DEFINE_MUTEX(mobile_caches_mutex);
++
++/*
++ * Scratch space for one pass, sized for the largest slab the cache can have.
++ * Allocated once per pass rather than once per slab, so that no slab is left
++ * half evacuated because a helper allocation failed halfway through.
++ */
++struct slab_defrag_scratch {
++	unsigned long *map;
++	void **objects;
++};
++
++static int slab_defrag_scratch_alloc(struct kmem_cache *s,
++				     struct slab_defrag_scratch *scratch)
++{
++	unsigned int objects = oo_objects(s->oo);
++
++	scratch->map = bitmap_alloc(objects, GFP_KERNEL);
++	if (!scratch->map)
++		return -ENOMEM;
++
++	scratch->objects = kcalloc(objects, sizeof(void *), GFP_KERNEL);
++	if (!scratch->objects) {
++		bitmap_free(scratch->map);
++		return -ENOMEM;
++	}
++
++	return 0;
++}
++
++static void slab_defrag_scratch_free(struct slab_defrag_scratch *scratch)
++{
++	kfree(scratch->objects);
++	bitmap_free(scratch->map);
++}
++
++/*
++ * Move every object off one slab. The caller has already taken the slab off
++ * the partial list and owns it for the duration.
++ *
++ * Returns the number of objects that were relocated.
++ */
++/*
++ * Take everything that is free on the slab right now, the same way the
++ * allocator does when it hands a slab to a cpu, note it in @map and add it to
++ * the chain held in @head and @tail. Returns how many objects that was.
++ *
++ * Called once to find out what is live, and again before every object handed
++ * over, since by then the owners may have freed some of them.
++ */
++static unsigned int slab_claim_free(struct kmem_cache *s, struct slab *slab,
++				    unsigned long *map, void **head, void **tail)
++{
++	struct kmem_cache_node *n = get_node(s, slab_nid(slab));
++	void *addr = slab_address(slab);
++	void *chain, *p, *last = NULL;
++	unsigned int claimed = 0;
++	unsigned long flags;
++
++	/*
++	 * A free that arrived while the slab had nothing on its freelist put it
++	 * back on the partial list, and everything on that list is expected to
++	 * have a free object: the free path decides what to do with a slab by
++	 * looking at whether its freelist was empty, and would take an emptied
++	 * one off no list at all. So take it off here, under the same lock,
++	 * before emptying the freelist again.
++	 */
++	spin_lock_irqsave(&n->list_lock, flags);
++	if (slab_test_node_partial(slab))
++		remove_partial(n, slab);
++	chain = get_freelist_nofreeze(s, slab);
++	spin_unlock_irqrestore(&n->list_lock, flags);
++
++	if (!chain)
++		return 0;
++
++	for (p = chain; p; p = get_freepointer(s, p)) {
++		set_bit(__obj_to_index(s, addr, p), map);
++		last = p;
++		claimed++;
++	}
++
++	if (*tail)
++		set_freepointer(s, last, *head);
++	else
++		*tail = last;
++	*head = chain;
++
++	return claimed;
++}
++
++/*
++ * Returns how many objects were relocated, and reports through emptied
++ * whether that was all of them, which is the only outcome that hands a page
++ * back. A slab that keeps even one object is worth nothing to the caller and
++ * will keep refusing for as long as that object is held, so the caller needs
++ * to be able to tell the two apart.
++ */
++/*
++ * How many slabs in a row may refuse to come free before a pass gives up.
++ * Small because a refusal means a held object, and holds do not clear in the
++ * time it takes to walk a few more slabs.
++ */
++#define SLAB_DEFRAG_GIVE_UP 8
++
++static int slab_evacuate(struct kmem_cache *s, struct slab *slab,
++			 struct slab_defrag_scratch *scratch, bool *emptied)
++{
++	void *addr = slab_address(slab);
++	unsigned int claimed = 0, live = 0, moved = 0, i;
++	void *head, *tail = NULL;
++	void *p;
++
++	/*
++	 * Claim what is free on this slab in one atomic step, the same way the
++	 * allocator does when it hands a slab to a cpu. Everything below rests
++	 * on the two properties that gives us:
++	 *
++	 * The objects we did not claim are the live ones, and nothing can be
++	 * added to that set behind our back: a concurrent free goes to the
++	 * freelist we left behind, never to the chain we took, and an
++	 * allocation can only be served from the freelist. The set only ever
++	 * shrinks, which is why claiming again below is enough to keep it
++	 * honest.
++	 *
++	 * The claimed objects are counted as in use and belong to nobody, so
++	 * as long as we hold them the slab cannot reach zero and the page
++	 * cannot go back to the buddy allocator under the callback.
++	 */
++	/*
++	 * Anything the quarantine is holding was freed by its owner but has
++	 * not reached the freelist, and would be read below as a live object.
++	 * The pass drains it once at the start, but a free landing there while
++	 * the pass runs puts it back, so drain again for each slab, as late as
++	 * the claim allows. A build without KASAN has no quarantine and this
++	 * costs nothing.
++	 */
++	kasan_cache_shrink(s);
++
++	bitmap_zero(scratch->map, slab->objects);
++	head = NULL;
++	claimed = slab_claim_free(s, slab, scratch->map, &head, &tail);
++	if (!claimed) {
++		/*
++		 * A slab without a single free object gives us nothing to hold
++		 * it with: its owners could free the last object and hand the
++		 * page back while the callback still looks at it. It is also
++		 * the least rewarding slab to work on, so leave it alone.
++		 */
++		return 0;
++	}
++
++	for_each_object(p, s, addr, slab->objects) {
++		if (!test_bit(__obj_to_index(s, addr, p), scratch->map))
++			scratch->objects[live++] = p;
++	}
++
++	for (i = 0; i < live; i++) {
++		void *old = scratch->objects[i];
++		void *new;
++
++		/*
++		 * Nothing here may reclaim. This runs from compaction, and
++		 * going back into the page allocator to wait for memory would
++		 * risk recursing into it. A replacement normally comes from a
++		 * denser slab of the same cache, and not getting one merely
++		 * postpones the work.
++		 */
++		new = kmem_cache_alloc(s, GFP_NOWAIT | __GFP_NOWARN);
++		if (!new)
++			break;
++
++		/*
++		 * Account for what the owners have freed since the list was
++		 * made, as late as possible, so that an object already known
++		 * to be dead is never handed to the callback. What is left is
++		 * the window of the call itself, which nothing but blocking
++		 * every free in the system could close.
++		 */
++		if (READ_ONCE(slab->freelist))
++			claimed += slab_claim_free(s, slab, scratch->map,
++						   &head, &tail);
++
++		if (test_bit(__obj_to_index(s, addr, old), scratch->map)) {
++			kmem_cache_free(s, new);
++			continue;
++		}
++
++		if (s->move(s, old, new, s->object_size, s->move_private) !=
++		    KMEM_MOVE_DONE) {
++			kmem_cache_free(s, new);
++			continue;
++		}
++
++		/*
++		 * Collect rather than free right away. While we free nothing,
++		 * only the owners of the objects still to come can lower the
++		 * count, and they can never take it below the number of
++		 * objects claimed above.
++		 */
++		scratch->objects[moved++] = old;
++	}
++
++	if (moved) {
++		void *bulk_head = NULL, *bulk_tail = scratch->objects[0];
++
++		for (i = 0; i < moved; i++) {
++			set_freepointer(s, scratch->objects[i], bulk_head);
++			bulk_head = scratch->objects[i];
++		}
++
++		/*
++		 * Hand the vacated objects straight back to their slab. The
++		 * usual free path would park them in a per cpu sheaf, where
++		 * they still count as allocated, and the slab we are emptying
++		 * would never look empty.
++		 */
++		slab_free_bulk(s, slab, bulk_head, bulk_tail, scratch->objects,
++			       moved, _RET_IP_);
++	}
++
++	*emptied = (moved == live);
++
++	/*
++	 * Let go of the slab. This is what puts it back on the partial list,
++	 * or hands it to the page allocator if the evacuation emptied it.
++	 */
++	__slab_free(s, slab, head, tail, claimed, _RET_IP_);
++
++	return moved;
++}
++
++/*
++ * Objects parked in per cpu sheaves, in the node barn or in the KASAN
++ * quarantine belong to nobody but still count as allocated for the slabs they
++ * came from, so a slab can look busy while being effectively empty. Worse, an
++ * object waiting in the quarantine is not on any freelist, and would be taken
++ * for a live one and handed to the callback. Flush all three, so that what is
++ * left really is in use. This is the part of kmem_cache_shrink() that is needed
++ * here; its reordering of the partial lists is not, the selection below does
++ * its own.
++ */
++static void slab_defrag_flush(struct kmem_cache *s)
++{
++	int node;
++
++	kasan_cache_shrink(s);
++	flush_all_cpus_locked(s);
++
++	for_each_node(node) {
++		struct node_barn *barn = get_barn_node(s, node);
++
++		if (barn)
++			barn_shrink(s, barn);
++	}
++}
++
++static int slab_defrag_node(struct kmem_cache *s, struct kmem_cache_node *n,
++			    unsigned int max_occupancy,
++			    struct slab_defrag_scratch *scratch)
++{
++	struct slab *slab, *t;
++	unsigned long flags;
++	LIST_HEAD(candidates);
++	int moved = 0, refused = 0;
++
++	/*
++	 * Take the candidates out of circulation in one go. Off the list they
++	 * cannot be handed out, which stops the allocation fast path from
++	 * refilling the very slabs being emptied, and stops a replacement from
++	 * coming out of another slab that is about to be worked on.
++	 */
++	spin_lock_irqsave(&n->list_lock, flags);
++	list_for_each_entry_safe(slab, t, &n->partial, slab_list) {
++		if (slab->inuse * 100 > slab->objects * max_occupancy)
++			continue;
++
++		remove_partial(n, slab);
++		list_add(&slab->slab_list, &candidates);
++	}
++	spin_unlock_irqrestore(&n->list_lock, flags);
++
++	while (!list_empty(&candidates)) {
++		bool emptied = false;
++
++		slab = list_first_entry(&candidates, struct slab, slab_list);
++		list_del(&slab->slab_list);
++
++		moved += slab_evacuate(s, slab, scratch, &emptied);
++
++		/*
++		 * A slab that keeps an object keeps it because something holds
++		 * it, and a hold does not clear because we ask again a moment
++		 * later. Emptying is the only outcome that returns a page, so
++		 * a pass that is not emptying slabs is moving objects for
++		 * nothing and should stop rather than walk the rest of the
++		 * list.
++		 *
++		 * Left unbounded this relocated every movable object of every
++		 * sparse slab, ninety times over per object, with the slab
++		 * count never moving.
++		 */
++		if (emptied)
++			refused = 0;
++		else if (++refused >= SLAB_DEFRAG_GIVE_UP)
++			break;
++
++		cond_resched();
++	}
++
++	/*
++	 * Whatever the pass did not get to is still off the partial list and
++	 * would be lost to the allocator otherwise.
++	 */
++	if (!list_empty(&candidates)) {
++		spin_lock_irqsave(&n->list_lock, flags);
++		list_for_each_entry_safe(slab, t, &candidates, slab_list) {
++			list_del(&slab->slab_list);
++			add_partial(n, slab, ADD_TO_TAIL);
++		}
++		spin_unlock_irqrestore(&n->list_lock, flags);
++	}
++
++	return moved;
++}
++
++/*
++ * How many passes a cache sits out after one that cost work and returned no
++ * pages, in the same spirit as compaction deferring a zone it could not help.
++ */
++#define SLAB_DEFRAG_DEFER 8
++
++/* Partial slabs across the node, which is what a pass is trying to reduce. */
++static unsigned long slab_partial_count(struct kmem_cache *s, int node)
++{
++	struct kmem_cache_node *n;
++	unsigned long count = 0;
++	int nid;
++
++	if (node == NUMA_NO_NODE) {
++		for_each_kmem_cache_node(s, nid, n)
++			count += n->nr_partial;
++	} else {
++		n = get_node(s, node);
++		if (n)
++			count = n->nr_partial;
++	}
++
++	return count;
++}
++
++static int kmem_cache_defrag_locked(struct kmem_cache *s, int node,
++				    unsigned int max_occupancy)
++{
++	struct slab_defrag_scratch scratch;
++	struct kmem_cache_node *n;
++	unsigned long before;
++	int nid, moved = 0, err;
++
++	lockdep_assert_cpus_held();
++	lockdep_assert_held(&mobile_caches_mutex);
++
++	/*
++	 * Emptying slabs is not the same as having fewer of them: the
++	 * replacements have to come from somewhere, and a cache can hand back
++	 * pages at one end while taking them at the other all day. Only the
++	 * count of slabs says whether a pass was worth its cost, so a cache
++	 * that did not shrink is left alone for a while.
++	 */
++	if (s->defrag_defer) {
++		s->defrag_defer--;
++		return 0;
++	}
++
++	before = slab_partial_count(s, node);
++
++	err = slab_defrag_scratch_alloc(s, &scratch);
++	if (err)
++		return err;
++
++	slab_defrag_flush(s);
++
++	if (node == NUMA_NO_NODE) {
++		for_each_kmem_cache_node(s, nid, n)
++			moved += slab_defrag_node(s, n, max_occupancy,
++						  &scratch);
++	} else {
++		n = get_node(s, node);
++		if (n)
++			moved = slab_defrag_node(s, n, max_occupancy, &scratch);
++	}
++
++	slab_defrag_scratch_free(&scratch);
++
++	if (slab_partial_count(s, node) >= before)
++		s->defrag_defer = SLAB_DEFRAG_DEFER;
++
++	return moved;
++}
++
++/**
++ * kmem_cache_setup_mobility - let a cache relocate its own objects
++ * @s: the cache
++ * @move: relocates a single object, called without allocator locks
++ * @init: puts an unused object into a state @move can recognise
++ * @private: cookie handed back to both callbacks
++ *
++ * Call this before the cache is used. @init has to have run over every object
++ * that exists, and it only runs when a slab is created, so a cache that has
++ * already allocated something is refused.
++ *
++ * Return: 0 on success, negative if the cache cannot support mobility.
++ */
++int kmem_cache_setup_mobility(struct kmem_cache *s,
++			      kmem_cache_move_func *move,
++			      kmem_cache_init_func *init, void *private)
++{
++	struct kmem_cache_node *n;
++	int node;
++
++	if (!move || !init)
++		return -EINVAL;
++
++	/*
++	 * Objects of such a cache stay valid past their free and may be
++	 * examined by a lockless reader, so nothing may relocate them.
++	 */
++	if (s->flags & SLAB_TYPESAFE_BY_RCU)
++		return -EINVAL;
++
++	/*
++	 * The replacement is charged to whoever runs the relocation, which is
++	 * not the owner of the object being moved, so accounted caches would
++	 * end up billing the wrong cgroup.
++	 */
++	if (s->flags & SLAB_ACCOUNT)
++		return -EINVAL;
++
++	/*
++	 * Relocation hands objects back to their slab directly, and the checks
++	 * a debug cache runs on a free would see the ones that were free all
++	 * along being freed a second time. Debugging already turns off the
++	 * sheaves and the cmpxchg fast path for the same kind of reason, so
++	 * turn relocation off with it rather than teach it a special case.
++	 */
++	if (kmem_cache_debug(s))
++		return -EINVAL;
++
++	/*
++	 * A sheaf holds a freed object outside its slab's freelist and leaves
++	 * the slab counting it as in use, so evacuation, which reads that
++	 * freelist to tell live objects from free ones, would offer an object
++	 * to the callback after its owner had let go of it.
++	 *
++	 * They cannot be taken away here: the cache may already be serving
++	 * allocations, and there is no moment at which removing them is safe.
++	 * A cache that wants to relocate has to be created without them.
++	 */
++	if (cache_has_sheaves(s))
++		return -EINVAL;
++
++	/*
++	 * A merged cache also serves users that never asked for any of this,
++	 * and their objects would reach a callback that knows nothing about
++	 * them. Relocation needs a cache of its own.
++	 */
++	if (s->refcount > 1)
++		return -EINVAL;
++
++	mutex_lock(&mobile_caches_mutex);
++
++	if (s->move) {
++		mutex_unlock(&mobile_caches_mutex);
++		return -EBUSY;
++	}
++
++	/*
++	 * Objects of a slab that already exists have missed the init callback
++	 * and would be offered to the move callback as raw memory, so register
++	 * before the cache is used rather than teach the callback to tell the
++	 * two kinds of object apart.
++	 */
++	for_each_kmem_cache_node(s, node, n) {
++		if (node_nr_slabs(n)) {
++			mutex_unlock(&mobile_caches_mutex);
++			return -EBUSY;
++		}
++	}
++
++	s->move_private = private;
++	s->move_init = init;
++	s->move = move;
++	list_add(&s->mobile_list, &mobile_caches);
++
++	mutex_unlock(&mobile_caches_mutex);
++
++	return 0;
++}
++EXPORT_SYMBOL(kmem_cache_setup_mobility);
++
++/*
++ * Called before a cache is taken down. Waits out a relocation that is already
++ * running and keeps the next one from starting, so that neither the cache nor
++ * its slabs can go away while they are being worked on.
++ */
++static void kmem_cache_teardown_mobility(struct kmem_cache *s)
++{
++	mutex_lock(&mobile_caches_mutex);
++
++	if (s->move) {
++		list_del(&s->mobile_list);
++		s->move = NULL;
++		s->move_init = NULL;
++		s->move_private = NULL;
++	}
++
++	mutex_unlock(&mobile_caches_mutex);
++}
++
++/**
++ * kmem_cache_defrag - relocate objects out of the sparsest slabs of a cache
++ * @s: the cache, which must have registered a move callback
++ * @node: node to work on, or NUMA_NO_NODE for all of them
++ * @max_occupancy: leave slabs that are more than this percent full alone
++ *
++ * Empties the slabs that hold the fewest objects, so that their pages can go
++ * back to the page allocator. Sleeps.
++ *
++ * Return: number of objects relocated, or a negative error.
++ */
++int kmem_cache_defrag(struct kmem_cache *s, int node,
++		      unsigned int max_occupancy)
++{
++	int moved;
++
++	if (!s->move)
++		return -EOPNOTSUPP;
++
++	if (max_occupancy > 100)
++		return -EINVAL;
++
++	might_sleep();
++
++	/*
++	 * Flushing the per cpu sheaves needs the cpus held, and a cache is torn
++	 * down under the same lock followed by slab_mutex, so take it here to
++	 * keep that order rather than end up holding the two the other way
++	 * around.
++	 */
++	cpus_read_lock();
++	mutex_lock(&mobile_caches_mutex);
++
++	moved = kmem_cache_defrag_locked(s, node, max_occupancy);
++
++	mutex_unlock(&mobile_caches_mutex);
++	cpus_read_unlock();
++
++	return moved;
++}
++EXPORT_SYMBOL(kmem_cache_defrag);
++
++/*
++ * How full a slab may be and still be worth emptying, in percent. Measured
++ * rather than guessed, see the comment on slab_defrag() in mm/internal.h.
++ */
++unsigned int sysctl_slab_defrag_occupancy __read_mostly = 75;
++
++/**
++ * slab_defrag - relocate objects out of the sparsest slabs of every cache
++ * @node: node to work on, or NUMA_NO_NODE for all of them
++ * @max_occupancy: leave slabs that are more than this percent full alone,
++ *		   zero to do nothing at all
++ *
++ * Return: number of objects relocated.
++ */
++unsigned long slab_defrag(int node, unsigned int max_occupancy)
++{
++	unsigned long moved = 0;
++	struct kmem_cache *s;
++
++	if (!max_occupancy)
++		return 0;
++
++	might_sleep();
++
++	cpus_read_lock();
++	mutex_lock(&mobile_caches_mutex);
++
++	list_for_each_entry(s, &mobile_caches, mobile_list) {
++		int rc = kmem_cache_defrag_locked(s, node, max_occupancy);
++
++		if (rc > 0)
++			moved += rc;
++	}
++
++	mutex_unlock(&mobile_caches_mutex);
++	cpus_read_unlock();
++
++	return moved;
++}
++
+ #define SHRINK_PROMOTE_MAX 32
+ 
+ /*
+-- 
+2.55.0
+

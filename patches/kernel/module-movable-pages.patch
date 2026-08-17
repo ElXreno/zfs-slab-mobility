@@ -1,0 +1,113 @@
+From cf0d3852e912106c5a8ce25cee2d7ad2386d8483 Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Sat, 15 Aug 2026 11:33:49 +0300
+Subject: [PATCH] mm: let a module own movable_ops pages
+
+Migration reaches the owner of a movable_ops page through page_movable_ops(),
+and that lookup is by page type, so the set of possible owners is the set of
+types listed there: a loadable module has no way in. Add a type that stands
+for exactly that, one module-owned slot, wired the same way as the two that
+already exist.
+
+The registration is exported without the GPL restriction, because the type
+exists for out-of-tree modules and the user this was written for is licensed
+CDDL; keeping the restriction would leave the type unusable by anything.
+
+The registration slot is single and takes NULL to release it, so a module
+that unloads has to unmark its pages first; nothing here can check that for
+it, in the same way nothing checks it for the existing types.
+---
+ include/linux/page-flags.h | 17 ++++++++++++++++-
+ mm/migrate.c               | 15 ++++++++++++++-
+ 2 files changed, 30 insertions(+), 2 deletions(-)
+
+diff --git a/include/linux/page-flags.h b/include/linux/page-flags.h
+index 7223f6f..24bd519 100644
+--- a/include/linux/page-flags.h
++++ b/include/linux/page-flags.h
+@@ -923,6 +923,7 @@ enum pagetype {
+ 	PGTY_zsmalloc		= 0xf6,
+ 	PGTY_unaccepted		= 0xf7,
+ 	PGTY_large_kmalloc	= 0xf8,
++	PGTY_modmovable		= 0xf9,
+ 
+ 	PGTY_mapcount_underflow = 0xff
+ };
+@@ -1047,6 +1048,19 @@ FOLIO_TEST_FLAG_FALSE(hugetlb)
+ 
+ PAGE_TYPE_OPS(Zsmalloc, zsmalloc, zsmalloc)
+ 
++/*
++ * Pages owned by a loadable module that has registered movable_operations
++ * for them. The page type exists because migration has to reach the owner
++ * through page_movable_ops(), and that lookup is by type; a module cannot
++ * be reached through any of the types above.
++ *
++ * An enum value cannot be tested with #ifdef, so out-of-tree modules that
++ * have to build against kernels both with and without this get something
++ * they can test.
++ */
++#define HAVE_PGTY_MODMOVABLE 1
++PAGE_TYPE_OPS(ModMovable, modmovable, modmovable)
++
+ /*
+  * Mark pages that has to be accepted before touched for the first time.
+  *
+@@ -1136,7 +1150,8 @@ PAGEFLAG_FALSE(MovableOpsIsolated, movable_ops_isolated);
+ static inline bool page_has_movable_ops(const struct page *page)
+ {
+ 	return PageMovableOps(page) &&
+-	       (PageOffline(page) || PageZsmalloc(page));
++	       (PageOffline(page) || PageZsmalloc(page) ||
++		PageModMovable(page));
+ }
+ 
+ static __always_inline int PageAnonExclusive(const struct page *page)
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 8a64291..5d38fbe 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -53,6 +53,7 @@
+ 
+ static const struct movable_operations *offline_movable_ops;
+ static const struct movable_operations *zsmalloc_movable_ops;
++static const struct movable_operations *modmovable_ops;
+ 
+ int set_movable_ops(const struct movable_operations *ops, enum pagetype type)
+ {
+@@ -71,12 +72,22 @@ int set_movable_ops(const struct movable_operations *ops, enum pagetype type)
+ 			return -EBUSY;
+ 		zsmalloc_movable_ops = ops;
+ 		break;
++	case PGTY_modmovable:
++		if (modmovable_ops && ops)
++			return -EBUSY;
++		modmovable_ops = ops;
++		break;
+ 	default:
+ 		return -EINVAL;
+ 	}
+ 	return 0;
+ }
+-EXPORT_SYMBOL_GPL(set_movable_ops);
++/*
++ * Not GPL-only: the module-owned type below exists for modules that are not
++ * part of the tree, and the only such user here is licensed CDDL. Marking the
++ * registration GPL-only would leave the type with no way to ever be used.
++ */
++EXPORT_SYMBOL(set_movable_ops);
+ 
+ static const struct movable_operations *page_movable_ops(struct page *page)
+ {
+@@ -92,6 +103,8 @@ static const struct movable_operations *page_movable_ops(struct page *page)
+ 		return offline_movable_ops;
+ 	if (PageZsmalloc(page))
+ 		return zsmalloc_movable_ops;
++	if (PageModMovable(page))
++		return modmovable_ops;
+ 
+ 	return NULL;
+ }
+-- 
+2.55.0
+

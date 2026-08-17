@@ -1,0 +1,27 @@
+From 65a6ff898c8126908dd893f760ea5a7626a91e89 Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Sat, 15 Aug 2026 22:44:27 +0300
+Subject: [PATCH] libzpool: declare the mobility flag for userspace too
+
+libzpool builds the same arc.c and dnode.c, where the flag now appears in
+the cache creation calls, so it needs a name there as well. Nothing in
+userspace has slabs to relocate, so it names nothing.
+---
+ include/sys/zfs_context.h | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/include/sys/zfs_context.h b/include/sys/zfs_context.h
+index 26e7b5cf5..c65aa8acf 100644
+--- a/include/sys/zfs_context.h
++++ b/include/sys/zfs_context.h
+@@ -408,6 +408,7 @@ void procfs_list_add(procfs_list_t *procfs_list, void *p);
+ #define	KMC_NODEBUG		UMC_NODEBUG
+ #define	KMC_KVMEM		0x0
+ #define	KMC_RECLAIMABLE		0x0
++#define	KMC_MOBILE		0x0
+ #define	kmem_alloc(_s, _f)	umem_alloc(_s, _f)
+ #define	kmem_zalloc(_s, _f)	umem_zalloc(_s, _f)
+ #define	kmem_free(_b, _s)	umem_free(_b, _s)
+-- 
+2.55.0
+

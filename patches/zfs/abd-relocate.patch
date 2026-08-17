@@ -1,0 +1,477 @@
+From 1880b140ab4dca52aa046737324b508a74e734aa Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Sat, 15 Aug 2026 15:48:13 +0300
+Subject: [PATCH] abd: relocate a chunk when the page allocator asks
+
+With the readers counted, a chunk with none of them can be copied and its
+scatterlist entry pointed at the new pages. That entry is the only place the
+chunk is named: abd_get_offset() and the gang chains index into it rather than
+copying it, so moving it moves the chunk for everything that can reach it.
+
+The count is looked at again here rather than only when isolation was offered,
+because the flag that turns readers away is set by the caller in between. A
+reader that slipped through that window is visible as a non zero count and the
+move is declined; one that arrives later sees the flag and waits.
+
+Pages handed to the block layer outlive the walk that produced them, so the
+disk path holds them across the io and lets go in the done callback, where the
+same walk visits the same chunks because none of them could have moved.
+---
+ include/os/linux/zfs/sys/abd_os.h |   3 +
+ module/os/linux/zfs/abd_os.c      | 218 ++++++++++++++++++++++++++----
+ module/os/linux/zfs/vdev_disk.c   |  39 ++++++
+ 3 files changed, 234 insertions(+), 26 deletions(-)
+
+diff --git a/include/os/linux/zfs/sys/abd_os.h b/include/os/linux/zfs/sys/abd_os.h
+index 5993d6098..ae9c01875 100644
+--- a/include/os/linux/zfs/sys/abd_os.h
++++ b/include/os/linux/zfs/sys/abd_os.h
+@@ -55,6 +55,9 @@ struct abd_linear {
+ 	struct scatterlist *abd_sgl; /* for LINEAR_PAGE */
+ };
+ 
++void abd_gate_hold_page(struct page *);
++void abd_gate_drop_page(struct page *);
++
+ typedef int abd_iter_page_func_t(struct page *, size_t, size_t, void *);
+ int abd_iterate_page_func(struct abd *, size_t, size_t, abd_iter_page_func_t *,
+     void *);
+diff --git a/module/os/linux/zfs/abd_os.c b/module/os/linux/zfs/abd_os.c
+index 2f4d300f6..743684001 100644
+--- a/module/os/linux/zfs/abd_os.c
++++ b/module/os/linux/zfs/abd_os.c
+@@ -90,6 +90,9 @@ typedef struct abd_stats {
+ 	 */
+ 	kstat_named_t abdstat_page_isolate_asked;
+ 	kstat_named_t abdstat_page_isolate_no_owner;
++	kstat_named_t abdstat_page_migrated;
++	kstat_named_t abdstat_page_migrate_busy;
++	kstat_named_t abdstat_page_migrate_lost;
+ } abd_stats_t;
+ 
+ static abd_stats_t abd_stats = {
+@@ -146,6 +149,9 @@ static abd_stats_t abd_stats = {
+ 	{ "scatter_sg_table_retry",		KSTAT_DATA_UINT64 },
+ 	{ "page_isolate_asked",			KSTAT_DATA_UINT64 },
+ 	{ "page_isolate_no_owner",		KSTAT_DATA_UINT64 },
++	{ "page_migrated",			KSTAT_DATA_UINT64 },
++	{ "page_migrate_busy",			KSTAT_DATA_UINT64 },
++	{ "page_migrate_lost",			KSTAT_DATA_UINT64 },
+ };
+ 
+ static struct {
+@@ -162,6 +168,9 @@ static struct {
+ 	wmsum_t abdstat_scatter_sg_table_retry;
+ 	wmsum_t abdstat_page_isolate_asked;
+ 	wmsum_t abdstat_page_isolate_no_owner;
++	wmsum_t abdstat_page_migrated;
++	wmsum_t abdstat_page_migrate_busy;
++	wmsum_t abdstat_page_migrate_lost;
+ } abd_sums;
+ 
+ #define	abd_for_each_sg(abd, sg, n, i)	\
+@@ -273,10 +282,8 @@ abd_unmark_zfs_page(struct page *page)
+  * belongs to no one.
+  */
+ static inline void
+-abd_mark_movable_page(struct page *page, abd_t *abd)
++abd_make_page_movable(struct page *page, abd_t *abd)
+ {
+-	get_page(page);
+-	SetPagePrivate(page);
+ 	set_page_private(page, (unsigned long)abd);
+ 	__SetPageModMovable(page);
+ 	SetPageMovableOps(page);
+@@ -285,10 +292,9 @@ abd_mark_movable_page(struct page *page, abd_t *abd)
+ static inline void
+ abd_unmark_movable_page(struct page *page)
+ {
+-	__ClearPageModMovable(page);
+-	set_page_private(page, 0UL);
+-	ClearPagePrivate(page);
+-	put_page(page);
++	if (PageModMovable(page))
++		__ClearPageModMovable(page);
++	abd_unmark_zfs_page(page);
+ }
+ 
+ static inline abd_t *
+@@ -349,6 +355,30 @@ abd_gate_exit(abd_t *owner)
+ 		atomic_dec(&ABD_SCATTER(owner).abd_readers);
+ }
+ 
++/*
++ * Hold a chunk beyond the walk that produced it, for a caller that hands the
++ * page to something which will touch it later, such as the block layer. Safe
++ * to take while the walk's own hold is in place, because that is what makes
++ * the page the current one; the two are released independently.
++ */
++void
++abd_gate_hold_page(struct page *page)
++{
++	abd_t *owner = abd_page_owner(page);
++
++	if (owner != NULL)
++		atomic_inc(&ABD_SCATTER(owner).abd_readers);
++}
++
++void
++abd_gate_drop_page(struct page *page)
++{
++	abd_t *owner = abd_page_owner(page);
++
++	if (owner != NULL)
++		atomic_dec(&ABD_SCATTER(owner).abd_readers);
++}
++
+ /*
+  * The page allocator asks whether a chunk can be relocated. Nothing is moved
+  * yet: this half of the work only proves the path from compaction down to the
+@@ -360,38 +390,116 @@ static bool
+ abd_page_isolate(struct page *page, isolate_mode_t mode)
+ {
+ 	(void) mode;
++	abd_t *abd;
+ 
+ 	ABDSTAT_BUMP(abdstat_page_isolate_asked);
+ 
++	abd = abd_page_owner(page);
++	if (abd == NULL) {
++		ABDSTAT_BUMP(abdstat_page_isolate_no_owner);
++		return (B_FALSE);
++	}
++
+ 	/*
+-	 * Must never fire: a page is only offered here because we marked it,
+-	 * and we only mark pages whose owner we recorded at the same moment.
+-	 * It is counted rather than asserted because a broken back pointer is
+-	 * exactly what this half of the work exists to rule out.
++	 * A cheap look only. The flag that keeps readers away is set by the
++	 * caller after this returns, so the count is looked at again in
++	 * abd_page_migrate() where that flag is already visible; refusing here
++	 * merely saves the caller the trouble of a page it cannot have.
+ 	 */
+-	if (abd_page_owner(page) == NULL)
+-		ABDSTAT_BUMP(abdstat_page_isolate_no_owner);
++	if (atomic_read(&ABD_SCATTER(abd).abd_readers) != 0)
++		return (B_FALSE);
+ 
+-	return (B_FALSE);
++	return (B_TRUE);
+ }
+ 
++/*
++ * Relocate a chunk on behalf of the page allocator.
++ *
++ * The isolation flag was set by the caller before we were reached, so a reader
++ * that raised the count is visible here, and one that has not raised it yet
++ * will see the flag and stand back. Finding the count at zero therefore means
++ * the chunk is ours alone for as long as the flag stays set.
++ *
++ * Only the entry in the owning scatterlist has to be moved: everything that
++ * reaches these pages does so through that one array, since abd_get_offset()
++ * and friends point into it rather than copying it.
++ */
+ static int
+ abd_page_migrate(struct page *dst, struct page *src, enum migrate_mode mode)
+ {
+-	(void) dst, (void) src, (void) mode;
++	(void) mode;
++	abd_t *abd = abd_page_owner(src);
++	struct scatterlist *sg, *found = NULL;
++	unsigned int i, order, npages;
++
++	if (abd == NULL)
++		return (-EAGAIN);
++
++	if (atomic_read(&ABD_SCATTER(abd).abd_readers) != 0) {
++		ABDSTAT_BUMP(abdstat_page_migrate_busy);
++		return (-EAGAIN);
++	}
++
++	abd_for_each_sg(abd, sg, ABD_SCATTER(abd).abd_nents, i) {
++		if (sg_page(sg) == src) {
++			found = sg;
++			break;
++		}
++	}
++
++	if (found == NULL) {
++		ABDSTAT_BUMP(abdstat_page_migrate_lost);
++		return (-EAGAIN);
++	}
++
++	order = compound_order(src);
++	npages = 1U << order;
++	/*
++	 * Subpages of a compound page are contiguous in the memory map, so
++	 * the whole chunk is reachable by index from its head.
++	 */
++	for (i = 0; i < npages; i++)
++		copy_highpage(dst + i, src + i);
++
++	/*
++	 * The replacement has to be recognisable as ours before anything can
++	 * reach it, and the old one has to stay recognisable until nothing
++	 * can, so the order here is: make the new one ready, publish it, then
++	 * retire the old one.
++	 */
++	/*
++	 * Both sides have to end up with the reference count this code keeps
++	 * on a chunk it owns, which is two: one from the allocation and one
++	 * taken when the chunk was marked, and the free path drops both.
++	 *
++	 * The replacement arrives holding the caller's allocation reference,
++	 * which the caller drops once this returns, so it needs one taken here
++	 * to stand in its place. The original still holds the one it was
++	 * allocated with, which nothing else will ever drop now that the chunk
++	 * has left, so that one is dropped here.
++	 */
++	abd_mark_zfs_page(dst);
++	abd_make_page_movable(dst, abd);
++	get_page(dst);
++
++	sg_set_page(found, dst, found->length, found->offset);
+ 
+-	/* Never isolated, so never asked to move. */
+-	ASSERT(0);
+-	return (-EAGAIN);
++	abd_unmark_movable_page(src);
++	put_page(src);
++
++	ABDSTAT_BUMP(abdstat_page_migrated);
++
++	return (0);
+ }
+ 
+ static void
+ abd_page_putback(struct page *page)
+ {
++	/*
++	 * Nothing was taken from the chunk to isolate it beyond the flag the
++	 * caller manages, so there is nothing here to give back.
++	 */
+ 	(void) page;
+-
+-	/* Never isolated, so never given back. */
+-	ASSERT(0);
+ }
+ 
+ static const struct movable_operations abd_movable_ops = {
+@@ -400,8 +508,20 @@ static const struct movable_operations abd_movable_ops = {
+ 	.putback_page	= abd_page_putback,
+ };
+ #else
+-#define	abd_mark_movable_page(page, abd)	abd_mark_zfs_page(page)
++#define	abd_make_page_movable(page, abd)	((void)0)
+ #define	abd_unmark_movable_page(page)		abd_unmark_zfs_page(page)
++
++void
++abd_gate_hold_page(struct page *page)
++{
++	(void) page;
++}
++
++void
++abd_gate_drop_page(struct page *page)
++{
++	(void) page;
++}
+ #endif /* HAVE_PGTY_MODMOVABLE */
+ #else
+ #define	abd_mark_zfs_page(page)
+@@ -482,7 +602,7 @@ abd_alloc_chunks(abd_t *abd, size_t size)
+ 		size_t sg_size = MIN(PAGESIZE << compound_order(page),
+ 		    remaining_size);
+ 		sg_set_page(sg, page, sg_size, 0);
+-		abd_mark_movable_page(page, abd);
++		abd_mark_zfs_page(page);
+ 		remaining_size -= sg_size;
+ 
+ 		sg = sg_next(sg);
+@@ -526,6 +646,27 @@ abd_alloc_chunks(abd_t *abd, size_t size)
+ 		ABDSTAT_BUMP(abdstat_scatter_page_multi_chunk);
+ 		abd->abd_flags |= ABD_FLAG_MULTI_CHUNK;
+ 
++#ifdef HAVE_PGTY_MODMOVABLE
++		/*
++		 * Only now is it known that this abd will not be turned into a
++		 * linear one above. That form hands out the address of its one
++		 * chunk directly, to callers that keep it and never look at the
++		 * scatterlist again, so its page can never be allowed to move.
++		 */
++		{
++			struct scatterlist *msg;
++			int mi;
++
++			/*
++			 * Walk the table rather than the abd: its scatterlist
++			 * is only attached further below.
++			 */
++			for_each_sg(table.sgl, msg, table.nents, mi) {
++				abd_make_page_movable(sg_page(msg), abd);
++			}
++		}
++#endif
++
+ 		if (zones) {
+ 			ABDSTAT_BUMP(abdstat_scatter_page_multi_zone);
+ 			abd->abd_flags |= ABD_FLAG_MULTI_ZONE;
+@@ -570,7 +711,7 @@ abd_alloc_chunks(abd_t *abd, size_t size)
+ 
+ 		ABDSTAT_BUMP(abdstat_scatter_orders[0]);
+ 		sg_set_page(sg, page, PAGESIZE, 0);
+-		abd_mark_movable_page(page, abd);
++		abd_mark_zfs_page(page);
+ 	}
+ 
+ 	if (nr_pages > 1) {
+@@ -780,6 +921,12 @@ abd_kstats_update(kstat_t *ksp, int rw)
+ 	    wmsum_value(&abd_sums.abdstat_page_isolate_asked);
+ 	as->abdstat_page_isolate_no_owner.value.ui64 =
+ 	    wmsum_value(&abd_sums.abdstat_page_isolate_no_owner);
++	as->abdstat_page_migrated.value.ui64 =
++	    wmsum_value(&abd_sums.abdstat_page_migrated);
++	as->abdstat_page_migrate_busy.value.ui64 =
++	    wmsum_value(&abd_sums.abdstat_page_migrate_busy);
++	as->abdstat_page_migrate_lost.value.ui64 =
++	    wmsum_value(&abd_sums.abdstat_page_migrate_lost);
+ 	return (0);
+ }
+ 
+@@ -805,6 +952,9 @@ abd_init(void)
+ 	wmsum_init(&abd_sums.abdstat_scatter_sg_table_retry, 0);
+ 	wmsum_init(&abd_sums.abdstat_page_isolate_asked, 0);
+ 	wmsum_init(&abd_sums.abdstat_page_isolate_no_owner, 0);
++	wmsum_init(&abd_sums.abdstat_page_migrated, 0);
++	wmsum_init(&abd_sums.abdstat_page_migrate_busy, 0);
++	wmsum_init(&abd_sums.abdstat_page_migrate_lost, 0);
+ 
+ 	abd_ksp = kstat_create("zfs", 0, "abdstats", "misc", KSTAT_TYPE_NAMED,
+ 	    sizeof (abd_stats) / sizeof (kstat_named_t), KSTAT_FLAG_VIRTUAL);
+@@ -861,6 +1011,9 @@ abd_fini(void)
+ 	wmsum_fini(&abd_sums.abdstat_scatter_sg_table_retry);
+ 	wmsum_fini(&abd_sums.abdstat_page_isolate_asked);
+ 	wmsum_fini(&abd_sums.abdstat_page_isolate_no_owner);
++	wmsum_fini(&abd_sums.abdstat_page_migrated);
++	wmsum_fini(&abd_sums.abdstat_page_migrate_busy);
++	wmsum_fini(&abd_sums.abdstat_page_migrate_lost);
+ 
+ 	if (abd_cache) {
+ 		kmem_cache_destroy(abd_cache);
+@@ -1048,6 +1201,9 @@ abd_iter_advance(struct abd_iter *aiter, size_t amount)
+ 	ASSERT0(aiter->iter_page_doff);
+ 	ASSERT0(aiter->iter_page_dsize);
+ 
++	abd_gate_exit(aiter->iter_gate);
++	aiter->iter_gate = NULL;
++
+ 	/* There's nothing left to advance to, so do nothing */
+ 	if (abd_iter_at_end(aiter))
+ 		return;
+@@ -1318,6 +1474,8 @@ void
+ abd_iter_page(struct abd_iter *aiter)
+ {
+ 	if (abd_iter_at_end(aiter)) {
++		abd_gate_exit(aiter->iter_gate);
++		aiter->iter_gate = NULL;
+ 		aiter->iter_page = NULL;
+ 		aiter->iter_page_doff = 0;
+ 		aiter->iter_page_dsize = 0;
+@@ -1348,9 +1506,17 @@ abd_iter_page(struct abd_iter *aiter)
+ 	} else {
+ 		ASSERT(!abd_is_gang(aiter->iter_abd));
+ 
++		/*
++		 * Taken before the entry is read, so the page handed out is
++		 * the one the scatterlist points at and stays that way for as
++		 * long as the caller has it. Released by abd_iter_advance()
++		 * or abd_iter_page_done().
++		 */
++		struct page *head;
++		aiter->iter_gate = abd_gate_enter(aiter->iter_sg, &head);
++
+ 		/* current scatter page */
+-		page = nth_page(sg_page(aiter->iter_sg),
+-		    aiter->iter_offset >> PAGE_SHIFT);
++		page = nth_page(head, aiter->iter_offset >> PAGE_SHIFT);
+ 
+ 		/* position within page */
+ 		doff = aiter->iter_offset & (PAGESIZE - 1);
+diff --git a/module/os/linux/zfs/vdev_disk.c b/module/os/linux/zfs/vdev_disk.c
+index ab7457b04..4967ca20f 100644
+--- a/module/os/linux/zfs/vdev_disk.c
++++ b/module/os/linux/zfs/vdev_disk.c
+@@ -666,6 +666,14 @@ typedef struct {
+ 
+ 	abd_t		*vbio_abd;	/* abd carrying borrowed linear buf */
+ 
++	/*
++	 * The abd whose chunks are held still for the duration of the io,
++	 * and its length, so the same walk can release them once the device
++	 * is finished with the pages.
++	 */
++	abd_t		*vbio_held_abd;
++	uint64_t	vbio_held_size;
++
+ 	uint_t		vbio_max_segs;	/* max segs per bio */
+ 
+ 	uint_t		vbio_max_bytes;	/* max bytes per bio */
+@@ -755,9 +763,26 @@ static int
+ vbio_fill_cb(struct page *page, size_t off, size_t len, void *priv)
+ {
+ 	vbio_t *vbio = priv;
++
++	/*
++	 * The page outlives this walk: it goes to the device and is touched
++	 * long after we return. Hold it until the io is done.
++	 */
++	abd_gate_hold_page(page);
++
+ 	return (vbio_add_page(vbio, page, len, off));
+ }
+ 
++static int
++vbio_release_cb(struct page *page, size_t off, size_t len, void *priv)
++{
++	(void) off, (void) len, (void) priv;
++
++	abd_gate_drop_page(page);
++
++	return (0);
++}
++
+ /* Create some BIOs, fill them with data and submit them */
+ static void
+ vbio_submit(vbio_t *vbio, abd_t *abd, uint64_t size)
+@@ -773,6 +798,9 @@ vbio_submit(vbio_t *vbio, abd_t *abd, uint64_t size)
+ 	struct blk_plug plug;
+ 	blk_start_plug(&plug);
+ 
++	vbio->vbio_held_abd = abd;
++	vbio->vbio_held_size = size;
++
+ 	(void) abd_iterate_page_func(abd, 0, size, vbio_fill_cb, vbio);
+ 	ASSERT(vbio->vbio_bio);
+ 
+@@ -1226,6 +1254,17 @@ vdev_disk_io_done(zio_t *zio)
+ 		vbio_t *vbio = zio->io_bio;
+ 		zio->io_bio = NULL;
+ 
++		/*
++		 * The device is finished with the pages, so the chunks behind
++		 * them can move again. This has to come before the copy is
++		 * freed below, since the pages held may be its own.
++		 */
++		if (vbio->vbio_held_abd != NULL) {
++			(void) abd_iterate_page_func(vbio->vbio_held_abd, 0,
++			    vbio->vbio_held_size, vbio_release_cb, NULL);
++			vbio->vbio_held_abd = NULL;
++		}
++
+ 		/*
+ 		 * If we copied the ABD before issuing it, clean up and return
+ 		 * the copy to the ADB, with changes if appropriate.
+-- 
+2.55.0
+

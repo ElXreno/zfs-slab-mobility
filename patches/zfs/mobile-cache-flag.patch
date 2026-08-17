@@ -1,0 +1,100 @@
+From 4a7b46b2abcc17be42d66829242c9b155e9db6c6 Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Sun, 16 Aug 2026 05:18:45 +0300
+Subject: [PATCH] spl: let a cache say at creation that its objects may move
+
+Relocation reads a slab's freelist to tell a live object from a free one,
+so a cache that keeps freed objects anywhere else cannot be evacuated
+correctly, and a cache shared with other subsystems through merging would
+hand their objects to a callback written for ours. Neither can be settled
+after the fact: by then the cache is already serving allocations.
+
+Add a flag that says so at creation, and set it on the two caches that
+register a move callback.
+---
+ include/os/linux/spl/sys/kmem_cache.h |  2 ++
+ module/os/linux/spl/spl-kmem-cache.c  | 18 ++++++++++++++++++
+ module/zfs/arc.c                      |  3 ++-
+ module/zfs/dnode.c                    |  3 ++-
+ 4 files changed, 24 insertions(+), 2 deletions(-)
+
+diff --git a/include/os/linux/spl/sys/kmem_cache.h b/include/os/linux/spl/sys/kmem_cache.h
+index ba407ec..1c5f44a 100644
+--- a/include/os/linux/spl/sys/kmem_cache.h
++++ b/include/os/linux/spl/sys/kmem_cache.h
+@@ -47,6 +47,7 @@ typedef enum kmc_bit {
+ 	KMC_BIT_ALLOC		= 19,	/* Proc handler helper bit */
+ 	KMC_BIT_MAX		= 20,	/* Proc handler helper bit */
+ 	KMC_BIT_RECLAIMABLE	= 21,	/* Can be freed by shrinker */
++	KMC_BIT_MOBILE		= 22,	/* Objects may be relocated */
+ } kmc_bit_t;
+ 
+ /* kmem move callback return values */
+@@ -69,6 +70,7 @@ typedef enum kmem_cbrc {
+ #define	KMC_ALLOC		(1 << KMC_BIT_ALLOC)
+ #define	KMC_MAX			(1 << KMC_BIT_MAX)
+ #define	KMC_RECLAIMABLE		(1 << KMC_BIT_RECLAIMABLE)
++#define	KMC_MOBILE		(1 << KMC_BIT_MOBILE)
+ 
+ extern struct list_head spl_kmem_cache_list;
+ extern struct rw_semaphore spl_kmem_cache_sem;
+diff --git a/module/os/linux/spl/spl-kmem-cache.c b/module/os/linux/spl/spl-kmem-cache.c
+index b370bd7..493f3cb 100644
+--- a/module/os/linux/spl/spl-kmem-cache.c
++++ b/module/os/linux/spl/spl-kmem-cache.c
+@@ -788,6 +788,24 @@ spl_kmem_cache_create(const char *name, size_t size, size_t align,
+ 		 * comes free. It never made the kernel reclaim anything anyway.
+ 		 */
+ 
++		/*
++		 * A cache whose objects may be relocated has to stand alone
++		 * and hold nothing back from its slabs. Sheaves keep freed
++		 * objects out of the slab freelist, which is where relocation
++		 * looks to tell a free object from a live one, and a merged
++		 * cache would hand objects belonging to other subsystems to a
++		 * callback written for this one. Both have to be settled when
++		 * the cache is created; neither can be undone later.
++		 */
++		if (skc->skc_flags & KMC_MOBILE) {
++#ifdef SLAB_NO_SHEAVES
++			slabflags |= SLAB_NO_SHEAVES;
++#endif
++#ifdef SLAB_NO_MERGE
++			slabflags |= SLAB_NO_MERGE;
++#endif
++		}
++
+ 		skc->skc_linux_cache = kmem_cache_create_usercopy(
+ 		    skc->skc_name, size, align, slabflags, 0, size, NULL);
+ 		if (skc->skc_linux_cache == NULL)
+diff --git a/module/zfs/arc.c b/module/zfs/arc.c
+index 99f48c1..8ebc05b 100644
+--- a/module/zfs/arc.c
++++ b/module/zfs/arc.c
+@@ -1311,7 +1311,8 @@ retry:
+ 	}
+ 
+ 	hdr_full_cache = kmem_cache_create("arc_buf_hdr_t_full", HDR_FULL_SIZE,
+-	    0, hdr_full_cons, hdr_full_dest, NULL, NULL, NULL, KMC_RECLAIMABLE);
++	    0, hdr_full_cons, hdr_full_dest, NULL, NULL, NULL,
++	    KMC_RECLAIMABLE | KMC_MOBILE);
+ 	kmem_cache_set_move(hdr_full_cache, arc_hdr_move);
+ 	hdr_l2only_cache = kmem_cache_create("arc_buf_hdr_t_l2only",
+ 	    HDR_L2ONLY_SIZE, 0, hdr_l2only_cons, hdr_l2only_dest, NULL,
+diff --git a/module/zfs/dnode.c b/module/zfs/dnode.c
+index 8fc8d9f..50477a0 100644
+--- a/module/zfs/dnode.c
++++ b/module/zfs/dnode.c
+@@ -326,7 +326,8 @@ dnode_init(void)
+ {
+ 	ASSERT0P(dnode_cache);
+ 	dnode_cache = kmem_cache_create("dnode_t", sizeof (dnode_t),
+-	    0, dnode_cons, dnode_dest, NULL, NULL, NULL, KMC_RECLAIMABLE);
++	    0, dnode_cons, dnode_dest, NULL, NULL, NULL,
++	    KMC_RECLAIMABLE | KMC_MOBILE);
+ 	kmem_cache_set_move(dnode_cache, dnode_move);
+ 
+ 	wmsum_init(&dnode_sums.dnode_hold_dbuf_hold, 0);
+-- 
+2.55.0
+

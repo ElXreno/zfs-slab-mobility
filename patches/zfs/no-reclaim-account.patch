@@ -1,0 +1,47 @@
+From 9336dcbe8573a89a4abbc73a47107be951f2014b Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Sun, 16 Aug 2026 04:55:24 +0300
+Subject: [PATCH] spl: stop grouping the slab caches with the data they
+ describe
+
+SLAB_RECLAIM_ACCOUNT asks the page allocator for reclaimable pageblocks,
+which is where scatter abd chunks already go. A chunk is reclaimable in
+the sense the allocator means: its owner hands it back on request. A slab
+page is not, it comes back only once its last object dies, and for these
+caches that is rare. Sharing pageblocks between the two leaves every block
+holding a live object of any of them, and none of them come free.
+
+Measured in a vm, arc holding 1GiB of data after a shrink: pageblocks with
+more than one immovable owner fall from 178 to 85 and from 135 to 72 over
+two runs, and the blocks holding free memory out of reach fall with them.
+
+Nothing is lost in reclaim: the flag never made the kernel free anything,
+the shrinker this module registers does that and runs either way. What is
+lost is the MemAvailable estimate, which counts about half of this memory,
+340MiB out of 62GiB here.
+---
+ module/os/linux/spl/spl-kmem-cache.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/module/os/linux/spl/spl-kmem-cache.c b/module/os/linux/spl/spl-kmem-cache.c
+index 6d496e6..cea22f0 100644
+--- a/module/os/linux/spl/spl-kmem-cache.c
++++ b/module/os/linux/spl/spl-kmem-cache.c
+@@ -781,8 +781,12 @@ spl_kmem_cache_create(const char *name, size_t size, size_t align,
+ 		if (size > spl_kmem_cache_slab_limit)
+ 			goto out;
+ 
+-		if (skc->skc_flags & KMC_RECLAIMABLE)
+-			slabflags |= SLAB_RECLAIM_ACCOUNT;
++		/*
++		 * KMC_RECLAIMABLE deliberately does not become
++		 * SLAB_RECLAIM_ACCOUNT: that would put these caches in the
++		 * pageblocks the abd chunks use, and a block holding both never
++		 * comes free. It never made the kernel reclaim anything anyway.
++		 */
+ 
+ 		skc->skc_linux_cache = kmem_cache_create_usercopy(
+ 		    skc->skc_name, size, align, slabflags, 0, size, NULL);
+-- 
+2.55.0
+

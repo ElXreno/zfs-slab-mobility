@@ -1,0 +1,137 @@
+# The suite.
+#
+# Every check is a comparison of builds, never a single run against a constant:
+# absolute counts depend on the machine, the guest size and the workload, while
+# the ratio between two builds measured back to back does not.
+#
+# Three seeds per build. Two would leave a median that is really a mean, and a
+# single outlier could then carry a threshold on its own.
+{
+  pkgs,
+  lib,
+  fragview,
+  fragload,
+}:
+
+let
+  variants = import ../nix/variants.nix { inherit pkgs lib; };
+
+  mkRun = import ./run.nix {
+    inherit
+      pkgs
+      lib
+      variants
+      fragload
+      ;
+  };
+
+  mkCompare = import ./compare.nix { inherit pkgs lib fragview; };
+
+  seeds = [
+    1
+    2
+    3
+  ];
+
+  runsFor = args: variant: map (seed: mkRun (args // { inherit variant seed; })) seeds;
+
+  checks = {
+    # The one line change. Not letting the ZFS slab caches ask for the pageblocks
+    # the data pages live in should roughly halve the count of blocks that hold
+    # both, and take the memory pinned by nearly empty blocks down with it.
+    separation = mkCompare {
+      name = "separation";
+      order = [
+        "stock"
+        "separation"
+      ];
+      runs = {
+        stock = runsFor { } "stock";
+        separation = runsFor { } "separation";
+      };
+      expect = [
+        {
+          metric = "mixed";
+          from = "stock";
+          to = "separation";
+          atMost = 0.8;
+        }
+        {
+          metric = "pinned";
+          from = "stock";
+          to = "separation";
+          atMost = 0.8;
+        }
+      ];
+    };
+
+    # Object relocation and movable ABD pages. At this guest size the outcome is
+    # not reliably better than separation alone, so what is asserted is that the
+    # patches do what they claim: the scatter ABD ends up in movable pageblocks
+    # instead of unmovable ones. Whether that turns into fewer hostage blocks
+    # depends on how much there is to move, which is a property of the workload.
+    mobility = mkCompare {
+      name = "mobility";
+      order = [
+        "separation"
+        "mobility"
+      ];
+      runs = {
+        separation = runsFor { } "separation";
+        mobility = runsFor { } "mobility";
+      };
+      expect = [
+        {
+          metric = "blocks_movable";
+          from = "separation";
+          to = "mobility";
+          atLeast = 1.5;
+        }
+        {
+          metric = "pinned";
+          from = "separation";
+          to = "mobility";
+          atMost = 1.1;
+        }
+      ];
+    };
+
+    # vm.defrag_mode tells the allocator to compact rather than mix migrate types.
+    # That is worth something only if the pages it wants to compact can move, so
+    # on a stock kernel it should make no measurable difference either way.
+    defrag-mode = mkCompare {
+      name = "defrag-mode";
+      order = [
+        "on"
+        "off"
+      ];
+      runs = {
+        on = runsFor { defragMode = 1; } "stock";
+        off = runsFor { defragMode = 0; } "stock";
+      };
+      expect = [
+        {
+          metric = "pinned";
+          from = "on";
+          to = "off";
+          atMost = 1.15;
+        }
+        {
+          metric = "pinned";
+          from = "on";
+          to = "off";
+          atLeast = 0.85;
+        }
+      ];
+    };
+  };
+in
+{
+  inherit checks;
+
+  runs = {
+    run-stock = mkRun { variant = "stock"; };
+    run-separation = mkRun { variant = "separation"; };
+    run-mobility = mkRun { variant = "mobility"; };
+  };
+}

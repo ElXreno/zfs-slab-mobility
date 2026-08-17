@@ -1,0 +1,253 @@
+From 4951d0b9616441ccfc292d1ca0530a641fe2a38e Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Sat, 15 Aug 2026 12:25:09 +0300
+Subject: [PATCH] abd: offer scatter chunks to the page allocator as
+ relocatable
+
+A pageblock holding a few ABD chunks is a pageblock compaction can never
+hand back, and after an ARC shrink there are a great many of them: measured
+on a 62G desktop, 31MiB of chunks kept 171 pageblocks and 328MiB of free
+memory out of reach, six times what every slab cache together held.
+
+Nothing moves yet. This registers the chunks with the page allocator and
+records the owning abd on each page, so that compaction reaches us and we
+can see it doing so; every offer is refused. Relocating for real needs a
+handshake against readers of the chunk, and that is worth landing on its
+own rather than hidden underneath the plumbing.
+
+The owner goes in the page's private word, which until now carried a
+constant that nothing reads. Relocation has to get from a page back to the
+scatterlist entry pointing at it, and that entry is reachable only through
+its owner. The zero page keeps the old constant: it is shared by every
+zero-filled abd and belongs to no one, and it is never offered.
+---
+ module/os/linux/zfs/abd_os.c | 131 ++++++++++++++++++++++++++++++++++-
+ 1 file changed, 128 insertions(+), 3 deletions(-)
+
+diff --git a/module/os/linux/zfs/abd_os.c b/module/os/linux/zfs/abd_os.c
+index 2fd3c3f69..2f81c224e 100644
+--- a/module/os/linux/zfs/abd_os.c
++++ b/module/os/linux/zfs/abd_os.c
+@@ -63,6 +63,7 @@
+ #include <linux/kmap_compat.h>
+ #include <linux/mm_compat.h>
+ #include <linux/scatterlist.h>
++#include <linux/migrate.h>
+ #include <linux/version.h>
+ 
+ #if defined(MAX_ORDER)
+@@ -83,6 +84,12 @@ typedef struct abd_stats {
+ 	kstat_named_t abdstat_scatter_page_multi_zone;
+ 	kstat_named_t abdstat_scatter_page_alloc_retry;
+ 	kstat_named_t abdstat_scatter_sg_table_retry;
++	/*
++	 * Number of times the page allocator offered to relocate a chunk, and
++	 * of those, how many had lost the back pointer to their owner.
++	 */
++	kstat_named_t abdstat_page_isolate_asked;
++	kstat_named_t abdstat_page_isolate_no_owner;
+ } abd_stats_t;
+ 
+ static abd_stats_t abd_stats = {
+@@ -137,6 +144,8 @@ static abd_stats_t abd_stats = {
+ 	 *  allocate the sg table for an ABD.
+ 	 */
+ 	{ "scatter_sg_table_retry",		KSTAT_DATA_UINT64 },
++	{ "page_isolate_asked",			KSTAT_DATA_UINT64 },
++	{ "page_isolate_no_owner",		KSTAT_DATA_UINT64 },
+ };
+ 
+ static struct {
+@@ -151,6 +160,8 @@ static struct {
+ 	wmsum_t abdstat_scatter_page_multi_zone;
+ 	wmsum_t abdstat_scatter_page_alloc_retry;
+ 	wmsum_t abdstat_scatter_sg_table_retry;
++	wmsum_t abdstat_page_isolate_asked;
++	wmsum_t abdstat_page_isolate_no_owner;
+ } abd_sums;
+ 
+ #define	abd_for_each_sg(abd, sg, n, i)	\
+@@ -250,6 +261,98 @@ abd_unmark_zfs_page(struct page *page)
+ 	ClearPagePrivate(page);
+ 	put_page(page);
+ }
++
++#ifdef HAVE_PGTY_MODMOVABLE
++/*
++ * Offer a chunk to the page allocator as relocatable.
++ *
++ * The private word carries the abd that owns the pages rather than the marker
++ * above, because relocation has to get from a page back to the scatterlist
++ * entry that points at it, and that entry is reachable only through its owner.
++ * The zero page keeps the marker: it is shared by every zero-filled abd and
++ * belongs to no one.
++ */
++static inline void
++abd_mark_movable_page(struct page *page, abd_t *abd)
++{
++	get_page(page);
++	SetPagePrivate(page);
++	set_page_private(page, (unsigned long)abd);
++	__SetPageModMovable(page);
++	SetPageMovableOps(page);
++}
++
++static inline void
++abd_unmark_movable_page(struct page *page)
++{
++	__ClearPageModMovable(page);
++	set_page_private(page, 0UL);
++	ClearPagePrivate(page);
++	put_page(page);
++}
++
++static inline abd_t *
++abd_page_owner(struct page *page)
++{
++	if (!PageModMovable(page))
++		return (NULL);
++	return ((abd_t *)page_private(page));
++}
++
++/*
++ * The page allocator asks whether a chunk can be relocated. Nothing is moved
++ * yet: this half of the work only proves the path from compaction down to the
++ * owning abd, and counts how often it is offered. Relocating for real needs a
++ * handshake against readers, which is deliberately kept separate because
++ * getting it wrong corrupts data rather than merely wasting effort.
++ */
++static bool
++abd_page_isolate(struct page *page, isolate_mode_t mode)
++{
++	(void) mode;
++
++	ABDSTAT_BUMP(abdstat_page_isolate_asked);
++
++	/*
++	 * Must never fire: a page is only offered here because we marked it,
++	 * and we only mark pages whose owner we recorded at the same moment.
++	 * It is counted rather than asserted because a broken back pointer is
++	 * exactly what this half of the work exists to rule out.
++	 */
++	if (abd_page_owner(page) == NULL)
++		ABDSTAT_BUMP(abdstat_page_isolate_no_owner);
++
++	return (B_FALSE);
++}
++
++static int
++abd_page_migrate(struct page *dst, struct page *src, enum migrate_mode mode)
++{
++	(void) dst, (void) src, (void) mode;
++
++	/* Never isolated, so never asked to move. */
++	ASSERT(0);
++	return (-EAGAIN);
++}
++
++static void
++abd_page_putback(struct page *page)
++{
++	(void) page;
++
++	/* Never isolated, so never given back. */
++	ASSERT(0);
++}
++
++static const struct movable_operations abd_movable_ops = {
++	.isolate_page	= abd_page_isolate,
++	.migrate_page	= abd_page_migrate,
++	.putback_page	= abd_page_putback,
++};
++#else
++#define	abd_mark_movable_page(page, abd)	abd_mark_zfs_page(page)
++#define	abd_unmark_movable_page(page)		abd_unmark_zfs_page(page)
++#endif /* HAVE_PGTY_MODMOVABLE */
+ #else
+ #define	abd_mark_zfs_page(page)
+ #define	abd_unmark_zfs_page(page)
+@@ -327,7 +430,7 @@ abd_alloc_chunks(abd_t *abd, size_t size)
+ 		size_t sg_size = MIN(PAGESIZE << compound_order(page),
+ 		    remaining_size);
+ 		sg_set_page(sg, page, sg_size, 0);
+-		abd_mark_zfs_page(page);
++		abd_mark_movable_page(page, abd);
+ 		remaining_size -= sg_size;
+ 
+ 		sg = sg_next(sg);
+@@ -414,7 +517,7 @@ abd_alloc_chunks(abd_t *abd, size_t size)
+ 
+ 		ABDSTAT_BUMP(abdstat_scatter_orders[0]);
+ 		sg_set_page(sg, page, PAGESIZE, 0);
+-		abd_mark_zfs_page(page);
++		abd_mark_movable_page(page, abd);
+ 	}
+ 
+ 	if (nr_pages > 1) {
+@@ -459,7 +562,7 @@ abd_free_chunks(abd_t *abd)
+ 	if (!abd_is_from_pages(abd)) {
+ 		abd_for_each_sg(abd, sg, nr_pages, i) {
+ 			page = sg_page(sg);
+-			abd_unmark_zfs_page(page);
++			abd_unmark_movable_page(page);
+ 			order = compound_order(page);
+ 			__free_pages(page, order);
+ 			ASSERT3U(sg->length, <=, PAGE_SIZE << order);
+@@ -620,6 +723,10 @@ abd_kstats_update(kstat_t *ksp, int rw)
+ 	    wmsum_value(&abd_sums.abdstat_scatter_page_alloc_retry);
+ 	as->abdstat_scatter_sg_table_retry.value.ui64 =
+ 	    wmsum_value(&abd_sums.abdstat_scatter_sg_table_retry);
++	as->abdstat_page_isolate_asked.value.ui64 =
++	    wmsum_value(&abd_sums.abdstat_page_isolate_asked);
++	as->abdstat_page_isolate_no_owner.value.ui64 =
++	    wmsum_value(&abd_sums.abdstat_page_isolate_no_owner);
+ 	return (0);
+ }
+ 
+@@ -643,6 +750,8 @@ abd_init(void)
+ 	wmsum_init(&abd_sums.abdstat_scatter_page_multi_zone, 0);
+ 	wmsum_init(&abd_sums.abdstat_scatter_page_alloc_retry, 0);
+ 	wmsum_init(&abd_sums.abdstat_scatter_sg_table_retry, 0);
++	wmsum_init(&abd_sums.abdstat_page_isolate_asked, 0);
++	wmsum_init(&abd_sums.abdstat_page_isolate_no_owner, 0);
+ 
+ 	abd_ksp = kstat_create("zfs", 0, "abdstats", "misc", KSTAT_TYPE_NAMED,
+ 	    sizeof (abd_stats) / sizeof (kstat_named_t), KSTAT_FLAG_VIRTUAL);
+@@ -659,11 +768,25 @@ abd_init(void)
+ 	}
+ 
+ 	abd_alloc_zero_scatter();
++
++#ifdef HAVE_PGTY_MODMOVABLE
++	if (set_movable_ops(&abd_movable_ops, PGTY_modmovable) != 0)
++		printk(KERN_NOTICE "ZFS: chunks cannot be relocated\n");
++#endif
+ }
+ 
+ void
+ abd_fini(void)
+ {
++#ifdef HAVE_PGTY_MODMOVABLE
++	/*
++	 * Every marked page belongs to an abd, and an abd outliving this
++	 * would have kept the module loaded, so releasing the slot here
++	 * cannot leave a marked page behind with nowhere to ask.
++	 */
++	(void) set_movable_ops(NULL, PGTY_modmovable);
++#endif
++
+ 	abd_free_zero_scatter();
+ 
+ 	if (abd_ksp != NULL) {
+@@ -683,6 +806,8 @@ abd_fini(void)
+ 	wmsum_fini(&abd_sums.abdstat_scatter_page_multi_zone);
+ 	wmsum_fini(&abd_sums.abdstat_scatter_page_alloc_retry);
+ 	wmsum_fini(&abd_sums.abdstat_scatter_sg_table_retry);
++	wmsum_fini(&abd_sums.abdstat_page_isolate_asked);
++	wmsum_fini(&abd_sums.abdstat_page_isolate_no_owner);
+ 
+ 	if (abd_cache) {
+ 		kmem_cache_destroy(abd_cache);
+-- 
+2.55.0
+

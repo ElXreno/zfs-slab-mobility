@@ -1,0 +1,132 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  eval:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      any-jobs: ${{ steps.matrix.outputs.any-jobs }}
+      manifest-version: ${{ steps.matrix.outputs.manifest-version }}
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: cachix/install-nix-action@v31.11.1
+      - uses: Mic92/hestia@v3
+      - id: matrix
+        uses: Mic92/hestia/matrix@v3
+        with:
+          nix-eval-jobs: "nix run nixpkgs#nix-eval-jobs --"
+
+  build:
+    needs: eval
+    if: needs.eval.outputs.any-jobs == 'true'
+    name: ${{ matrix.name }} (${{ matrix.system }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.eval.outputs.matrix) }}
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: wimpysworld/nothing-but-nix@main
+        with:
+          nix-permission-edict: true
+          hatchet-protocol: "rampage"
+          root-safe-haven: "4096"
+
+      - uses: cachix/install-nix-action@v31.11.1
+        with:
+          extra_nix_config: |
+            build-dir = /nix/_build
+            extra-sandbox-paths = /nix/ccache
+            system-features = kvm nixos-test benchmark big-parallel
+
+      - name: Prepare build and cache directories
+        run: |
+          sudo mkdir -p /nix/_build
+          sudo install -d -m 0777 /nix/ccache
+          echo "TMPDIR=" >> "$GITHUB_ENV"
+
+      # Per check on purpose: merging would mix objects built with different
+      # patches, lowering the hit rate for a bigger archive.
+      - name: Restore object cache
+        uses: actions/cache/restore@v4
+        with:
+          path: /nix/ccache
+          key: ccache-${{ matrix.name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.name }}-
+
+      - uses: Mic92/hestia@v3
+        with:
+          wait-manifest-version: ${{ needs.eval.outputs.manifest-version }}
+
+      - name: Prefetch drv closure
+        run: |
+          hashes=$(printf '%s\n' ${{ matrix.installables }} |
+            awk -F/ '{printf "%s%s", (NR > 1 ? "," : ""), substr($NF, 1, 32)}')
+          curl -fsS "http://$HESTIA_LISTEN/closure/$hashes" | nix-store --import
+
+      # -j1 is not optional: a comparison is six guests of six gigabytes each,
+      # and nix will happily start several at once.
+      # Not piped into tee: bash -e without pipefail would hand back tee's exit
+      # code and a failed check would look like it had passed.
+      - name: Build
+        run: |
+          nix build -j1 -L --no-link --print-out-paths ${{ matrix.installables }} \
+            > "$RUNNER_TEMP/paths"
+          cat "$RUNNER_TEMP/paths"
+
+      - name: Report
+        if: always()
+        run: |
+          [ -s "$RUNNER_TEMP/paths" ] || exit 0
+          while read -r p; do
+            [ -f "$p/summary.md" ] && cat "$p/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          done < "$RUNNER_TEMP/paths"
+
+      - name: Collect artifacts
+        if: always()
+        run: |
+          [ -s "$RUNNER_TEMP/paths" ] || exit 0
+          mkdir -p artifacts
+          while read -r p; do
+            cp -rL "$p"/. artifacts/
+          done < "$RUNNER_TEMP/paths"
+          chmod -R u+w artifacts
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ matrix.name }}
+          path: artifacts
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Trim object cache
+        if: always()
+        run: |
+          nix run nixpkgs#ccache -- --dir /nix/ccache --max-size 8G --cleanup || true
+
+      - name: Save object cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: /nix/ccache
+          key: ccache-${{ matrix.name }}-${{ github.sha }}
+

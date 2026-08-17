@@ -1,0 +1,28 @@
+From: ElXreno <elxreno@gmail.com>
+Subject: [PATCH] dbuf: take the dnode handles back on Linux
+
+Commit ed87d456 ("Skip dnode handles use when not needed") made a dbuf
+point at its dnode directly on Linux and FreeBSD, because "Neither
+FreeBSD nor Linux currently implement kmem_cache_set_move(), which means
+dnode_move() is never called", and the three zrlock round trips per dbuf
+life cycle were paying for nothing. Now that the Linux allocator can ask
+a cache to relocate its objects, they pay for something again: without a
+handle in between, a dnode cannot move at all, and dnode_move() returns
+KMEM_CBRC_NO for every object it is offered.
+
+This only flips the switch back for Linux. The code behind it is the one
+that shipped here until 2024 and is still what illumos uses, and FreeBSD
+keeps the simplified path since nothing asks it to move anything.
+---
+diff --git a/include/sys/dbuf.h b/include/sys/dbuf.h
+--- a/include/sys/dbuf.h
++++ b/include/sys/dbuf.h
+@@ -213,7 +213,7 @@
+ 	 * Handle to safely access the dnode we belong to (NULL when evicted)
+ 	 * if dnode_move() is used on the platform, or just dnode otherwise.
+ 	 */
+-#if !defined(__linux__) && !defined(__FreeBSD__)
++#if !defined(__FreeBSD__)
+ #define	USE_DNODE_HANDLE	1
+ 	struct dnode_handle *db_dnode_handle;
+ #else

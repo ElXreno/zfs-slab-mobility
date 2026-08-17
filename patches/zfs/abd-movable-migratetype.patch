@@ -1,0 +1,99 @@
+From 7bb9570379f8f2068fec74d35e684127337d4717 Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Sat, 15 Aug 2026 23:09:29 +0300
+Subject: [PATCH] abd: put relocatable chunks where compaction works
+
+Chunks were asked for as reclaimable, which tells the page allocator they
+cannot be moved but their owner can be asked to give them up. That puts
+them in the same pageblocks as every reclaimable slab cache, this module's
+own among them, and measured on a 62G desktop the two end up mixed: of the
+18585 blocks holding free memory out of reach, only about two thousand are
+held by chunks alone and two thousand by slab alone, while eight and a half
+thousand need both to move before they come free.
+
+Now that a chunk can be relocated, movable is what it is, and it groups
+with the pages compaction already works on rather than with the slab.
+
+Stop shortening a single chunk abd to a linear one at the same time. That
+form hands out the address of its chunk to callers that keep it, so the
+chunk could never move, and it is not a corner: only one scatter abd in six
+has more than one chunk, so the shortcut would leave most of the cache
+where it was. It costs the copy in abd_borrow_buf() that the shortcut
+avoided.
+---
+ module/os/linux/zfs/abd_os.c | 42 +++++++++++++++++++++++++++---------
+ 1 file changed, 32 insertions(+), 10 deletions(-)
+
+diff --git a/module/os/linux/zfs/abd_os.c b/module/os/linux/zfs/abd_os.c
+index 743684001..e7a453e14 100644
+--- a/module/os/linux/zfs/abd_os.c
++++ b/module/os/linux/zfs/abd_os.c
+@@ -544,7 +544,19 @@ abd_alloc_chunks(abd_t *abd, size_t size)
+ 	struct sg_table table;
+ 	struct scatterlist *sg;
+ 	struct page *page, *tmp_page = NULL;
++	/*
++	 * Reclaimable says the pages cannot be moved but their owner can be
++	 * asked to give them up, which puts them in the same pageblocks as
++	 * every reclaimable slab cache, this module's included. Once a chunk
++	 * can be relocated that is the wrong word for it: movable groups it
++	 * with the pages compaction already works on, and away from the slab
++	 * it used to be mixed with.
++	 */
++#ifdef HAVE_PGTY_MODMOVABLE
++	gfp_t gfp = __GFP_MOVABLE | __GFP_NOWARN | GFP_NOIO;
++#else
+ 	gfp_t gfp = __GFP_RECLAIMABLE | __GFP_NOWARN | GFP_NOIO;
++#endif
+ 	gfp_t gfp_comp = (gfp | __GFP_NORETRY | __GFP_COMP) & ~__GFP_RECLAIM;
+ 	unsigned int max_order = MIN(zfs_abd_scatter_max_order,
+ 	    ABD_MAX_ORDER - 1);
+@@ -616,7 +628,21 @@ abd_alloc_chunks(abd_t *abd, size_t size)
+ 	ASSERT(!PageHighMem(sg_page(table.sgl)));
+ 	ASSERT0(ABD_SCATTER(abd).abd_offset);
+ 
+-	if (table.nents == 1) {
++	/*
++	 * A linear abd hands out the address of its one chunk directly, to
++	 * callers that keep it and never look at the scatterlist again, so
++	 * that chunk could never be relocated. Relocation is worth more than
++	 * the copy the shortcut saves, and taking it here would leave most of
++	 * the cache immovable: only one scatter abd in six has more than one
++	 * chunk.
++	 */
++	boolean_t can_be_linear = (table.nents == 1);
++
++#ifdef HAVE_PGTY_MODMOVABLE
++	can_be_linear = B_FALSE;
++#endif
++
++	if (can_be_linear) {
+ 		/*
+ 		 * Since there is only one entry, this ABD can be represented
+ 		 * as a linear buffer.  All single-page (4K) ABD's can be
+@@ -642,17 +668,13 @@ abd_alloc_chunks(abd_t *abd, size_t size)
+ 		abd->abd_flags |= ABD_FLAG_LINEAR_PAGE;
+ 		abd->abd_u.abd_linear.abd_sgl = table.sgl;
+ 		ABD_LINEAR_BUF(abd) = page_address(sg_page(table.sgl));
+-	} else if (table.nents > 1) {
+-		ABDSTAT_BUMP(abdstat_scatter_page_multi_chunk);
+-		abd->abd_flags |= ABD_FLAG_MULTI_CHUNK;
++	} else {
++		if (table.nents > 1) {
++			ABDSTAT_BUMP(abdstat_scatter_page_multi_chunk);
++			abd->abd_flags |= ABD_FLAG_MULTI_CHUNK;
++		}
+ 
+ #ifdef HAVE_PGTY_MODMOVABLE
+-		/*
+-		 * Only now is it known that this abd will not be turned into a
+-		 * linear one above. That form hands out the address of its one
+-		 * chunk directly, to callers that keep it and never look at the
+-		 * scatterlist again, so its page can never be allowed to move.
+-		 */
+ 		{
+ 			struct scatterlist *msg;
+ 			int mi;
+-- 
+2.55.0
+

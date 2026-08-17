@@ -1,0 +1,46 @@
+From: ElXreno <elxreno@gmail.com>
+Subject: [PATCH] dnode: do not move a dnode whose mutex is still held
+
+dnode_move() decides a dnode is unreferenced by comparing its hold count
+against the number of dbufs pointing at it. That misses a hold which is
+on its way out but not gone: dnode_rele_and_unlock() removes the last
+hold and only afterwards leaves dn_mtx, so in between the counts say the
+dnode is free while a thread is still inside it. Relocating there leaves
+the vacated copy with a held mutex, and mutex_destroy() on it fails
+VERIFY0P(mutex_owner()), which on Linux ends in spl_panic() and a machine
+that looks hung rather than crashed. Seen once in roughly ten runs of a
+compaction workload over 200k files.
+
+Take the owner of dn_mtx into account as well. Reading it without the
+mutex is enough: to take it in order to add or drop a hold, a thread must
+already hold a reference that is not one of the dbufs, which the count
+has just ruled out, and the dbufs themselves cannot act because the
+handle lock is held here.
+
+This only matters where something calls dnode_move(), which until now was
+nowhere on Linux.
+---
+diff --git a/module/zfs/dnode.c b/module/zfs/dnode.c
+--- a/module/zfs/dnode.c
++++ b/module/zfs/dnode.c
+@@ -1167,7 +1167,19 @@
+ 	DTRACE_PROBE3(dnode__move, dnode_t *, odn, int64_t, refcount,
+ 	    uint32_t, dbufs);
+ 
+-	if (refcount > dbufs) {
++	/*
++	 * dn_mtx tells us about a hold that is on its way out but not gone yet.
++	 * dnode_rele_and_unlock() drops the last hold and only then leaves the
++	 * mutex, so between those two the dnode looks unreferenced while its
++	 * owner is still inside it; moving it there leaves the copy behind with
++	 * a held mutex, which the destructor refuses to take apart.
++	 *
++	 * Reading the owner without the mutex is enough here. Anyone who takes
++	 * it in order to add or drop a hold must already have a hold that is
++	 * not one of the dbufs, which is what the count above rules out, and
++	 * the dbufs themselves are shut out by the handle lock we hold.
++	 */
++	if (refcount > dbufs || mutex_owner(&odn->dn_mtx) != NULL) {
+ 		rw_exit(&odn->dn_struct_rwlock);
+ 		zrl_exit(&odn->dn_handle->dnh_zrlock);
+ 		mutex_exit(&os->os_lock);

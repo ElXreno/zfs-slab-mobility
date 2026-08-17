@@ -1,0 +1,140 @@
+From 7e13da254bfc4803b7d6b5152997ef53cd51c43f Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Thu, 13 Aug 2026 22:25:37 +0300
+Subject: [PATCH] spl: wire the move callback up to the allocator
+
+dnode_move() has been sitting in the tree unused on Linux: the illumos
+allocator asks a cache to relocate an object, the Linux one never did, so
+spl_kmem_cache_set_move() was left as a stub. A kernel that implements
+kmem_cache_setup_mobility() can now be told about it.
+
+The two interfaces differ in one respect that matters here. illumos runs
+the constructor once, when a slab is created, while we run it on every
+allocation; the replacement object handed to the callback comes straight
+from the page allocator, so the bridge has to construct it, and to run the
+destructor over whichever of the two objects ends up being freed.
+---
+ include/os/linux/spl/sys/kmem_cache.h |  1 +
+ module/os/linux/spl/spl-kmem-cache.c  | 87 ++++++++++++++++++++++++++-
+ 2 files changed, 86 insertions(+), 2 deletions(-)
+
+diff --git a/include/os/linux/spl/sys/kmem_cache.h b/include/os/linux/spl/sys/kmem_cache.h
+index ca84a92..ba407ec 100644
+--- a/include/os/linux/spl/sys/kmem_cache.h
++++ b/include/os/linux/spl/sys/kmem_cache.h
+@@ -146,6 +146,7 @@ typedef struct spl_kmem_cache {
+ 	uint32_t		skc_mag_refill;	/* Magazine refill count */
+ 	spl_kmem_ctor_t		skc_ctor;	/* Constructor */
+ 	spl_kmem_dtor_t		skc_dtor;	/* Destructor */
++	kmem_cbrc_t		(*skc_move)(void *, void *, size_t, void *);
+ 	void			*skc_private;	/* Private data */
+ 	void			*skc_vmp;	/* Unused */
+ 	struct kmem_cache	*skc_linux_cache; /* Linux slab cache if used */
+diff --git a/module/os/linux/spl/spl-kmem-cache.c b/module/os/linux/spl/spl-kmem-cache.c
+index 6d496e6..9cb7ed6 100644
+--- a/module/os/linux/spl/spl-kmem-cache.c
++++ b/module/os/linux/spl/spl-kmem-cache.c
+@@ -803,15 +803,98 @@ out:
+ }
+ EXPORT_SYMBOL(spl_kmem_cache_create);
+ 
++#ifdef KMEM_CACHE_MOBILITY
+ /*
+- * Register a move callback for cache defragmentation.
+- * XXX: Unimplemented but harmless to stub out for now.
++ * Bridge between the allocator asking for an object to be relocated and the
++ * move callback the consumer wrote for the illumos allocator.
++ *
++ * The two differ in one respect that matters: illumos constructs an object
++ * once when its slab is created, while we run the constructor on every
++ * allocation. The replacement handed to us here came straight from the page
++ * allocator, so it has to be brought into the same state a
++ * spl_kmem_cache_alloc() would have produced, and whichever of the two objects
++ * ends up being freed has to be taken back out of it.
++ */
++static int
++spl_kmem_cache_move_cb(struct kmem_cache *cache, void *old, void *new,
++    size_t size, void *private)
++{
++	spl_kmem_cache_t *skc = private;
++	kmem_cbrc_t rc;
++
++	ASSERT3U(skc->skc_magic, ==, SKC_MAGIC);
++
++	if (skc->skc_ctor)
++		skc->skc_ctor(new, skc->skc_private, KM_NOSLEEP);
++
++	rc = skc->skc_move(old, new, size, skc->skc_private);
++
++	if (skc->skc_dtor)
++		skc->skc_dtor(rc == KMEM_CBRC_YES ? old : new,
++		    skc->skc_private);
++
++	switch (rc) {
++	case KMEM_CBRC_YES:
++		return (KMEM_MOVE_DONE);
++	case KMEM_CBRC_LATER:
++		return (KMEM_MOVE_LATER);
++	case KMEM_CBRC_DONT_KNOW:
++	case KMEM_CBRC_DONT_NEED:
++		return (KMEM_MOVE_UNKNOWN);
++	default:
++		return (KMEM_MOVE_NO);
++	}
++}
++
++/*
++ * Run the constructor once more, when the slab an object lives on is created.
++ *
++ * The move callback can be handed an object that a thread has already taken
++ * from the allocator but has not finished setting up, and it has to be able to
++ * tell that it is not looking at a live object. illumos gets that for free,
++ * because its allocator writes 0xdeadbeef and 0xbaddcafe over everything that
++ * is not in use; the Linux one writes nothing, so an object that has never
++ * been handed out would carry whatever the page happened to contain. Running
++ * the constructor here means every object of the cache is in the state the
++ * subsystem defines from the moment it exists.
++ *
++ * Constructing twice before the first use is harmless: a constructor that is
++ * safe to run on a freshly freed object is safe to run on this one.
++ */
++static void
++spl_kmem_cache_init_cb(struct kmem_cache *cache, void *obj, void *private)
++{
++	spl_kmem_cache_t *skc = private;
++
++	if (skc->skc_ctor)
++		skc->skc_ctor(obj, skc->skc_private, KM_NOSLEEP);
++}
++#endif
++
++/*
++ * Register a move callback for cache defragmentation. Only caches backed by
++ * the Linux allocator can take part, and only on kernels that know how to ask.
+  */
+ void
+ spl_kmem_cache_set_move(spl_kmem_cache_t *skc,
+     kmem_cbrc_t (move)(void *, void *, size_t, void *))
+ {
+ 	ASSERT(move != NULL);
++
++	skc->skc_move = move;
++
++#ifdef KMEM_CACHE_MOBILITY
++	if (skc->skc_linux_cache == NULL)
++		return;
++
++	if (kmem_cache_setup_mobility(skc->skc_linux_cache,
++	    spl_kmem_cache_move_cb,
++	    spl_kmem_cache_init_cb, skc) != 0) {
++		printk(KERN_NOTICE "SPL: cache %s cannot relocate objects\n",
++		    skc->skc_name);
++		skc->skc_move = NULL;
++	}
++#endif
+ }
+ EXPORT_SYMBOL(spl_kmem_cache_set_move);
+ 
+-- 
+2.55.0
+

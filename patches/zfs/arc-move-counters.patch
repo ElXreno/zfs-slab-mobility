@@ -1,0 +1,259 @@
+From 57b453f4e5e78324252b34509ab61efc8662e3eb Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Sat, 15 Aug 2026 10:09:19 +0300
+Subject: [PATCH] arc: count why a header was not relocated
+
+The relocation callback tells the allocator only that a header could not be
+moved right now, so the aggregate refusal rate says nothing about what would
+have to change for the cache to give a slab back. Count each reason on its
+own, since a header commonly has several at once and the overlap is what
+separates a header that is merely reachable from one that is in flight.
+---
+ include/sys/arc_impl.h |  30 ++++++++++
+ module/zfs/arc.c       | 121 ++++++++++++++++++++++++++++++++++++-----
+ 2 files changed, 136 insertions(+), 15 deletions(-)
+
+diff --git a/include/sys/arc_impl.h b/include/sys/arc_impl.h
+index fc81231bf..bbc67b247 100644
+--- a/include/sys/arc_impl.h
++++ b/include/sys/arc_impl.h
+@@ -577,6 +577,25 @@ typedef struct arc_stats {
+ 	kstat_named_t arcstat_evict_l2_eligible_mru;
+ 	kstat_named_t arcstat_evict_l2_ineligible;
+ 	kstat_named_t arcstat_evict_l2_skip;
++	/*
++	 * Outcomes of the relocation callback the allocator uses to empty a
++	 * slab. A header is relocated only when nothing is using it, so the
++	 * reasons one is left where it is say what stands between the cache
++	 * and a slab it could have given back. They are counted separately
++	 * rather than as a first-match, because a header commonly hits more
++	 * than one at once and the overlap is the interesting part.
++	 */
++	kstat_named_t arcstat_move_relocated;
++	kstat_named_t arcstat_move_not_live;
++	kstat_named_t arcstat_move_raced;
++	kstat_named_t arcstat_move_lock_miss;
++	kstat_named_t arcstat_move_deferred;
++	kstat_named_t arcstat_move_defer_held;
++	kstat_named_t arcstat_move_defer_io;
++	kstat_named_t arcstat_move_defer_acb;
++	kstat_named_t arcstat_move_defer_l2write;
++	kstat_named_t arcstat_move_defer_l2hdr;
++	kstat_named_t arcstat_move_defer_nol1;
+ 	kstat_named_t arcstat_hash_elements;
+ 	kstat_named_t arcstat_hash_elements_max;
+ 	kstat_named_t arcstat_hash_collisions;
+@@ -945,6 +964,17 @@ typedef struct arc_sums {
+ 	wmsum_t arcstat_evict_l2_eligible_mru;
+ 	wmsum_t arcstat_evict_l2_ineligible;
+ 	wmsum_t arcstat_evict_l2_skip;
++	wmsum_t arcstat_move_relocated;
++	wmsum_t arcstat_move_not_live;
++	wmsum_t arcstat_move_raced;
++	wmsum_t arcstat_move_lock_miss;
++	wmsum_t arcstat_move_deferred;
++	wmsum_t arcstat_move_defer_held;
++	wmsum_t arcstat_move_defer_io;
++	wmsum_t arcstat_move_defer_acb;
++	wmsum_t arcstat_move_defer_l2write;
++	wmsum_t arcstat_move_defer_l2hdr;
++	wmsum_t arcstat_move_defer_nol1;
+ 	wmsum_t arcstat_hash_elements;
+ 	wmsum_t arcstat_hash_collisions;
+ 	wmsum_t arcstat_hash_chains;
+diff --git a/module/zfs/arc.c b/module/zfs/arc.c
+index ec5367fdf..99f48c178 100644
+--- a/module/zfs/arc.c
++++ b/module/zfs/arc.c
+@@ -532,6 +532,17 @@ arc_stats_t arc_stats = {
+ 	{ "evict_l2_eligible_mru",	KSTAT_DATA_UINT64 },
+ 	{ "evict_l2_ineligible",	KSTAT_DATA_UINT64 },
+ 	{ "evict_l2_skip",		KSTAT_DATA_UINT64 },
++	{ "move_relocated",		KSTAT_DATA_UINT64 },
++	{ "move_not_live",		KSTAT_DATA_UINT64 },
++	{ "move_raced",			KSTAT_DATA_UINT64 },
++	{ "move_lock_miss",		KSTAT_DATA_UINT64 },
++	{ "move_deferred",		KSTAT_DATA_UINT64 },
++	{ "move_defer_held",		KSTAT_DATA_UINT64 },
++	{ "move_defer_io",		KSTAT_DATA_UINT64 },
++	{ "move_defer_acb",		KSTAT_DATA_UINT64 },
++	{ "move_defer_l2write",		KSTAT_DATA_UINT64 },
++	{ "move_defer_l2hdr",		KSTAT_DATA_UINT64 },
++	{ "move_defer_nol1",		KSTAT_DATA_UINT64 },
+ 	{ "hash_elements",		KSTAT_DATA_UINT64 },
+ 	{ "hash_elements_max",		KSTAT_DATA_UINT64 },
+ 	{ "hash_collisions",		KSTAT_DATA_UINT64 },
+@@ -3457,20 +3468,26 @@ arc_hdr_move(void *buf, void *newbuf, size_t size, void *arg)
+ 	kmutex_t *hash_lock;
+ 	multilist_sublist_t *mls;
+ 	arc_state_t *state;
++	boolean_t defer = B_FALSE;
+ 
+-	if (HDR_EMPTY(hdr))
++	if (HDR_EMPTY(hdr)) {
++		ARCSTAT_BUMP(arcstat_move_not_live);
+ 		return (KMEM_CBRC_DONT_KNOW);
++	}
+ 
+ 	/*
+ 	 * Derived from the header's own contents, so it can only be trusted
+ 	 * once it has been taken and the contents rechecked underneath it.
+ 	 */
+ 	hash_lock = HDR_LOCK(hdr);
+-	if (!mutex_tryenter(hash_lock))
++	if (!mutex_tryenter(hash_lock)) {
++		ARCSTAT_BUMP(arcstat_move_lock_miss);
+ 		return (KMEM_CBRC_LATER);
++	}
+ 
+ 	if (HDR_EMPTY(hdr) || HDR_LOCK(hdr) != hash_lock ||
+ 	    !HDR_IN_HASH_TABLE(hdr)) {
++		ARCSTAT_BUMP(arcstat_move_raced);
+ 		mutex_exit(hash_lock);
+ 		return (KMEM_CBRC_DONT_KNOW);
+ 	}
+@@ -3478,15 +3495,47 @@ arc_hdr_move(void *buf, void *newbuf, size_t size, void *arg)
+ 	/*
+ 	 * A hold means somebody reached the header by a route this function
+ 	 * cannot follow, up to and including a pointer sitting in a local
+-	 * variable across a sleep, so a held header is never moved. Buffers
+-	 * are different: they are reachable only through the list below, and
+-	 * their consumers hold the buffer rather than the header, so their
+-	 * back pointers can be corrected here.
+-	 */
+-	if (!HDR_HAS_L1HDR(hdr) || HDR_HAS_L2HDR(hdr) ||
+-	    HDR_IO_IN_PROGRESS(hdr) || HDR_L2_WRITING(hdr) ||
+-	    hdr->b_l1hdr.b_acb != NULL ||
+-	    !zfs_refcount_is_zero(&hdr->b_l1hdr.b_refcnt)) {
++	 * variable across a sleep, so a held header is never moved. Every
++	 * attached buffer takes such a hold, which is why they are not listed
++	 * separately here.
++	 */
++	/*
++	 * Every reason to leave the header alone is counted, not just the
++	 * first one found, because a header commonly has several at once and
++	 * which of them could ever be lifted is the question these counters
++	 * exist to answer. The l1 half has to be established before the rest
++	 * can be read at all, so it is the one test that still stands alone.
++	 */
++	if (!HDR_HAS_L1HDR(hdr)) {
++		ARCSTAT_BUMP(arcstat_move_defer_nol1);
++		ARCSTAT_BUMP(arcstat_move_deferred);
++		mutex_exit(hash_lock);
++		return (KMEM_CBRC_LATER);
++	}
++
++	if (HDR_HAS_L2HDR(hdr)) {
++		ARCSTAT_BUMP(arcstat_move_defer_l2hdr);
++		defer = B_TRUE;
++	}
++	if (HDR_IO_IN_PROGRESS(hdr)) {
++		ARCSTAT_BUMP(arcstat_move_defer_io);
++		defer = B_TRUE;
++	}
++	if (HDR_L2_WRITING(hdr)) {
++		ARCSTAT_BUMP(arcstat_move_defer_l2write);
++		defer = B_TRUE;
++	}
++	if (hdr->b_l1hdr.b_acb != NULL) {
++		ARCSTAT_BUMP(arcstat_move_defer_acb);
++		defer = B_TRUE;
++	}
++	if (!zfs_refcount_is_zero(&hdr->b_l1hdr.b_refcnt)) {
++		ARCSTAT_BUMP(arcstat_move_defer_held);
++		defer = B_TRUE;
++	}
++
++	if (defer) {
++		ARCSTAT_BUMP(arcstat_move_deferred);
+ 		mutex_exit(hash_lock);
+ 		return (KMEM_CBRC_LATER);
+ 	}
+@@ -3511,10 +3560,6 @@ arc_hdr_move(void *buf, void *newbuf, size_t size, void *arg)
+ 	 */
+ 	zfs_refcount_create(&nhdr->b_l1hdr.b_refcnt);
+ 	zfs_refcount_transfer(&nhdr->b_l1hdr.b_refcnt, &hdr->b_l1hdr.b_refcnt);
+-
+-	for (arc_buf_t *buf = nhdr->b_l1hdr.b_buf; buf != NULL;
+-	    buf = buf->b_next)
+-		buf->b_hdr = nhdr;
+ #ifdef ZFS_DEBUG
+ 	mutex_init(&nhdr->b_l1hdr.b_freeze_lock, NULL, MUTEX_DEFAULT, NULL);
+ #endif
+@@ -3549,6 +3594,8 @@ arc_hdr_move(void *buf, void *newbuf, size_t size, void *arg)
+ 
+ 	mutex_exit(hash_lock);
+ 
++	ARCSTAT_BUMP(arcstat_move_relocated);
++
+ 	return (KMEM_CBRC_YES);
+ }
+ 
+@@ -7438,6 +7485,28 @@ arc_kstat_update(kstat_t *ksp, int rw)
+ 	    wmsum_value(&arc_sums.arcstat_evict_l2_ineligible);
+ 	as->arcstat_evict_l2_skip.value.ui64 =
+ 	    wmsum_value(&arc_sums.arcstat_evict_l2_skip);
++	as->arcstat_move_relocated.value.ui64 =
++	    wmsum_value(&arc_sums.arcstat_move_relocated);
++	as->arcstat_move_not_live.value.ui64 =
++	    wmsum_value(&arc_sums.arcstat_move_not_live);
++	as->arcstat_move_raced.value.ui64 =
++	    wmsum_value(&arc_sums.arcstat_move_raced);
++	as->arcstat_move_lock_miss.value.ui64 =
++	    wmsum_value(&arc_sums.arcstat_move_lock_miss);
++	as->arcstat_move_deferred.value.ui64 =
++	    wmsum_value(&arc_sums.arcstat_move_deferred);
++	as->arcstat_move_defer_held.value.ui64 =
++	    wmsum_value(&arc_sums.arcstat_move_defer_held);
++	as->arcstat_move_defer_io.value.ui64 =
++	    wmsum_value(&arc_sums.arcstat_move_defer_io);
++	as->arcstat_move_defer_acb.value.ui64 =
++	    wmsum_value(&arc_sums.arcstat_move_defer_acb);
++	as->arcstat_move_defer_l2write.value.ui64 =
++	    wmsum_value(&arc_sums.arcstat_move_defer_l2write);
++	as->arcstat_move_defer_l2hdr.value.ui64 =
++	    wmsum_value(&arc_sums.arcstat_move_defer_l2hdr);
++	as->arcstat_move_defer_nol1.value.ui64 =
++	    wmsum_value(&arc_sums.arcstat_move_defer_nol1);
+ 	as->arcstat_hash_elements.value.ui64 =
+ 	    as->arcstat_hash_elements_max.value.ui64 =
+ 	    wmsum_value(&arc_sums.arcstat_hash_elements);
+@@ -7866,6 +7935,17 @@ arc_state_init(void)
+ 	wmsum_init(&arc_sums.arcstat_evict_l2_eligible_mru, 0);
+ 	wmsum_init(&arc_sums.arcstat_evict_l2_ineligible, 0);
+ 	wmsum_init(&arc_sums.arcstat_evict_l2_skip, 0);
++	wmsum_init(&arc_sums.arcstat_move_relocated, 0);
++	wmsum_init(&arc_sums.arcstat_move_not_live, 0);
++	wmsum_init(&arc_sums.arcstat_move_raced, 0);
++	wmsum_init(&arc_sums.arcstat_move_lock_miss, 0);
++	wmsum_init(&arc_sums.arcstat_move_deferred, 0);
++	wmsum_init(&arc_sums.arcstat_move_defer_held, 0);
++	wmsum_init(&arc_sums.arcstat_move_defer_io, 0);
++	wmsum_init(&arc_sums.arcstat_move_defer_acb, 0);
++	wmsum_init(&arc_sums.arcstat_move_defer_l2write, 0);
++	wmsum_init(&arc_sums.arcstat_move_defer_l2hdr, 0);
++	wmsum_init(&arc_sums.arcstat_move_defer_nol1, 0);
+ 	wmsum_init(&arc_sums.arcstat_hash_elements, 0);
+ 	wmsum_init(&arc_sums.arcstat_hash_collisions, 0);
+ 	wmsum_init(&arc_sums.arcstat_hash_chains, 0);
+@@ -8025,6 +8105,17 @@ arc_state_fini(void)
+ 	wmsum_fini(&arc_sums.arcstat_evict_l2_eligible_mru);
+ 	wmsum_fini(&arc_sums.arcstat_evict_l2_ineligible);
+ 	wmsum_fini(&arc_sums.arcstat_evict_l2_skip);
++	wmsum_fini(&arc_sums.arcstat_move_relocated);
++	wmsum_fini(&arc_sums.arcstat_move_not_live);
++	wmsum_fini(&arc_sums.arcstat_move_raced);
++	wmsum_fini(&arc_sums.arcstat_move_lock_miss);
++	wmsum_fini(&arc_sums.arcstat_move_deferred);
++	wmsum_fini(&arc_sums.arcstat_move_defer_held);
++	wmsum_fini(&arc_sums.arcstat_move_defer_io);
++	wmsum_fini(&arc_sums.arcstat_move_defer_acb);
++	wmsum_fini(&arc_sums.arcstat_move_defer_l2write);
++	wmsum_fini(&arc_sums.arcstat_move_defer_l2hdr);
++	wmsum_fini(&arc_sums.arcstat_move_defer_nol1);
+ 	wmsum_fini(&arc_sums.arcstat_hash_elements);
+ 	wmsum_fini(&arc_sums.arcstat_hash_collisions);
+ 	wmsum_fini(&arc_sums.arcstat_hash_chains);
+-- 
+2.55.0
+

@@ -1,0 +1,38 @@
+From: ElXreno <elxreno@gmail.com>
+Subject: [PATCH] dnode: do not depend on the allocator poisoning a freed dnode
+
+dnode_move() treats a dnode as live if its objset pointer passes
+POINTER_IS_VALID(), and the comment there explains why that is enough:
+"the memory patterns written by kmem (baddcafe and deadbeef) set at least
+one of the two low bits". That is an illumos property. The Linux
+allocator writes no such pattern, so a dnode that has been handed out by
+kmem_cache_alloc() but not yet filled in by dnode_create(), which sets
+the objset pointer last of all precisely so that this check works, can
+carry anything at all there, including a NULL that POINTER_IS_VALID()
+happily accepts. The result is dnode_move() walking into mutex_enter() on
+a NULL objset.
+
+Invalidate the pointer in the constructor, so that the window between the
+allocation and the end of dnode_create() is closed by the code that
+depends on it rather than by what an allocator happens to leave behind.
+---
+diff --git a/module/zfs/dnode.c b/module/zfs/dnode.c
+--- a/module/zfs/dnode.c
++++ b/module/zfs/dnode.c
+@@ -152,6 +152,16 @@
+ 	zfs_refcount_create(&dn->dn_tx_holds);
+ 	list_link_init(&dn->dn_link);
+ 
++	/*
++	 * dnode_move() decides whether a dnode is live by looking at this
++	 * pointer, and it must not accept one that dnode_create() has not
++	 * finished setting up yet. On illumos that follows from the allocator
++	 * writing 0xdeadbeef and 0xbaddcafe over a freed buffer, which leaves
++	 * one of the two low bits set, but nothing writes those patterns here.
++	 * Say it outright instead: a dnode is not movable until it is created.
++	 */
++	POINTER_INVALIDATE(&dn->dn_objset);
++
+ 	memset(dn->dn_next_type, 0, sizeof (dn->dn_next_type));
+ 	memset(dn->dn_next_nblkptr, 0, sizeof (dn->dn_next_nblkptr));
+ 	memset(dn->dn_next_nlevels, 0, sizeof (dn->dn_next_nlevels));

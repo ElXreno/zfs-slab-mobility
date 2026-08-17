@@ -1,0 +1,194 @@
+From 8e31f46e041df837f05824f9f7b09861ad5de5b9 Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Sat, 15 Aug 2026 03:13:44 +0300
+Subject: [PATCH] arc: relocate quiet headers when the allocator asks
+
+A pageblock holding a few arc_buf_hdr_t is a pageblock the page allocator
+can never hand out, and after a shrinker has run there are a great many of
+them: measured on a 62G desktop, the full header cache sat at 31% occupancy
+spread over 7124 pageblocks, more than any other cache on the machine.
+
+Register a move callback so the allocator can ask for those headers to be
+relocated and give the slabs back. Three things make this cheap enough to
+be worth doing.
+
+A header carries its own liveness marker already. The constructor zeroes
+the whole structure and the destructor asserts it has been zeroed again, so
+a header with an empty dva is either on its way in or on its way out and is
+not ours to touch. Nothing had to be added to tell live from free.
+
+The dva also decides both which hash lock covers the header and which
+sublist of its state holds it. The copy keeps the same dva, so it belongs
+under the same lock and in the same sublist: no rebalancing, and one lock
+covers the whole move. The lock is derived from the header's own contents,
+so it is only trusted once taken and the contents rechecked underneath it.
+
+Only a header nobody is using is moved. A hold, an attached buffer, an io
+in flight or a place on an l2arc device all mean back references this would
+have to chase, and refusing them costs nothing: the population worth
+relocating after a shrink is exactly the quiet one, and the allocator is
+told to come back later rather than that the header cannot move.
+
+What the copy cannot carry across is repaired by hand. The refcount owns a
+tree and a list of its holders and has to be told where it now lives, the
+debug lock is rebuilt because a copied one has waiters queued against the
+old address, and the header goes back into its sublist in the same position
+rather than at either end, since that order is what eviction walks. The old
+header is left empty, owning nothing, which is the state its destructor
+expects.
+---
+ module/zfs/arc.c | 124 +++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 124 insertions(+)
+
+diff --git a/module/zfs/arc.c b/module/zfs/arc.c
+index 22f9be7fb..ec5367fdf 100644
+--- a/module/zfs/arc.c
++++ b/module/zfs/arc.c
+@@ -915,6 +915,7 @@ static void arc_free_data_impl(arc_buf_hdr_t *hdr, uint64_t size,
+     const void *tag);
+ static void arc_hdr_free_abd(arc_buf_hdr_t *, boolean_t);
+ static void arc_hdr_alloc_abd(arc_buf_hdr_t *, int);
++static kmem_cbrc_t arc_hdr_move(void *, void *, size_t, void *);
+ static void arc_hdr_destroy(arc_buf_hdr_t *);
+ static void arc_access(arc_buf_hdr_t *, arc_flags_t, boolean_t);
+ static void arc_buf_watch(arc_buf_t *);
+@@ -1300,6 +1301,7 @@ retry:
+ 
+ 	hdr_full_cache = kmem_cache_create("arc_buf_hdr_t_full", HDR_FULL_SIZE,
+ 	    0, hdr_full_cons, hdr_full_dest, NULL, NULL, NULL, KMC_RECLAIMABLE);
++	kmem_cache_set_move(hdr_full_cache, arc_hdr_move);
+ 	hdr_l2only_cache = kmem_cache_create("arc_buf_hdr_t_l2only",
+ 	    HDR_L2ONLY_SIZE, 0, hdr_l2only_cons, hdr_l2only_dest, NULL,
+ 	    NULL, NULL, 0);
+@@ -3428,6 +3430,128 @@ arc_hdr_realloc(arc_buf_hdr_t *hdr, kmem_cache_t *old, kmem_cache_t *new)
+ 	return (nhdr);
+ }
+ 
++/*
++ * Relocate a header on behalf of the allocator, so that the slab it sits on
++ * can be handed back and the pageblock holding it can be used for something
++ * that needs contiguous memory.
++ *
++ * A header is recognisable as live because it has an identity: the
++ * constructor zeroes the whole thing and the destructor asserts it has been
++ * zeroed again, so a dva of zero means the header is either on its way in or
++ * on its way out and is not ours to touch. The dva also decides which hash
++ * lock covers the header and which sublist of its state holds it, which is
++ * what makes the move cheap: the copy keeps the same dva, so it belongs on the
++ * same lock and in the same sublist, and nothing has to be rebalanced.
++ *
++ * Only a header nobody is using is moved. Anything with a hold, an attached
++ * buffer, an io in flight or a place on an l2arc device is left where it is:
++ * those have back references this function would have to chase, and the
++ * population worth relocating after a shrinker has run is exactly the quiet
++ * one.
++ */
++static kmem_cbrc_t
++arc_hdr_move(void *buf, void *newbuf, size_t size, void *arg)
++{
++	(void) size, (void) arg;
++	arc_buf_hdr_t *hdr = buf, *nhdr = newbuf;
++	kmutex_t *hash_lock;
++	multilist_sublist_t *mls;
++	arc_state_t *state;
++
++	if (HDR_EMPTY(hdr))
++		return (KMEM_CBRC_DONT_KNOW);
++
++	/*
++	 * Derived from the header's own contents, so it can only be trusted
++	 * once it has been taken and the contents rechecked underneath it.
++	 */
++	hash_lock = HDR_LOCK(hdr);
++	if (!mutex_tryenter(hash_lock))
++		return (KMEM_CBRC_LATER);
++
++	if (HDR_EMPTY(hdr) || HDR_LOCK(hdr) != hash_lock ||
++	    !HDR_IN_HASH_TABLE(hdr)) {
++		mutex_exit(hash_lock);
++		return (KMEM_CBRC_DONT_KNOW);
++	}
++
++	/*
++	 * A hold means somebody reached the header by a route this function
++	 * cannot follow, up to and including a pointer sitting in a local
++	 * variable across a sleep, so a held header is never moved. Buffers
++	 * are different: they are reachable only through the list below, and
++	 * their consumers hold the buffer rather than the header, so their
++	 * back pointers can be corrected here.
++	 */
++	if (!HDR_HAS_L1HDR(hdr) || HDR_HAS_L2HDR(hdr) ||
++	    HDR_IO_IN_PROGRESS(hdr) || HDR_L2_WRITING(hdr) ||
++	    hdr->b_l1hdr.b_acb != NULL ||
++	    !zfs_refcount_is_zero(&hdr->b_l1hdr.b_refcnt)) {
++		mutex_exit(hash_lock);
++		return (KMEM_CBRC_LATER);
++	}
++
++	state = hdr->b_l1hdr.b_state;
++	mls = NULL;
++	if (multilist_link_active(&hdr->b_l1hdr.b_arc_node)) {
++		ASSERT3P(state, !=, arc_anon);
++		mls = multilist_sublist_lock_obj(
++		    &state->arcs_list[arc_buf_type(hdr)], hdr);
++	}
++
++	buf_hash_remove(hdr);
++	memcpy(nhdr, hdr, HDR_FULL_SIZE);
++
++	/*
++	 * The copy brought across every member that points back at where it
++	 * came from. The refcount owns a tree and a list of its holders, and
++	 * even with none of them it still has to be told where it now lives;
++	 * the debug lock is rebuilt because a copied one has waiters queued on
++	 * the old address.
++	 */
++	zfs_refcount_create(&nhdr->b_l1hdr.b_refcnt);
++	zfs_refcount_transfer(&nhdr->b_l1hdr.b_refcnt, &hdr->b_l1hdr.b_refcnt);
++
++	for (arc_buf_t *buf = nhdr->b_l1hdr.b_buf; buf != NULL;
++	    buf = buf->b_next)
++		buf->b_hdr = nhdr;
++#ifdef ZFS_DEBUG
++	mutex_init(&nhdr->b_l1hdr.b_freeze_lock, NULL, MUTEX_DEFAULT, NULL);
++#endif
++
++	if (mls != NULL) {
++		/*
++		 * Back into the same place in the list rather than at either
++		 * end of it: the order is what eviction walks.
++		 */
++		multilist_sublist_insert_after(mls, hdr, nhdr);
++		multilist_sublist_remove(mls, hdr);
++		multilist_sublist_unlock(mls);
++	} else {
++		multilist_link_init(&nhdr->b_l1hdr.b_arc_node);
++	}
++
++	(void) buf_hash_insert(nhdr, NULL);
++
++	/*
++	 * Leave the old header in the state its destructor expects: empty, and
++	 * owning nothing that the new one now owns.
++	 */
++	buf_discard_identity(hdr);
++	hdr->b_l1hdr.b_pabd = NULL;
++	hdr->b_l1hdr.b_buf = NULL;
++	hdr->b_l1hdr.b_acb = NULL;
++	hdr->b_l1hdr.b_state = arc_anon;
++	multilist_link_init(&hdr->b_l1hdr.b_arc_node);
++#ifdef ZFS_DEBUG
++	hdr->b_l1hdr.b_freeze_cksum = NULL;
++#endif
++
++	mutex_exit(hash_lock);
++
++	return (KMEM_CBRC_YES);
++}
++
+ /*
+  * This function is used by the send / receive code to convert a newly
+  * allocated arc_buf_t to one that is suitable for a raw encrypted write. It
+-- 
+2.55.0
+
