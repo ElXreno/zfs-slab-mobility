@@ -36,9 +36,9 @@ let
   runsFor = args: variant: map (seed: mkRun (args // { inherit variant seed; })) seeds;
 
   checks = {
-    # The one line change. Not letting the ZFS slab caches ask for the pageblocks
-    # the data pages live in should roughly halve the count of blocks that hold
-    # both, and take the memory pinned by nearly empty blocks down with it.
+    # The one line change, asserted on the slab pages left inside nearly empty
+    # blocks. Counting blocks with more than one immovable owner says less once
+    # the ARC holds most of memory: nearly every block has an ARC page then.
     separation = mkCompare {
       name = "separation";
       order = [
@@ -51,16 +51,16 @@ let
       };
       expect = [
         {
-          metric = "mixed";
+          metric = "slab_in";
           from = "stock";
           to = "separation";
-          atMost = 0.8;
+          atMost = 0.3;
         }
         {
           metric = "pinned";
           from = "stock";
           to = "separation";
-          atMost = 0.8;
+          atMost = 0.6;
         }
       ];
     };

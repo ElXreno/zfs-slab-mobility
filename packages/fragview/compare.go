@@ -1,11 +1,11 @@
 // Putting snapshots side by side and deciding whether the difference holds up.
 //
-// Which number to lead with matters more than it looks. The count of hostage
-// blocks is the headline figure and it is also the noisy one: repeated runs of
-// the same build have come out 493 and 431 before a change and 392 and 178
-// after it, so a threshold on it alone would flap. Mixed blocks, the count of
-// pageblocks holding pages of more than one immovable owner, is the thing the
-// pool separation actually changes, and it barely moves between runs.
+// Which number to lead with depends on the machine. Hostage blocks read as the
+// headline and swing by a fifth between seeds. Blocks with more than one
+// immovable owner are steadier, but once the ARC holds most of memory almost
+// every block has an ARC page and the count stops distinguishing anything. What
+// survives both is narrower: the slab pages left inside blocks that are
+// otherwise nearly empty.
 package main
 
 import (

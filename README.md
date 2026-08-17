@@ -40,44 +40,45 @@ freshly booted machine.
 ## Measured
 
 Median of three seeds, after dropping caches and compacting, in a six gigabyte
-guest of 3584 pageblocks. These are the numbers `nix flake check` produces, so
-they can be reproduced rather than taken on trust.
+guest of 3584 pageblocks. ZFS keeps its own tuning, so the ARC takes about four
+fifths of memory as it would on a real machine. These are the numbers
+`nix flake check` produces.
 
 | | stock | separation | mobility |
 |---|---|---|---|
-| mixed blocks | 510 | 297 | 274 |
-| hostage blocks | 466 | 181 | 138 |
-| pinned | 884 MiB | 342 MiB | 259 MiB |
-| slab pages inside them | 6343 | 389 | 1260 |
-| unusable index at order 10 | 35% | 19% | 16% |
-| Movable / Reclaimable blocks | 1278 / 1483 | 1322 / 1429 | 2714 / 13 |
-
-Expect these to move a few per cent between runs. Two full runs of the suite
-put the ratio of mixed blocks between stock and separation at 0.559 and 0.582,
-and the pinned memory at 0.346 and 0.387, against a threshold of 0.8.
+| hostage blocks | 503 | 146 | 138 |
+| pinned | 960 MiB | 276 MiB | 261 MiB |
+| slab pages inside them | 8382 | 800 | 1690 |
+| mixed blocks | 370 | 301 | 272 |
+| unusable index at order 10 | 40% | 19% | 16% |
+| Movable / Reclaimable blocks | 310 / 2458 | 333 / 2389 | 2699 / 13 |
+| ARC | 87 MiB | 87 MiB | 87 MiB |
 
 The ARC holds the same amount in all three, so the memory is not going
 anywhere different, only being grouped differently.
 
-Separation does most of the work here: not letting the slab caches share
-pageblocks with the data pages takes the pinned memory to a third and the slab
-pages left inside nearly empty blocks from 6853 to 412.
+Separation does the work: the slab pages left sitting inside nearly empty
+blocks fall by nine tenths, and the memory those blocks pin falls with them.
 
-Mobility then shows up in the migrate types, where the transfer is almost exact:
-Movable gains 1401 blocks and Reclaimable loses 1397. With the slab out of the
+Mobility shows up in the migrate types, where the transfer is almost exact:
+Movable gains 2366 blocks and Reclaimable loses 2376. With the slab out of the
 reclaimable pool and the scatter ABD asking for movable pages, ZFS has nothing
-left in Reclaimable at all, and the fourteen blocks remaining are the rest of
+left in Reclaimable at all, and the thirteen blocks remaining are the rest of
 the system.
 
 Compaction without mobility makes things worse: it consolidates the movable
 pages and leaves blocks that still hold one immovable page more exposed, so the
 hostage count goes up 16 to 19 per cent. With mobility it does not move.
 
-`vm.defrag_mode=1` makes no measurable difference on a stock kernel: the pinned
-memory comes out within five per cent either way, against a spread of eight per
-cent between seeds of the same build. It tells the allocator to compact rather
-than mix migrate types, which is worth something only if the pages it wants to
-compact can move.
+`vm.defrag_mode=1` makes no measurable difference on a stock kernel. It tells
+the allocator to compact rather than mix migrate types, which is worth
+something only if the pages it wants to compact can move.
+
+Counting blocks with more than one immovable owner used to be the leading
+figure here. It stopped discriminating once the ARC was allowed its real size:
+nearly every block then holds an ARC page, so the count is dominated by pairs
+that have nothing to do with the slab. Expect a few per cent of movement
+between runs either way.
 
 ## Running it
 
