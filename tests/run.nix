@@ -51,10 +51,7 @@ pkgs.testers.runNixOSTest {
     boot = {
       kernelPackages = variants.${variant};
       supportedFilesystems = [ "zfs" ];
-      # Provides /proc/slabwho, which names the cache owning each slab page.
       extraModulePackages = [ variants.${variant}.slabwho ];
-      # defrag_mode changes how hard the allocator works to avoid mixing
-      # migrate types. Left at the kernel default unless a test pins it.
       kernel.sysctl = lib.optionalAttrs (defragMode != null) {
         "vm.defrag_mode" = defragMode;
       };
@@ -63,8 +60,6 @@ pkgs.testers.runNixOSTest {
     networking.hostId = "deadbeef";
     environment.systemPackages = [ fragload ];
 
-    # Nothing in the guest should compete for memory with the thing being
-    # measured, and a snapshot of a machine mid documentation build is noise.
     documentation.enable = false;
     services.udisks2.enable = false;
   };
@@ -83,19 +78,10 @@ pkgs.testers.runNixOSTest {
         "zfs create -o recordsize=${recordSize} -o compression=off -o atime=off tank/data"
     )
 
-    # Half of memory for the ARC, and a dirty limit well below it. At three
-    # quarters the write phase has no room left and the guest panics as
-    # deadlocked on memory before producing anything.
-    allmem = int(machine.succeed("awk '/^MemTotal:/{print $2*1024}' /proc/meminfo"))
-    ceiling = allmem // 2
-    machine.succeed(f"echo {allmem // 16} > /sys/module/zfs/parameters/zfs_dirty_data_max")
-    machine.succeed(f"echo {ceiling} > /sys/module/zfs/parameters/zfs_arc_max")
-    got = int(machine.succeed("awk '$1==\"c_max\"{print $3}' /proc/spl/kstat/zfs/arcstats"))
-    assert got == ceiling, f"c_max did not take: {got} instead of {ceiling}"
+    # ZFS keeps its own tuning: holding the ARC down leaves memory free, and
+    # then the allocator never runs short of the high orders being measured.
+    ceiling = int(machine.succeed("awk '$1==\"c_max\"{print $3}' /proc/spl/kstat/zfs/arcstats"))
 
-    # Block cloning would answer repeated content by pointing at the same
-    # blocks, and then the ARC has a fraction of the data to cache and never
-    # grows. The generator writes distinct bytes anyway; this is belt and braces.
     machine.succeed("echo 0 > /sys/module/zfs/parameters/zfs_bclone_enabled")
 
     machine.succeed(
@@ -105,17 +91,13 @@ pkgs.testers.runNixOSTest {
     )
     machine.succeed("sync")
 
-    # Logical size and allocated size have to agree. When they do not the set is
-    # holes or clones, and every number after this point would be worthless.
+    # Holes or clones here would make every number after this point worthless.
     alloc = int(machine.succeed("zpool list -Hp -o alloc tank"))
     want = ${toString setBytes}
     assert alloc > want - want // 8, f"only {alloc} bytes on disk for a {want} byte set"
 
     machine.succeed("echo 3 > /proc/sys/vm/drop_caches")
 
-    # The guest hands out what the kernel reported and nothing else. Analysis
-    # runs on the host, so changing how pages are classified costs a rerun of
-    # the analysis rather than a rerun of every virtual machine.
     def snapshot(phase):
         d = f"/tmp/proc/{phase}"
         machine.succeed(f"mkdir -p {d}/spl/kstat/zfs {d}/sys/kernel")
@@ -128,8 +110,7 @@ pkgs.testers.runNixOSTest {
         for f in ("kpageflags", "kpagecount"):
             machine.succeed(f"gzip -1 -c /proc/{f} > {d}/{f}.gz")
 
-    # Read in a seeded shuffle rather than in order: sequential reads let the
-    # prefetcher answer most of them and the ARC never holds much at once.
+    # Seeded shuffle: read in order, the prefetcher answers most of it.
     with subtest("warm"):
         machine.succeed(
             "fragload -mode read -dir /tank/data/set"
@@ -138,8 +119,6 @@ pkgs.testers.runNixOSTest {
         )
         snapshot("warm")
 
-    # A slice stays hot throughout, so that what survives the squeeze is data
-    # somebody is holding rather than metadata describing data nobody wants.
     with subtest("squeeze"):
         machine.succeed(
             "echo ${toString (arcFloorMB * 1024 * 1024)} > /sys/module/zfs/parameters/zfs_arc_max"
@@ -157,27 +136,16 @@ pkgs.testers.runNixOSTest {
         machine.sleep(duration=timedelta(seconds=5))
         snapshot("dropped")
 
-    # Object mobility only ever acts inside compaction, and nothing above asks
-    # for it. Without this the mobility patches would be measured in a state
-    # where they are by construction asleep. Every variant gets the same request.
+    # Object mobility only acts inside compaction, and nothing above asks for it.
     with subtest("compact"):
         machine.succeed("echo 1 > /proc/sys/vm/compact_memory")
         machine.sleep(duration=timedelta(seconds=10))
         snapshot("compacted")
 
-    # Everything above leaves memory fragmented and free. The loop this phase
-    # looks for needs it fragmented and busy: a cache growing through vmalloc
-    # asks for a high order, and only wakes kswapd when that order is gone. So
-    # the ceiling goes back up and the set is read again.
-    # The ceiling goes higher than anywhere else here. Half of memory is what
-    # the write phase can survive, and it leaves the other half free, so the
-    # allocator never has to look past the Normal zone and DMA32 keeps a supply
-    # of high orders to fall back on. Reading cannot dirty anything, so the ARC
-    # can be allowed to take almost all of it.
+    # Memory fragmented and busy, unlike above. Writing zero would not restore
+    # the ceiling: arc_c_max stays where the squeeze put it.
     with subtest("reread"):
-        machine.succeed(
-            f"echo {allmem - allmem // 8} > /sys/module/zfs/parameters/zfs_arc_max"
-        )
+        machine.succeed(f"echo {ceiling} > /sys/module/zfs/parameters/zfs_arc_max")
         machine.succeed(
             "fragload -mode read -dir /tank/data/set"
             " -files ${toString files} -size ${toString fileSize} -seed ${toString seed}",
