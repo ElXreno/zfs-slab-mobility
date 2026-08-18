@@ -33,6 +33,7 @@ let
     "abd-relocate"
     "abd-movable-migratetype"
     "abd-free-gate"
+    "dbuf-move-probe"
   ];
 
   mkVariant =

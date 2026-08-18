@@ -1,0 +1,207 @@
+From 3cbd36a17b8b3fbb07101fa2b12a2a4966f3dfd3 Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Tue, 18 Aug 2026 18:59:40 +0300
+Subject: [PATCH] dbuf: count whether a dbuf could be relocated, without moving
+ any
+
+Relocating a dbuf means correcting a hash chain, a node in the dnode's tree,
+a link in the dbuf cache, a list head that lives inside the object and three
+synchronisation objects. That is worth writing only if the population it
+could act on is large enough to matter, and nothing so far says how large
+that is: the cache is simply the biggest holder of nearly empty pageblocks
+among the ZFS caches, at 882 blocks in the last dump.
+
+Register a callback that answers no every time and counts why. The reasons
+are the ones a real relocation would have to refuse for: a hold means
+somebody reached the dbuf by a route the callback cannot follow, a bonus
+buffer is still pointed at by its dnode after its last hold goes, a user
+keeps its own pointer, and dirty records point back at the list head inside
+the object.
+
+The allocator offers allocated objects only, so anything seen here was live
+when it was picked; it can still be freed underneath, which is what the lock
+and the objset recheck are for.
+---
+ module/zfs/dbuf.c | 117 +++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 116 insertions(+), 1 deletion(-)
+
+diff --git a/module/zfs/dbuf.c b/module/zfs/dbuf.c
+index a4fe3e519..4a422cef9 100644
+--- a/module/zfs/dbuf.c
++++ b/module/zfs/dbuf.c
+@@ -118,6 +118,21 @@ typedef struct dbuf_stats {
+ 	 * the data in the regular dbuf cache.
+ 	 */
+ 	kstat_named_t metadata_cache_overflow;
++	/*
++	 * Whether the allocator could relocate a dbuf if it asked, counted by
++	 * the reason it could not. Nothing is moved yet: this says whether a
++	 * relocation callback is worth writing at all, and the answer is the
++	 * share of the population that is quiet.
++	 */
++	kstat_named_t move_offered;
++	kstat_named_t move_would;
++	kstat_named_t move_no_lock;
++	kstat_named_t move_stale;
++	kstat_named_t move_bonus;
++	kstat_named_t move_held;
++	kstat_named_t move_user;
++	kstat_named_t move_dirty;
++	kstat_named_t move_state;
+ } dbuf_stats_t;
+ 
+ dbuf_stats_t dbuf_stats = {
+@@ -142,7 +157,16 @@ dbuf_stats_t dbuf_stats = {
+ 	{ "metadata_cache_count",		KSTAT_DATA_UINT64 },
+ 	{ "metadata_cache_size_bytes",		KSTAT_DATA_UINT64 },
+ 	{ "metadata_cache_size_bytes_max",	KSTAT_DATA_UINT64 },
+-	{ "metadata_cache_overflow",		KSTAT_DATA_UINT64 }
++	{ "metadata_cache_overflow",		KSTAT_DATA_UINT64 },
++	{ "move_offered",			KSTAT_DATA_UINT64 },
++	{ "move_would",				KSTAT_DATA_UINT64 },
++	{ "move_no_lock",			KSTAT_DATA_UINT64 },
++	{ "move_stale",				KSTAT_DATA_UINT64 },
++	{ "move_bonus",				KSTAT_DATA_UINT64 },
++	{ "move_held",				KSTAT_DATA_UINT64 },
++	{ "move_user",				KSTAT_DATA_UINT64 },
++	{ "move_dirty",				KSTAT_DATA_UINT64 },
++	{ "move_state",				KSTAT_DATA_UINT64 }
+ };
+ 
+ struct {
+@@ -158,6 +182,15 @@ struct {
+ 	wmsum_t hash_insert_race;
+ 	wmsum_t metadata_cache_count;
+ 	wmsum_t metadata_cache_overflow;
++	wmsum_t move_offered;
++	wmsum_t move_would;
++	wmsum_t move_no_lock;
++	wmsum_t move_stale;
++	wmsum_t move_bonus;
++	wmsum_t move_held;
++	wmsum_t move_user;
++	wmsum_t move_dirty;
++	wmsum_t move_state;
+ } dbuf_sums;
+ 
+ #define	DBUF_STAT_INCR(stat, val)	\
+@@ -286,6 +319,60 @@ static unsigned long dbuf_metadata_cache_target_bytes(void);
+ static uint_t dbuf_cache_hiwater_pct = 10;
+ static uint_t dbuf_cache_lowater_pct = 10;
+ 
++/*
++ * Asked by the allocator whether this dbuf could be relocated, and answering
++ * no every time on purpose. Writing the relocation itself means correcting a
++ * hash chain, a tree node, a cache link, a list head that lives inside the
++ * object and three synchronisation objects, which is only worth doing if the
++ * population it could act on is large enough to matter. This counts that
++ * population and the reasons the rest is out of reach.
++ *
++ * The allocator offers allocated objects only, so a dbuf seen here was live
++ * when it was picked. It can still be freed underneath, which is what the
++ * lock and the recheck are for.
++ */
++static kmem_cbrc_t
++dbuf_move_probe(void *buf, void *newbuf, size_t size, void *arg)
++{
++	(void) newbuf, (void) size, (void) arg;
++	dmu_buf_impl_t *db = buf;
++
++	DBUF_STAT_BUMP(move_offered);
++
++	/*
++	 * The constructor runs when the slab is built rather than on every
++	 * allocation, so this lock is initialised even on an object that is
++	 * currently free, and taking it is safe whatever state the dbuf is in.
++	 */
++	if (!mutex_tryenter(&db->db_mtx)) {
++		DBUF_STAT_BUMP(move_no_lock);
++		return (KMEM_CBRC_LATER);
++	}
++
++	if (db->db_objset == NULL || !POINTER_IS_VALID(db->db_objset)) {
++		DBUF_STAT_BUMP(move_stale);
++	} else if (db->db_blkid == DMU_BONUS_BLKID) {
++		/*
++		 * Its dnode keeps a pointer to it that outlives the last hold,
++		 * so an idle bonus buffer is still spoken for.
++		 */
++		DBUF_STAT_BUMP(move_bonus);
++	} else if (!zfs_refcount_is_zero(&db->db_holds)) {
++		DBUF_STAT_BUMP(move_held);
++	} else if (db->db_user != NULL) {
++		DBUF_STAT_BUMP(move_user);
++	} else if (db->db_dirtycnt != 0) {
++		DBUF_STAT_BUMP(move_dirty);
++	} else if (db->db_state != DB_CACHED) {
++		DBUF_STAT_BUMP(move_state);
++	} else {
++		DBUF_STAT_BUMP(move_would);
++	}
++
++	mutex_exit(&db->db_mtx);
++	return (KMEM_CBRC_LATER);
++}
++
+ static int
+ dbuf_cons(void *vdb, void *unused, int kmflag)
+ {
+@@ -939,6 +1026,15 @@ dbuf_kstat_update(kstat_t *ksp, int rw)
+ 	    &dbuf_caches[DB_DBUF_METADATA_CACHE].size);
+ 	ds->metadata_cache_overflow.value.ui64 =
+ 	    wmsum_value(&dbuf_sums.metadata_cache_overflow);
++	ds->move_offered.value.ui64 = wmsum_value(&dbuf_sums.move_offered);
++	ds->move_would.value.ui64 = wmsum_value(&dbuf_sums.move_would);
++	ds->move_no_lock.value.ui64 = wmsum_value(&dbuf_sums.move_no_lock);
++	ds->move_stale.value.ui64 = wmsum_value(&dbuf_sums.move_stale);
++	ds->move_bonus.value.ui64 = wmsum_value(&dbuf_sums.move_bonus);
++	ds->move_held.value.ui64 = wmsum_value(&dbuf_sums.move_held);
++	ds->move_user.value.ui64 = wmsum_value(&dbuf_sums.move_user);
++	ds->move_dirty.value.ui64 = wmsum_value(&dbuf_sums.move_dirty);
++	ds->move_state.value.ui64 = wmsum_value(&dbuf_sums.move_state);
+ 	return (0);
+ }
+ 
+@@ -991,6 +1087,7 @@ dbuf_init(void)
+ 	dbuf_kmem_cache = kmem_cache_create("dmu_buf_impl_t",
+ 	    sizeof (dmu_buf_impl_t),
+ 	    0, dbuf_cons, dbuf_dest, NULL, NULL, NULL, 0);
++	kmem_cache_set_move(dbuf_kmem_cache, dbuf_move_probe);
+ 	dbuf_dirty_kmem_cache = kmem_cache_create("dbuf_dirty_record_t",
+ 	    sizeof (dbuf_dirty_record_t), 0, NULL, NULL, NULL, NULL, NULL, 0);
+ 
+@@ -1033,6 +1130,15 @@ dbuf_init(void)
+ 	wmsum_init(&dbuf_sums.hash_insert_race, 0);
+ 	wmsum_init(&dbuf_sums.metadata_cache_count, 0);
+ 	wmsum_init(&dbuf_sums.metadata_cache_overflow, 0);
++	wmsum_init(&dbuf_sums.move_offered, 0);
++	wmsum_init(&dbuf_sums.move_would, 0);
++	wmsum_init(&dbuf_sums.move_no_lock, 0);
++	wmsum_init(&dbuf_sums.move_stale, 0);
++	wmsum_init(&dbuf_sums.move_bonus, 0);
++	wmsum_init(&dbuf_sums.move_held, 0);
++	wmsum_init(&dbuf_sums.move_user, 0);
++	wmsum_init(&dbuf_sums.move_dirty, 0);
++	wmsum_init(&dbuf_sums.move_state, 0);
+ 
+ 	dbuf_ksp = kstat_create("zfs", 0, "dbufstats", "misc",
+ 	    KSTAT_TYPE_NAMED, sizeof (dbuf_stats) / sizeof (kstat_named_t),
+@@ -1107,6 +1213,15 @@ dbuf_fini(void)
+ 	wmsum_fini(&dbuf_sums.hash_insert_race);
+ 	wmsum_fini(&dbuf_sums.metadata_cache_count);
+ 	wmsum_fini(&dbuf_sums.metadata_cache_overflow);
++	wmsum_fini(&dbuf_sums.move_offered);
++	wmsum_fini(&dbuf_sums.move_would);
++	wmsum_fini(&dbuf_sums.move_no_lock);
++	wmsum_fini(&dbuf_sums.move_stale);
++	wmsum_fini(&dbuf_sums.move_bonus);
++	wmsum_fini(&dbuf_sums.move_held);
++	wmsum_fini(&dbuf_sums.move_user);
++	wmsum_fini(&dbuf_sums.move_dirty);
++	wmsum_fini(&dbuf_sums.move_state);
+ }
+ 
+ /*
+-- 
+2.55.0
+
