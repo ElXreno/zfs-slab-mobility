@@ -11,11 +11,13 @@
   phase ? "compacted",
   # Column order, and the order assertions read in.
   order ? lib.attrNames runs,
-  # { metric, from, to, atMost | atLeast, floor ?, gate ? }
+  # { metric, from, to, atMost | atLeast, floor ?, gate ?, skipNoSignal ? }
   # floor is the smallest baseline the ratio may be taken from: below it the
   # comparison reports no signal instead of dividing noise by noise. gate names
   # the metric that floor applies to, for asserting on a consequence whose
   # cause is measured elsewhere; it defaults to the asserted metric.
+  # skipNoSignal lets a no-signal result skip rather than fail the run, for a
+  # check whose phenomenon a shared CI runner cannot produce.
   expect ? [ ],
 }:
 
@@ -26,8 +28,9 @@ let
       op = if e ? atMost then "<=" else ">=";
       bound = toString (e.atMost or e.atLeast);
       floor = lib.optionalString (e ? floor) "@${e.gate or e.metric}:${toString e.floor}";
+      skip = lib.optionalString (e.skipNoSignal or false) "?skip";
     in
-    "--expect ${lib.escapeShellArg "${e.metric}:${e.from}->${e.to}${op}${bound}${floor}"}";
+    "--expect ${lib.escapeShellArg "${e.metric}:${e.from}->${e.to}${skip}${op}${bound}${floor}"}";
 
   dumpsFor =
     label:

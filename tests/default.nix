@@ -148,6 +148,10 @@ let
           # against eighty-three is a ratio of noise rather than a finding.
           # Locally the baseline is in the hundreds.
           floor = 50;
+          # A shared runner has memory to spare, so kswapd never wakes there
+          # and this can only ever read as no signal. Skipping says that
+          # plainly; failing would report the host as a regression.
+          skipNoSignal = true;
         }
         # The consequence rather than the indicator: what kswapd reclaims when
         # woken is the ARC, which is what the cache was being grown to serve.
@@ -160,6 +164,7 @@ let
           atLeast = 1.05;
           gate = "kswapd_scan";
           floor = 50;
+          skipNoSignal = true;
         }
       ];
     };
@@ -187,7 +192,9 @@ let
         let
           # A third of the guest. More turns the request into an eviction and
           # measures the ARC's collapse instead of the chunks' mobility.
-          demand = { hugeDemand = 1024; };
+          demand = {
+            hugeDemand = 1024;
+          };
           fiveSeeds = runsForSeeds [ 1 2 3 4 5 ] demand;
         in
         {

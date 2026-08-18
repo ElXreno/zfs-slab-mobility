@@ -323,6 +323,7 @@ type expectation struct {
 	bound            float64
 	gate             string
 	floor            float64
+	skipNoSignal     bool
 }
 
 func parseExpectation(spec string) (expectation, error) {
@@ -348,6 +349,11 @@ func parseExpectation(spec string) (expectation, error) {
 		return e, fmt.Errorf("no -> in %q", spec)
 	}
 	e.from, e.to = from, to
+
+	if strings.HasSuffix(to, "?skip") {
+		e.to = strings.TrimSuffix(to, "?skip")
+		e.skipNoSignal = true
+	}
 
 	if bound, gateStr, hasGate := strings.Cut(boundStr, "@"); hasGate {
 		boundStr = bound
@@ -376,6 +382,21 @@ type verdict struct {
 	ok          bool
 	missing     string
 	nosignal    bool
+}
+
+// A no-signal verdict fails the run, because a threshold that measured nothing
+// is worse than none. The exception is a check whose phenomenon needs a machine
+// under memory pressure, which a shared CI runner is not: there the absence of
+// signal is a property of the host, and the assertion marks itself skippable so
+// the run neither passes on nothing nor fails on the wrong thing.
+func (v verdict) fatal() bool {
+	if v.missing != "" {
+		return true
+	}
+	if v.nosignal {
+		return !v.skipNoSignal
+	}
+	return !v.ok
 }
 
 func judge(gs []*group, specs []expectation) []verdict {
@@ -537,7 +558,7 @@ func compareSnapshots(paths []string, o compareOpts) {
 	}
 
 	for _, v := range vs {
-		if !v.ok {
+		if v.fatal() {
 			os.Exit(1)
 		}
 	}
