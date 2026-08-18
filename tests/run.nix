@@ -104,6 +104,11 @@ pkgs.testers.runNixOSTest {
         for f in ("iomem", "buddyinfo", "pagetypeinfo", "slabinfo", "meminfo", "vmstat"):
             machine.succeed(f"cat /proc/{f} > {d}/{f}")
         machine.succeed(f"cat /proc/spl/kstat/zfs/arcstats > {d}/spl/kstat/zfs/arcstats")
+        # Chunk orders and the relocation counters. Without these there is no
+        # way to tell whether a run exercised the compound path at all, and a
+        # guest small enough for a runner may only ever produce order 0.
+        machine.succeed(f"cat /proc/spl/kstat/zfs/abdstats > {d}/spl/kstat/zfs/abdstats")
+        machine.succeed(f"cat /proc/spl/kmem/slab > {d}/spl/kmem-slab")
         for f in ("hostname", "osrelease"):
             machine.succeed(f"cat /proc/sys/kernel/{f} > {d}/sys/kernel/{f}")
         machine.succeed(f"cat /proc/slabwho > {d}/slabwho || true")
@@ -114,6 +119,32 @@ pkgs.testers.runNixOSTest {
         )
         for f in ("kpageflags", "kpagecount"):
             machine.succeed(f"gzip -1 -c /proc/{f} > {d}/{f}.gz")
+
+    # A kernel that corrupts a list during migration keeps running afterwards
+    # and every phase below still passes, so the run has to be told to look.
+    # Printing what it said beats a bare failure: the difference between a
+    # double free and a bad list walk is the whole diagnosis.
+    def kernel_is_quiet(where):
+        said = machine.succeed(
+            "dmesg | grep -E 'BUG:|Oops:|kernel BUG at|list_del corruption"
+            "|list_add corruption|refcount_t' || true"
+        )
+        assert not said.strip(), f"the kernel complained during {where}:\n{said}"
+
+    # Chunks of more than one page, right now rather than since boot: the
+    # counter is bumped on allocation and bumped down on free.
+    def compound_chunks():
+        return int(machine.succeed(
+            "awk '$1 ~ /^scatter_order_[1-9]/ { n += $3 } END { print n+0 }'"
+            " /proc/spl/kstat/zfs/abdstats"
+        ))
+
+    # Absent on a build without the relocation patches, which reads as zero.
+    def abdstat(name):
+        return int(machine.succeed(
+            f"awk '$1 == \"{name}\" {{ n = $3 }} END {{ print n+0 }}'"
+            " /proc/spl/kstat/zfs/abdstats"
+        ))
 
     # Seeded shuffle: read in order, the prefetcher answers most of it.
     with subtest("warm"):
@@ -157,6 +188,8 @@ pkgs.testers.runNixOSTest {
             timeout=timedelta(seconds=1800),
         )
         snapshot("reread")
+
+    kernel_is_quiet("the run")
 
     os.makedirs(os.environ["out"], exist_ok=True)
     machine.copy_from_machine("/tmp/proc", "")
