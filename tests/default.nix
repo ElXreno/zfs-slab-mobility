@@ -96,6 +96,37 @@ let
       ];
     };
 
+    kvmem = mkCompare {
+      name = "kvmem";
+      order = [
+        "separation"
+        "nokswapd"
+      ];
+      runs =
+        let
+          # recordsize only caps the block size: a file smaller than it still
+          # gets one block its own size. Reaching the caches that grow through
+          # vmalloc needs files at least as large as the record.
+          bigRecords = {
+            recordSize = "1m";
+            fileSize = 1048576;
+            files = 6000;
+          };
+        in
+        {
+          separation = runsFor bigRecords "separation";
+          nokswapd = runsFor bigRecords "nokswapd";
+        };
+      expect = [
+        {
+          metric = "kswapd_scan";
+          from = "separation";
+          to = "nokswapd";
+          atMost = 0.5;
+        }
+      ];
+    };
+
     # vm.defrag_mode tells the allocator to compact rather than mix migrate types.
     # That is worth something only if the pages it wants to compact can move, so
     # on a stock kernel it should make no measurable difference either way.
@@ -128,51 +159,4 @@ let
 in
 {
   inherit checks;
-
-  # Not a check. The loop it looks for needs a guest where the Normal zone
-  # dominates: at six gigabytes the allocator falls back to DMA32, which still
-  # has high orders, and never wakes kswapd. No runner holds a guest that large,
-  # so this one is built by hand.
-  local = {
-    # The vmalloc path. A cache whose slab is large enough asks the page allocator
-    # for a high order, and on failure wakes kswapd, which runs the arc shrinker.
-    # Only reachable with a recordsize that makes zio_buf_comb slabs big enough,
-    # so this one runs at 1M where the others run at the 128k default.
-    kvmem = mkCompare {
-      name = "kvmem";
-      order = [
-        "separation"
-        "nokswapd"
-      ];
-      runs =
-        let
-          # recordsize only caps the block size: a file smaller than it still
-          # gets one block its own size. Reaching the caches that grow through
-          # vmalloc needs files at least as large as the record.
-          bigRecords = {
-            recordSize = "1m";
-            fileSize = 1048576;
-            files = 6000;
-          };
-        in
-        {
-          separation = runsFor bigRecords "separation";
-          nokswapd = runsFor bigRecords "nokswapd";
-        };
-      expect = [
-        {
-          metric = "kswapd_scan";
-          from = "separation";
-          to = "nokswapd";
-          atMost = 0.5;
-        }
-      ];
-    };
-  };
-
-  runs = {
-    run-stock = mkRun { variant = "stock"; };
-    run-separation = mkRun { variant = "separation"; };
-    run-mobility = mkRun { variant = "mobility"; };
-  };
 }

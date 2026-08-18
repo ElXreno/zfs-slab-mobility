@@ -41,14 +41,15 @@
       {
         checks = lib.optionalAttrs (system == "x86_64-linux") suite.checks;
 
-        # A single pass, for looking at rather than asserting on. Kept out of
-        # checks: CI gives every check its own runner, and these are the same
-        # runs the comparisons already build.
         packages = {
           inherit fragview fragload;
           default = fragview;
         }
-        // lib.optionalAttrs (system == "x86_64-linux") (suite.runs // suite.local);
+        // lib.optionalAttrs (system == "x86_64-linux") {
+          # Against the stock kernel, so the module compiles without waiting on
+          # a kernel build. The variants carry their own build of it.
+          slabwho = pkgs.linuxPackages_latest.callPackage ./packages/slabwho/package.nix { };
+        };
 
         devShells.default = pkgs.mkShell {
           packages = [
