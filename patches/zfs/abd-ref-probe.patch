@@ -1,0 +1,52 @@
+From 6fbae5d2f9e78f804555955982f5b72ee650d3e4 Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Tue, 18 Aug 2026 21:21:07 +0300
+Subject: [PATCH] probe: report a chunk whose reference count is not what this
+ code keeps
+
+---
+ module/os/linux/zfs/abd_os.c | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/module/os/linux/zfs/abd_os.c b/module/os/linux/zfs/abd_os.c
+index 0d6c92ae6..ccf4118e3 100644
+--- a/module/os/linux/zfs/abd_os.c
++++ b/module/os/linux/zfs/abd_os.c
+@@ -468,6 +468,21 @@ abd_page_migrate(struct page *dst, struct page *src, enum migrate_mode mode)
+ 
+ 	order = compound_order(src);
+ 	npages = 1U << order;
++
++	/*
++	 * Three is what this chunk must be holding here: one from the
++	 * allocation, one from the mark, and one the isolation took. Anything
++	 * else means the count this code keeps has already been miscounted
++	 * somewhere earlier, and the two puts below would take the page away
++	 * from under the caller that still holds it locked.
++	 */
++	if (page_ref_count(src) != 3) {
++		printk(KERN_ERR "abdrefs: migrate src ref %d order %u "
++		    "isolated %d modmovable %d private %px\n",
++		    page_ref_count(src), order,
++		    !!PageMovableOpsIsolated(src), !!PageModMovable(src),
++		    (void *)page_private(src));
++	}
+ 	/*
+ 	 * Subpages of a compound page are contiguous in the memory map, so
+ 	 * the whole chunk is reachable by index from its head.
+@@ -627,6 +642,12 @@ abd_retire_page(struct scatterlist *sg)
+ 			continue;
+ 		}
+ 
++		if (page_ref_count(page) != 2) {
++			printk(KERN_ERR "abdrefs: retire ref %d order %u "
++			    "modmovable %d\n", page_ref_count(page),
++			    compound_order(page), !!PageModMovable(page));
++		}
++
+ 		abd_unmark_movable_page(page);
+ 		folio_unlock(folio);
+ 		return (page);
+-- 
+2.55.0
+
