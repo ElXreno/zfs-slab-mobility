@@ -166,6 +166,14 @@ pkgs.testers.runNixOSTest {
             " /proc/spl/kstat/zfs/abdstats"
         ))
 
+    # The dbuf relocation probe counts in dbufstats. Absent without the probe
+    # patch, which reads as zero.
+    def dbufstat(name):
+        return int(machine.succeed(
+            f"awk '$1 == \"{name}\" {{ n = $3 }} END {{ print n+0 }}'"
+            " /proc/spl/kstat/zfs/dbufstats"
+        ))
+
     # Seeded shuffle: read in order, the prefetcher answers most of it.
     with subtest("warm"):
         machine.succeed(
@@ -298,8 +306,26 @@ pkgs.testers.runNixOSTest {
 
     # Object mobility only acts inside compaction, and nothing above asks for it.
     with subtest("compact"):
+        # The dbuf probe answers inside compaction, so read its counters as a
+        # delta across this one pass rather than since boot. The reasons are
+        # why a dbuf could not be relocated; move_would is the share that
+        # could, and is the whole point of the measurement.
+        reasons = [
+            "move_offered", "move_would", "move_no_lock", "move_stale",
+            "move_bonus", "move_held", "move_user", "move_dirty", "move_state",
+        ]
+        before = {r: dbufstat(r) for r in reasons}
+
         machine.succeed("echo 1 > /proc/sys/vm/compact_memory")
         machine.sleep(duration=timedelta(seconds=10))
+
+        delta = {r: dbufstat(r) - before[r] for r in reasons}
+        if delta["move_offered"] > 0:
+            print("dbuf probe (this compaction pass):")
+            for r in reasons:
+                print(f"  {r:14s} {delta[r]}")
+            movable = 100 * delta["move_would"] / delta["move_offered"]
+            print(f"  -> {movable:.1f}% of offered dbufs were relocatable")
         snapshot("compacted")
 
     # Memory fragmented and busy, unlike above. Writing zero would not restore
