@@ -619,11 +619,15 @@ func (f *frame) compositionLines(w int) []string {
 
 // The one line that says whether this machine can serve a high order
 // allocation right now, and what is stopping it.
+//
+// Counted here rather than taken from the module, which tallies the same
+// threshold over a different set: any block with few enough pages in use,
+// whether or not those pages are stuck. A block held by nothing but page cache
+// is not an obstacle, compaction empties it unaided, so counting it here would
+// name as an obstacle the one case that is not one. The module's own tally is
+// still in /proc/slabwho for anyone comparing the two walks.
 func (f *frame) verdictLine() string {
 	hostages, locked := f.hostages, f.hostageFree
-	if f.whoTot.blocks > 0 {
-		hostages, locked = int(f.whoTot.hostageBlocks), f.whoTot.hostageFreePages
-	}
 
 	ok, fail := f.vm["compact_success"], f.vm["compact_fail"]
 	rate := 0.0
