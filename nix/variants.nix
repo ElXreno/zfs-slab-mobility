@@ -42,6 +42,7 @@ let
       noReclaimAccount ? false,
       slabMobilityZfs ? false,
       noKswapdWake ? false,
+      memProfiling ? false,
     }:
     let
       extraPatches =
@@ -52,12 +53,17 @@ let
       # unconditionally changes the derivation for the unpatched variants too,
       # and those would stop coming out of the binary cache.
       kernel =
-        if extraPatches == [ ] then
+        if extraPatches == [ ] && !memProfiling then
           pkgs.linux_latest
         else
           pkgs.linux_latest.override {
             stdenv = ccache.wrapStdenv pkgs.stdenv;
             kernelPatches = pkgs.linux_latest.kernelPatches ++ extraPatches;
+            structuredExtraConfig = lib.optionalAttrs memProfiling {
+              MEM_ALLOC_PROFILING = lib.kernel.yes;
+              MEM_ALLOC_PROFILING_ENABLED_BY_DEFAULT = lib.kernel.yes;
+              MEM_ALLOC_PROFILING_DEBUG = lib.kernel.no;
+            };
           };
 
       zfsExtra =
@@ -106,6 +112,13 @@ in
     noReclaimAccount = true;
     noKswapdWake = true;
   };
+
+  # Allocation profiling, which gives every slab object a codetag naming the
+  # line that allocated it. SLUB merges caches of the same size and keeps one
+  # name for all of them, so this is the only way to tell what a block is
+  # really held by. Its own cost is a pointer per object, so it is a separate
+  # variant rather than something the measured ones carry.
+  profiling = mkVariant { memProfiling = true; };
 
   # The above plus object relocation in SLUB and movable pages for the scatter
   # ABD, so that what is left in a block can be moved out of the way.
