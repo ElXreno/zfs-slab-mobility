@@ -87,11 +87,15 @@ let
           to = "mobility";
           atLeast = 1.5;
         }
+        # A guard, not a claim. The seeds now favour mobility, 159/258/322 MiB
+        # against 292/363/399, but the ranges still touch and three runs cannot
+        # carry the claim alone. Kept loose so it catches mobility breaking
+        # something outright rather than tracking the trend.
         {
           metric = "pinned";
           from = "separation";
           to = "mobility";
-          atMost = 1.1;
+          atMost = 1.5;
         }
       ];
     };

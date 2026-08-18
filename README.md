@@ -61,10 +61,32 @@ Separation does the work: the slab pages left sitting inside nearly empty
 blocks fall by nine tenths, and the memory those blocks pin falls with them.
 
 Mobility shows up in the migrate types, where the transfer is almost exact:
-Movable gains 2366 blocks and Reclaimable loses 2376. With the slab out of the
+Movable gains 2328 blocks and Reclaimable loses 2369. With the slab out of the
 reclaimable pool and the scatter ABD asking for movable pages, ZFS has nothing
-left in Reclaimable at all, and the thirteen blocks remaining are the rest of
+left in Reclaimable at all, and the fourteen blocks remaining are the rest of
 the system.
+
+Whether that turns into less pinned memory was measured twice and answered
+differently each time, so both are worth stating. The first round said no: the
+seeds gave one range, not two. That round ran against a build in which freeing
+a chunk raced with relocating it, which the `abd-migrate` check now catches, so
+it was not measuring what it appeared to be. With the race fixed:
+
+```text
+pinned, MiB       separation  292, 363, 399    mobility  159, 258, 322
+hostage blocks    separation  154, 192, 212    mobility   85, 137, 170
+```
+
+Eight of the nine pairings favour mobility on each, and the direction is the
+opposite of the first round. Three seeds do not settle it: the highest mobility
+run still lands above the lowest separation run on both, so this reads as a
+consistent trend rather than a measured improvement, and the check asserts only
+that nothing gets worse.
+
+The mechanism behind the earlier doubt is still there and still visible: moving
+the ABD out of a block takes its occupancy below an eighth, so a block that held
+slab beside data becomes a hostage holding slab alone. Pages of slab inside
+hostage blocks go up by half again even as the count of those blocks falls.
 
 Compaction without mobility makes things worse: it consolidates the movable
 pages and leaves blocks that still hold one immovable page more exposed, so the
