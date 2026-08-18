@@ -22,6 +22,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: cachix/install-nix-action@v31.11.1
+        with:
+          extra_nix_config: |
+            extra-substituters = https://elxreno.cachix.org
+            extra-trusted-public-keys = elxreno.cachix.org-1:ozSPSY5S3/TpbcXi+/DdtSj1JlK3CPz3G+F92yRBXDQ=
       - uses: Mic92/hestia@v3
       - id: matrix
         uses: Mic92/hestia/matrix@v3
@@ -55,6 +59,8 @@ jobs:
             build-dir = /nix/_build
             extra-sandbox-paths = /nix/ccache
             system-features = kvm nixos-test benchmark big-parallel
+            extra-substituters = https://elxreno.cachix.org
+            extra-trusted-public-keys = elxreno.cachix.org-1:ozSPSY5S3/TpbcXi+/DdtSj1JlK3CPz3G+F92yRBXDQ=
 
       - name: Prepare build and cache directories
         run: |
