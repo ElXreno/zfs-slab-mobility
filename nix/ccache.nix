@@ -37,7 +37,16 @@ in
             export CCACHE_COMPILERCHECK="string:${stdenv.cc.cc}"
             export CCACHE_SLOPPINESS="include_file_mtime,include_file_ctime,time_macros,locale,random_seed"
             export CCACHE_MAXSIZE=0
-            if [ ! -w "$CCACHE_DIR" ]; then export CCACHE_DISABLE=1; fi
+            # Not just the root: ccache writes its temporaries into $CCACHE_DIR/tmp,
+            # and a restored cache can bring that back owned by someone else. A
+            # writable root over an unwritable tmp is exactly what fails the
+            # compile, so probe an actual write and disable rather than fail.
+            if ! ( mkdir -p "$CCACHE_DIR/tmp" 2>/dev/null &&
+                   : > "$CCACHE_DIR/tmp/.probe.$$" 2>/dev/null ); then
+              export CCACHE_DISABLE=1
+            else
+              rm -f "$CCACHE_DIR/tmp/.probe.$$"
+            fi
           '';
         };
       }

@@ -78,6 +78,13 @@ jobs:
           restore-keys: |
             ccache-${{ matrix.name }}-
 
+      # The restore writes the archive back as the runner user, but the build
+      # runs as nixbld inside the sandbox and writes its temporaries under this
+      # directory. Without world-write on everything the cache brought back,
+      # the first compile fails with a permission error creating a temp file.
+      - name: Make the cache writable by the sandbox
+        run: sudo chmod -R 0777 /nix/ccache
+
       - uses: Mic92/hestia@v3
         with:
           wait-manifest-version: ${{ needs.eval.outputs.manifest-version }}
