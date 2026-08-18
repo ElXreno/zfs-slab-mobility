@@ -128,6 +128,7 @@ pkgs.testers.runNixOSTest {
         # way to tell whether a run exercised the compound path at all, and a
         # guest small enough for a runner may only ever produce order 0.
         machine.succeed(f"cat /proc/spl/kstat/zfs/abdstats > {d}/spl/kstat/zfs/abdstats")
+        machine.succeed(f"cat /proc/spl/kstat/zfs/dbufstats > {d}/spl/kstat/zfs/dbufstats")
         machine.succeed(f"cat /proc/spl/kmem/slab > {d}/spl/kmem-slab")
         for f in ("hostname", "osrelease"):
             machine.succeed(f"cat /proc/sys/kernel/{f} > {d}/sys/kernel/{f}")
@@ -197,6 +198,19 @@ pkgs.testers.runNixOSTest {
                 " would prove nothing"
             )
 
+            # The dbuf relocation probe answers here, where compaction runs
+            # against a full ARC, not in the later compact phase where the ARC
+            # has been squeezed and there are few dbufs left to offer. Read as
+            # a delta across the rounds below: the reasons are why a dbuf could
+            # not be moved, and move_would is the share that could, which is
+            # the whole question. Absent without the probe patch, reads zero.
+            dbuf_reasons = [
+                "move_offered", "move_would", "move_no_lock", "move_stale",
+                "move_bonus", "move_held", "move_user", "move_dirty",
+                "move_state",
+            ]
+            dbuf_before = {r: dbufstat(r) for r in dbuf_reasons}
+
             # kcompactd, not just the synchronous pass a sysctl write drives.
             # The report this reproduces came from the background daemon, and
             # it runs in a different migration mode against a different target
@@ -232,6 +246,14 @@ pkgs.testers.runNixOSTest {
 
             machine.succeed("systemctl stop abd-readers || true")
             kernel_is_quiet("compaction with a full ARC")
+
+            dbuf_delta = {r: dbufstat(r) - dbuf_before[r] for r in dbuf_reasons}
+            if dbuf_delta["move_offered"] > 0:
+                print("dbuf probe, across the compaction rounds:")
+                for r in dbuf_reasons:
+                    print(f"  {r:14s} {dbuf_delta[r]}")
+                share = 100 * dbuf_delta["move_would"] / dbuf_delta["move_offered"]
+                print(f"  -> {share:.1f}% of offered dbufs were relocatable")
 
             asked = abdstat("page_isolate_asked")
             moved = abdstat("page_migrated")
@@ -306,26 +328,8 @@ pkgs.testers.runNixOSTest {
 
     # Object mobility only acts inside compaction, and nothing above asks for it.
     with subtest("compact"):
-        # The dbuf probe answers inside compaction, so read its counters as a
-        # delta across this one pass rather than since boot. The reasons are
-        # why a dbuf could not be relocated; move_would is the share that
-        # could, and is the whole point of the measurement.
-        reasons = [
-            "move_offered", "move_would", "move_no_lock", "move_stale",
-            "move_bonus", "move_held", "move_user", "move_dirty", "move_state",
-        ]
-        before = {r: dbufstat(r) for r in reasons}
-
         machine.succeed("echo 1 > /proc/sys/vm/compact_memory")
         machine.sleep(duration=timedelta(seconds=10))
-
-        delta = {r: dbufstat(r) - before[r] for r in reasons}
-        if delta["move_offered"] > 0:
-            print("dbuf probe (this compaction pass):")
-            for r in reasons:
-                print(f"  {r:14s} {delta[r]}")
-            movable = 100 * delta["move_would"] / delta["move_offered"]
-            print(f"  -> {movable:.1f}% of offered dbufs were relocatable")
         snapshot("compacted")
 
     # Memory fragmented and busy, unlike above. Writing zero would not restore
