@@ -33,7 +33,10 @@ let
     3
   ];
 
-  runsFor = args: variant: map (seed: mkRun (args // { inherit variant seed; })) seeds;
+  runsForSeeds =
+    theseSeeds: args: variant:
+    map (seed: mkRun (args // { inherit variant seed; })) theseSeeds;
+  runsFor = runsForSeeds seeds;
 
   checks = {
     # The one line change, asserted on the slab pages left inside nearly empty
@@ -141,14 +144,22 @@ let
           from = "separation";
           to = "nokswapd";
           atMost = 0.5;
+          # A runner that never ran short scanned a single page, and one
+          # against eighty-three is a ratio of noise rather than a finding.
+          # Locally the baseline is in the hundreds.
+          floor = 50;
         }
         # The consequence rather than the indicator: what kswapd reclaims when
         # woken is the ARC, which is what the cache was being grown to serve.
+        # Gated on the cause, because an ARC that was never squeezed is not
+        # evidence that the patch preserved it.
         {
           metric = "arc_size";
           from = "separation";
           to = "nokswapd";
           atLeast = 1.05;
+          gate = "kswapd_scan";
+          floor = 50;
         }
       ];
     };
@@ -157,11 +168,14 @@ let
     # other check counts blocks and pages, which are means; this one asks how
     # much contiguous memory the machine can still hand out with the ARC full.
     #
-    # Measured before asserted: mobility handed out all 1024 on every seed,
-    # separation 193, 200 and 1024. That spread is why the guard is loose
-    # rather than near the ratio of five the medians give. The third
-    # separation run shows a guest can find the memory unaided, so a tight
-    # bound would fail on luck rather than on a regression.
+    # Measured before asserted, and the measurement has a ceiling. Ask for a
+    # third of the guest and the demand is met out of chunks the ARC holds,
+    # which is the thing under test; ask for half and the request itself
+    # evicts the ARC, so what gets handed out tracks how far the ARC happened
+    # to fall rather than whether its chunks could move, and mobility with a
+    # full ARC then loses to separation with a collapsed one. So the demand
+    # stays at a third and the noise is answered with seeds instead: five
+    # rather than three, so a single lucky run moves the median less.
     highorder = mkCompare {
       name = "highorder";
       phase = "highorder";
@@ -171,14 +185,14 @@ let
       ];
       runs =
         let
-          # A third of the guest asked for at once, so the request cannot be
-          # met out of whatever happens to be free and has to come from
-          # blocks the ARC is sitting in.
+          # A third of the guest. More turns the request into an eviction and
+          # measures the ARC's collapse instead of the chunks' mobility.
           demand = { hugeDemand = 1024; };
+          fiveSeeds = runsForSeeds [ 1 2 3 4 5 ] demand;
         in
         {
-          separation = runsFor demand "separation";
-          mobility = runsFor demand "mobility";
+          separation = fiveSeeds "separation";
+          mobility = fiveSeeds "mobility";
         };
       expect = [
         {

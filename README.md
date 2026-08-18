@@ -196,16 +196,16 @@ exactly that: fill the ARC, request a third of the guest as huge pages, count
 what came back.
 
 ```text
-huge pages handed out, of 1024 asked
-  separation   193, 200, 1024
-  mobility    1024, 1024, 1024
+huge pages handed out, of 1024 asked, five seeds sorted
+  separation   189, 208, 363, 512, 1024
+  mobility     229, 606, 1024, 1024, 1024
 ```
 
-Two of the three separation runs could not find a third of the guest in one
-piece. Every mobility run could. The third separation run is worth as much as
-the other two: a guest can get lucky and find the memory unaided, which is why
-the check guards a ratio of one and a half rather than the five its medians
-would support.
+Both sides are noisy: a separation guest sometimes gets lucky and finds the
+memory unaided, a mobility one sometimes wakes its shrinker at a bad moment. The
+answer to noise is the median, not a slack threshold: over five seeds it is 363
+against 1024. The check guards a ratio of one and a half, well under the 2.8 the
+medians give, so a run that lands badly does not read as a regression.
 
 This also answers a question that was asked the wrong way for a long time. The
 relocation counters look small next to the number of chunks in the ARC, which
