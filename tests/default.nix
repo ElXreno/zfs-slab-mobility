@@ -98,6 +98,7 @@ let
 
     kvmem = mkCompare {
       name = "kvmem";
+      phase = "reread";
       order = [
         "separation"
         "nokswapd"
@@ -107,10 +108,23 @@ let
           # recordsize only caps the block size: a file smaller than it still
           # gets one block its own size. Reaching the caches that grow through
           # vmalloc needs files at least as large as the record.
+          # zio_buf_comb_* holds linear buffers, and reading an uncompressed
+          # record needs none: the data goes straight into a scatter ABD. The
+          # data is random, so compression stores it whole and only the
+          # decompression buffer is added.
           bigRecords = {
             recordSize = "1m";
+            compression = "zstd-3";
             fileSize = 1048576;
             files = 6000;
+            # Each reader in flight holds a megabyte linear buffer, and those
+            # come from the cache whose slabs are the order 10 request. Four
+            # readers asked for fewer of them than the guest had left.
+            readJobs = 32;
+            # Demand has to outrun supply at the moment of the request. The
+            # first pass leaves about eighty order 10 blocks free, so the burst
+            # is sized to need more slabs than that.
+            burstJobs = 512;
           };
         in
         {
@@ -123,6 +137,14 @@ let
           from = "separation";
           to = "nokswapd";
           atMost = 0.5;
+        }
+        # The consequence rather than the indicator: what kswapd reclaims when
+        # woken is the ARC, which is what the cache was being grown to serve.
+        {
+          metric = "arc_size";
+          from = "separation";
+          to = "nokswapd";
+          atLeast = 1.05;
         }
       ];
     };

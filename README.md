@@ -160,7 +160,7 @@ Nothing here distributes a built kernel: CI publishes the comparison tables,
 the metrics and the snapshots, and keeps its build cache inside the GitHub
 Actions cache.
 
-## The vmalloc path, unresolved
+## The vmalloc path
 
 The caches SPL grows through `__vmalloc` are a third route that neither patch
 above touches. `vm_area_alloc_pages()` tries a high order before falling back to
@@ -170,19 +170,27 @@ is large enough wakes kswapd whenever the order it wanted is gone, and on this
 module that runs the ARC shrinker, freeing what the cache was being grown to
 hold. See openzfs/zfs#18893.
 
-`patches/zfs/no-kswapd-wake.patch` clears that one flag in `kv_alloc`.
+`patches/zfs/no-kswapd-wake.patch` clears that one flag in `kv_alloc`, leaving
+direct reclaim alone. The `kvmem` check compares it against separation at a 1M
+recordsize with zstd, since `zio_buf_comb_*` holds linear buffers and an
+uncompressed read never needs one. Three seeds, and the ranges do not overlap:
 
-**It is not confirmed, and the trigger may not be common.** No measurement here
-shows it changing anything. Filling memory until high orders were nearly gone
-still left `pgscan_kswapd` at zero, and reading `/proc/spl/kmem/slab` on a
-machine with 783 MiB of these caches showed why: the caches that are actually
-large have slabs of four to thirty two pages, an order two to five request that
-never fails. The one cache whose slab reaches 4096 pages was empty.
+```text
+pages scanned by kswapd   487, 536, 488   ->    79, 90, 0
+ARC, MiB                 4224, 4289, 4310 ->  4707, 4733, 4740
+```
 
-So a lot of vmalloc traffic from ZFS is not the same thing as a lot of high
-order requests from ZFS, and only the second drives the loop. That distinction
-is what `packages.kvmem` exists to test, once someone finds a configuration
-where the large slabs are actually populated.
+The ARC is the point rather than the counter. What kswapd reclaims when woken is
+the cache the allocation was serving, and without the wake the guest keeps 430
+MiB more of it.
+
+Getting there took placing the load correctly. The cache does grow during the
+read phase, from four slabs to twenty, which is sixteen order 10 requests. But
+squeezing the ARC and compacting beforehand left 1206 order 10 blocks free, and
+sixteen requests out of twelve hundred never wait for anything. The measurement
+only works once the demand arrives after the shortage: a second high concurrency
+pass at the end of the phase, by which point twelve to forty blocks remain and
+`unusable order-10` sits between 87 and 96 per cent.
 
 ## Caveats
 

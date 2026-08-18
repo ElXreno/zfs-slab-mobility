@@ -22,6 +22,9 @@
   variant,
   seed ? 1,
   recordSize ? "128k",
+  compression ? "off",
+  readJobs ? 0,
+  burstJobs ? 0,
   files ? 50000,
   fileSize ? 131072,
   memoryMB ? 6144,
@@ -34,7 +37,17 @@
 }:
 
 let
-  name = "${variant}-${recordSize}-seed${toString seed}";
+  name = "${variant}-${recordSize}-${compression}-seed${toString seed}";
+  jobsArg = lib.optionalString (readJobs > 0) " -jobs ${toString readJobs}";
+
+  # The read pass ends with memory full and the high orders nearly gone, which
+  # is the state a cache growing through vmalloc has to be asked to grow in.
+  # Right after the squeeze it was asked with a thousand order 10 blocks free,
+  # and any request succeeded. A different seed so the set is cold again.
+  burstCmd =
+    "fragload -mode read -dir /tank/data/set"
+    + " -files ${toString files} -size ${toString fileSize}"
+    + " -seed ${toString (seed + 1)} -jobs ${toString burstJobs}";
   setBytes = files * fileSize;
 in
 pkgs.testers.runNixOSTest {
@@ -75,7 +88,8 @@ pkgs.testers.runNixOSTest {
     machine.succeed("modprobe slabwho")
     machine.succeed("zpool create -f -o ashift=12 tank /dev/vdb")
     machine.succeed(
-        "zfs create -o recordsize=${recordSize} -o compression=off -o atime=off tank/data"
+        "zfs create -o recordsize=${recordSize} -o compression=${compression}"
+        " -o atime=off tank/data"
     )
 
     # ZFS keeps its own tuning: holding the ARC down leaves memory free, and
@@ -150,7 +164,8 @@ pkgs.testers.runNixOSTest {
     with subtest("warm"):
         machine.succeed(
             "fragload -mode read -dir /tank/data/set"
-            " -files ${toString files} -size ${toString fileSize} -seed ${toString seed}",
+            " -files ${toString files} -size ${toString fileSize} -seed ${toString seed}"
+            "${jobsArg}",
             timeout=timedelta(seconds=1800),
         )
         snapshot("warm")
@@ -184,9 +199,13 @@ pkgs.testers.runNixOSTest {
         machine.succeed(f"echo {ceiling} > /sys/module/zfs/parameters/zfs_arc_max")
         machine.succeed(
             "fragload -mode read -dir /tank/data/set"
-            " -files ${toString files} -size ${toString fileSize} -seed ${toString seed}",
+            " -files ${toString files} -size ${toString fileSize} -seed ${toString seed}"
+            "${jobsArg}",
             timeout=timedelta(seconds=1800),
         )
+        ${lib.optionalString (
+          burstJobs > 0
+        ) ''machine.succeed("${burstCmd}", timeout=timedelta(seconds=1800))''}
         snapshot("reread")
 
     kernel_is_quiet("the run")
