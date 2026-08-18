@@ -143,10 +143,34 @@ func hostageByCache(f *frame, top int) {
 	sort.Slice(rows, func(i, j int) bool { return rows[i].pages > rows[j].pages })
 
 	fmt.Printf("\n%-28s %10s %12s\n", "cache", "blocks", "pages")
+	var shown []string
 	for i, r := range rows {
 		if i >= top {
 			break
 		}
-		fmt.Printf("%-28s %10d %12d\n", trunc(r.name, 28), r.blocks, r.pages)
+		shown = append(shown, r.name)
+		fmt.Printf("%-28s %10d %12d\n", trunc(cacheLabel(r.name), 28), r.blocks, r.pages)
+	}
+	fmt.Print(aliasLegend(shown))
+	hostageBySite(f, 15)
+}
+
+// The line of code that allocated what is sitting in the hostage blocks. A
+// merged cache cannot answer this and neither can /proc/slabinfo: it needs the
+// per object codetag, which exists only on a kernel built with allocation
+// profiling.
+func hostageBySite(f *frame, top int) {
+	if len(f.sites) == 0 {
+		return
+	}
+
+	fmt.Printf("\n%-22s %-26s %-22s %7s %8s\n",
+		"cache", "allocated at", "in", "blocks", "objects")
+	for i, si := range f.sites {
+		if i >= top {
+			break
+		}
+		fmt.Printf("%-22s %-26s %-22s %7d %8d\n", trunc(cacheLabel(si.cache), 22),
+			trunc(si.fn, 26), trunc(si.file, 22), si.blocks, si.objects)
 	}
 }

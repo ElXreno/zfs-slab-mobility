@@ -46,6 +46,10 @@ type snapshot struct {
 	Vm     map[string]uint64  `json:"vmstat"`
 	Arc    map[string]uint64  `json:"arcstats,omitempty"`
 	Unseen map[string]uint64  `json:"unclassified,omitempty"`
+	// Additive, so a reader without it still loads an older snapshot and a
+	// reader with it degrades to unannotated names.
+	Aliases map[string][]string `json:"cache_aliases,omitempty"`
+	Sites   []snapSite          `json:"sites,omitempty"`
 }
 
 type snapSlab struct {
@@ -64,6 +68,14 @@ type snapWho struct {
 	Pages         uint64 `json:"pages"`
 	HostagePages  uint64 `json:"hostage_pages"`
 	Mobile        bool   `json:"mobile"`
+}
+
+type snapSite struct {
+	Cache   string `json:"cache"`
+	Fn      string `json:"fn"`
+	File    string `json:"file"`
+	Objects uint64 `json:"objects"`
+	Blocks  uint64 `json:"blocks"`
 }
 
 type snapWhoTot struct {
@@ -109,6 +121,7 @@ func (f *frame) toSnapshot(label string) *snapshot {
 		Arc:           f.arc,
 		WhoTot: snapWhoTot{f.whoTot.blocks, f.whoTot.hostageBlocks,
 			f.whoTot.hostageFreePages, f.whoTot.walkUS},
+		Aliases: cacheAliases,
 	}
 
 	for _, c := range f.slabs {
@@ -120,6 +133,9 @@ func (f *frame) toSnapshot(label string) *snapshot {
 		for k, w := range f.who {
 			s.Who[k] = snapWho{w.blocks, w.hostageBlocks, w.pages, w.hostagePages, w.mobile}
 		}
+	}
+	for _, si := range f.sites {
+		s.Sites = append(s.Sites, snapSite{si.cache, si.fn, si.file, si.objects, si.blocks})
 	}
 	if seen := unknownSeen(); len(seen) > 0 {
 		s.Unseen = map[string]uint64{}
@@ -217,6 +233,11 @@ func readSnapshot(path string) (*frame, error) {
 			f.who[k] = whoStat{w.Blocks, w.HostageBlocks, w.Pages, w.HostagePages, w.Mobile}
 		}
 	}
+	for _, si := range s.Sites {
+		f.sites = append(f.sites, siteStat{si.Cache, si.Fn, si.File, si.Objects, si.Blocks})
+	}
+	cacheAliases = s.Aliases
+
 	// The class names depend on whether the machine that took the snapshot ran
 	// ZFS, and that is a property of the snapshot rather than of this machine.
 	nameClassesForHost(len(s.Arc) > 0)

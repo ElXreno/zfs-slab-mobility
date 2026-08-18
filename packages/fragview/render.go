@@ -188,6 +188,17 @@ type whoStat struct {
 	mobile        bool
 }
 
+// Where the objects in hostage blocks were allocated, when the kernel carries
+// allocation profiling. This is the only attribution that survives SLUB
+// merging, since the cache name is shared by every alias.
+type siteStat struct {
+	cache   string
+	fn      string
+	file    string
+	objects uint64
+	blocks  uint64
+}
+
 type whoTotals struct {
 	blocks           uint64
 	hostageBlocks    uint64
@@ -205,6 +216,7 @@ type frame struct {
 	vm            map[string]uint64
 	arc           map[string]uint64
 	who           map[string]whoStat
+	sites         []siteStat
 	whoTot        whoTotals
 	whoErr        string
 	host          string
@@ -305,6 +317,21 @@ func occStyle(occ float64) lipgloss.Style {
 	return lipgloss.NewStyle()
 }
 
+// The site that allocated most of what this cache has sitting in hostage
+// blocks. For a merged cache this is what the name cannot say: the kmem_cache
+// is shared, but the codetag on each object is not.
+func (f *frame) topSite(cache string) string {
+	for _, si := range f.sites {
+		if si.cache == cache {
+			return si.fn + " " + si.file
+		}
+	}
+	return ""
+}
+
+// Lines the full table gives to explaining merged caches.
+const aliasRows = 3
+
 func moveMark(mobile bool) string {
 	if mobile {
 		return goodStyle.Render("    ✓")
@@ -313,10 +340,17 @@ func moveMark(mobile bool) string {
 }
 
 // The whole table, scrollable, for when fourteen rows of it are not enough.
-func (f *frame) slabFullPane(rows int) []string {
+func (f *frame) slabFullPane(rows, width int) []string {
 	all := f.sortedSlabs()
 	f.slabTotal = len(all)
-	f.slabRows = max(rows-2, 1)
+
+	// Room for the alias legend, reserved whether or not a merged cache is on
+	// screen right now, so scrolling does not change how many rows fit.
+	reserve := 0
+	if cacheAliases != nil {
+		reserve = aliasRows + 1
+	}
+	f.slabRows = max(rows-2-reserve, 1)
 
 	if f.slabScroll > len(all)-f.slabRows {
 		f.slabScroll = len(all) - f.slabRows
@@ -333,19 +367,33 @@ func (f *frame) slabFullPane(rows int) []string {
 	out := []string{
 		head("slab caches") + faint("   order: ") +
 			boldStyle.Render(f.sortName()) + faint(" (o cycles)") + shown,
-		faint(fmt.Sprintf(" %-28s %10s %10s %8s %6s %8s %8s %10s %5s",
-			"cache", "size", "wasted", "objsize", "used", "blocks", "hostage", "host.pages", "move")),
+		faint(fmt.Sprintf(" %-28s %10s %10s %8s %6s %8s %8s %10s %5s  %s",
+			"cache", "size", "wasted", "objsize", "used", "blocks", "hostage", "host.pages", "move",
+			"mostly allocated at")),
 	}
 
 	for i := f.slabScroll; i < len(all) && i < f.slabScroll+f.slabRows; i++ {
 		c := all[i]
 		w := f.who[c.name]
-		out = append(out, fmt.Sprintf(" %-28s %10s %10s %8s %s %8s %8s %10s %s",
-			trunc(c.name, 28), humanBytes(c.bytes()), humanBytes(c.wasted()),
+		out = append(out, fmt.Sprintf(" %-28s %10s %10s %8s %s %8s %8s %10s %s  %s",
+			trunc(cacheLabel(c.name), 28), humanBytes(c.bytes()), humanBytes(c.wasted()),
 			humanBytes(c.objSize),
 			occStyle(c.occupancy()).Render(fmt.Sprintf("%5.0f%%", c.occupancy()*100)),
 			humanCount(w.blocks), humanCount(w.hostageBlocks), humanCount(w.hostagePages),
-			moveMark(w.mobile)))
+			moveMark(w.mobile), faint(trunc(f.topSite(c.name), max(width-116, 8)))))
+	}
+
+	if reserve > 0 {
+		var names []string
+		for i := f.slabScroll; i < len(all) && i < f.slabScroll+f.slabRows; i++ {
+			names = append(names, all[i].name)
+		}
+		if lines := aliasLines(names, width, aliasRows); len(lines) > 0 {
+			out = append(out, faint(" one kmem_cache shared by, and reported as, the first of:"))
+			for _, l := range lines {
+				out = append(out, faint(l))
+			}
+		}
 	}
 	return out
 }
@@ -437,7 +485,7 @@ func (f *frame) render(rows, cols int) string {
 		for _, l := range top {
 			b.WriteString(l + "\n")
 		}
-		for _, l := range f.slabFullPane(avail + 2) {
+		for _, l := range f.slabFullPane(avail+2, w) {
 			b.WriteString(l + "\n")
 		}
 		b.WriteString(f.footerLine())
@@ -757,7 +805,7 @@ func (f *frame) slabPane(limit int) []string {
 				break
 			}
 			out = append(out, fmt.Sprintf(" %-22s %8s %5.0f%%",
-				trunc(c.name, 22), humanBytes(c.bytes()), c.occupancy()*100))
+				trunc(cacheLabel(c.name), 22), humanBytes(c.bytes()), c.occupancy()*100))
 		}
 		return out
 	}
@@ -774,7 +822,7 @@ func (f *frame) slabPane(limit int) []string {
 		}
 		w := f.who[c.name]
 		out = append(out, fmt.Sprintf(" %-22s %8s %s %7s %7s%s",
-			trunc(c.name, 22), humanBytes(c.bytes()),
+			trunc(cacheLabel(c.name), 22), humanBytes(c.bytes()),
 			occStyle(c.occupancy()).Render(fmt.Sprintf("%4.0f%%", c.occupancy()*100)),
 			humanCount(w.blocks), humanCount(w.hostageBlocks), moveMark(w.mobile)))
 	}

@@ -19,7 +19,10 @@
 // with copy_from_kernel_nofault(), because a cache can be destroyed while the
 // walk is in flight and a stale pointer must not take the machine down.
 
+#include <linux/codetag.h>
+#include <linux/hash.h>
 #include <linux/kernel.h>
+#include <linux/memcontrol.h>
 #include <linux/module.h>
 #include <linux/mm.h>
 #include <linux/mmzone.h>
@@ -35,6 +38,15 @@
 static unsigned int hostage_max = 64;
 module_param(hostage_max, uint, 0644);
 MODULE_PARM_DESC(hostage_max, "a block with at most this many used pages counts as hostage");
+
+/*
+ * Attribution is served from its own file. It costs orders of magnitude more
+ * than the cache walk, and a monitor polling twice a second must not pay for
+ * something it did not ask for.
+ */
+static unsigned int sites_refresh_ms = 15000;
+module_param(sites_refresh_ms, uint, 0644);
+MODULE_PARM_DESC(sites_refresh_ms, "reuse the previous attribution if it is younger than this");
 
 static unsigned int refresh_ms = 2000;
 module_param(refresh_ms, uint, 0644);
@@ -86,9 +98,47 @@ struct kmem_cache_mobility_mirror {
 static size_t name_off;
 static long move_off = -1;
 
+/*
+ * Mirror of struct slab from mm/slab.h. Only ->obj_exts and ->stride are wanted
+ * and both alias fields of struct page, so the layout is checked against it
+ * rather than trusted: obj_exts sits where memcg_data does, by static_assert in
+ * the kernel's own header.
+ */
+struct slab_mirror {
+	unsigned long flags;
+	struct kmem_cache *slab_cache;
+	struct list_head slab_list;
+	void *freelist;
+	union {
+		unsigned long counters;
+		struct {
+			unsigned inuse:16;
+			unsigned objects:15;
+			unsigned frozen:1;
+			unsigned int stride;
+		};
+	};
+	unsigned int __page_type;
+	atomic_t __page_refcount;
+	unsigned long obj_exts;
+};
+
+#ifdef CONFIG_MEMCG
+static_assert(offsetof(struct slab_mirror, obj_exts) ==
+	      offsetof(struct page, memcg_data));
+#endif
+static_assert(offsetof(struct slab_mirror, slab_cache) ==
+	      offsetof(struct page, compound_info));
+static_assert(sizeof(struct slab_mirror) <= sizeof(struct page));
+
 #define PAGES_PER_BLOCK (1UL << pageblock_order)
 #define MAX_CACHES 512
+#define MAX_SITES 1024
+/* Open addressed, twice the entries, so a probe finds a free slot quickly. */
+#define SITE_HASH_BITS 11
+#define MAX_HOSTAGE (1U << 17)
 #define NAME_LEN 40
+#define SITE_LEN 64
 
 struct cache_stat {
 	const struct kmem_cache *cache;
@@ -101,7 +151,32 @@ struct cache_stat {
 	bool mobile;
 };
 
+/*
+ * Where an object was allocated from, for the objects sitting in hostage
+ * blocks. SLUB merges caches of the same size into one kmem_cache and keeps
+ * only the first name, so the cache table alone cannot say whether a block is
+ * held by zswap or by ftrace. The codetag can, when the kernel carries one.
+ */
+struct site_stat {
+	const struct kmem_cache *cache;
+	const struct codetag *tag;
+	char name[SITE_LEN];
+	char file[SITE_LEN];
+	unsigned int line;
+	u64 objects;
+	u32 blocks;
+};
+
 static DEFINE_MUTEX(walk_lock);
+static struct site_stat *site_stats;
+static unsigned int nr_sites;
+static struct site_stat **site_hash;
+static struct proc_dir_entry *sites_file;
+static unsigned long sites_walked_at;
+static bool sites_walked_once;
+static unsigned long *hostage_pfns;
+static unsigned int nr_hostage;
+static bool sites_available;
 static struct cache_stat *stats;
 static unsigned int nr_stats;
 static unsigned long walked_at;
@@ -243,6 +318,214 @@ static bool layout_is_sane(void)
 	return ok;
 }
 
+#ifdef CONFIG_MEM_ALLOC_PROFILING
+
+static int by_objects(const void *a, const void *b)
+{
+	const struct site_stat *x = a, *y = b;
+
+	if (x->objects != y->objects)
+		return y->objects > x->objects ? 1 : -1;
+	return 0;
+}
+
+/*
+ * Keyed by cache as well as by tag. SLUB hands several caches the same
+ * kmem_cache, so the pair is what says which of them a site is filling, and
+ * that is the only way to read a merged cache apart.
+ */
+static struct site_stat *site_for(const struct kmem_cache *cache,
+				  const struct codetag *tag)
+{
+	u32 slot = hash_64((u64)(uintptr_t)tag ^ (u64)(uintptr_t)cache, SITE_HASH_BITS);
+	unsigned int probes;
+
+	/*
+	 * Called once per object rather than once per page, so this cannot be
+	 * the linear scan the cache table uses: on a fragmented machine that is
+	 * a hundred million lookups over a thousand entries, under a mutex,
+	 * while whoever is watching polls twice a second.
+	 */
+	for (probes = 0; probes < (1U << SITE_HASH_BITS); probes++) {
+		struct site_stat *st = site_hash[slot];
+
+		if (!st) {
+			if (nr_sites == MAX_SITES)
+				return NULL;
+			st = &site_stats[nr_sites++];
+			memset(st, 0, sizeof(*st));
+			st->tag = tag;
+			st->cache = cache;
+			site_hash[slot] = st;
+			return st;
+		}
+		if (st->tag == tag && st->cache == cache)
+			return st;
+		slot = (slot + 1) & ((1U << SITE_HASH_BITS) - 1);
+	}
+	return NULL;
+}
+
+static const char *cache_name_of(const struct kmem_cache *c)
+{
+	unsigned int i;
+
+	for (i = 0; i < nr_stats; i++)
+		if (stats[i].cache == c)
+			return stats[i].name[0] ? stats[i].name : "?";
+	return "?";
+}
+
+/*
+ * A codetag lives in a module section that can go away with the module, so the
+ * strings are copied the same fault tolerant way cache names are.
+ */
+static void describe_site(struct site_stat *st)
+{
+	struct codetag ct;
+	const char *base;
+
+	if (st->name[0])
+		return;
+
+	strscpy(st->name, "?", SITE_LEN);
+	strscpy(st->file, "?", SITE_LEN);
+
+	if (copy_from_kernel_nofault(&ct, st->tag, sizeof(ct)))
+		return;
+
+	st->line = ct.lineno;
+	copy_name_nofault(st->name, ct.function, SITE_LEN);
+	if (copy_name_nofault(st->file, ct.filename, SITE_LEN)) {
+		base = strrchr(st->file, '/');
+		if (base)
+			memmove(st->file, base + 1, strlen(base));
+	}
+	if (!st->name[0])
+		strscpy(st->name, "?", SITE_LEN);
+}
+
+/*
+ * Objects whose first byte falls on this page. One straddling the boundary is
+ * counted against the page it starts on, which is the same convention the page
+ * level accounting above already uses.
+ */
+static void attribute_page(struct page *page, struct site_stat **seen,
+			   unsigned int *nseen, unsigned int seen_max)
+{
+	struct page *head = compound_head(page);
+	struct slab_mirror *slab = (struct slab_mirror *)head;
+	const struct kmem_cache_mirror *cm;
+	const struct kmem_cache *cache;
+	unsigned long obj_exts, slab_addr, page_addr;
+	unsigned int stride, size, objects, first, last, i, j;
+
+	cache = page_cache_of(page);
+	cm = (const struct kmem_cache_mirror *)cache;
+	if (!cm)
+		return;
+
+	obj_exts = READ_ONCE(slab->obj_exts) & ~OBJEXTS_FLAGS_MASK;
+	stride = slab->stride;
+	size = cm->size;
+	objects = slab->objects;
+
+	/*
+	 * Nothing here is reachable unless the kernel was built with allocation
+	 * profiling and the vector was actually allocated for this slab. A
+	 * nonsense stride means the mirrored layout does not match, and reading
+	 * on would be indexing into whatever else lives there.
+	 */
+	if (!obj_exts || !objects || !size ||
+	    stride < sizeof(struct slabobj_ext) || stride > 64)
+		return;
+
+	slab_addr = (unsigned long)page_address(head);
+	page_addr = (unsigned long)page_address(page);
+	if (!slab_addr || page_addr < slab_addr)
+		return;
+
+	first = DIV_ROUND_UP(page_addr - slab_addr, size);
+	last = (page_addr + PAGE_SIZE - 1 - slab_addr) / size;
+	if (last >= objects)
+		last = objects - 1;
+
+	for (i = first; i <= last; i++) {
+		struct slabobj_ext *ext;
+		struct site_stat *st;
+		union codetag_ref ref;
+
+		ext = (struct slabobj_ext *)(obj_exts + (unsigned long)stride * i);
+		if (copy_from_kernel_nofault(&ref, &ext->ref, sizeof(ref)))
+			continue;
+		/* A freed object has its tag cleared, so this skips them. */
+		if (!ref.ct)
+			continue;
+
+		st = site_for(cache, ref.ct);
+		if (!st)
+			continue;
+		describe_site(st);
+		st->objects++;
+
+		for (j = 0; j < *nseen; j++)
+			if (seen[j] == st)
+				break;
+		if (j == *nseen && *nseen < seen_max) {
+			seen[(*nseen)++] = st;
+			st->blocks++;
+		}
+	}
+}
+
+/*
+ * Second pass, over the hostage blocks alone. Attributing every object in the
+ * machine would multiply the walk by the number of objects per page, and the
+ * only ones worth naming are those keeping a block from being handed out.
+ */
+static void walk_sites(void)
+{
+	struct site_stat *seen[64];
+	unsigned int b;
+
+	nr_sites = 0;
+	if (!site_stats || !site_hash)
+		return;
+	memset(site_hash, 0, array_size(1U << SITE_HASH_BITS, sizeof(*site_hash)));
+
+	for (b = 0; b < nr_hostage; b++) {
+		unsigned long pfn, start = hostage_pfns[b];
+		unsigned int nseen = 0;
+		bool pfn_ok = false;
+
+		for (pfn = start; pfn < start + PAGES_PER_BLOCK; pfn++) {
+			struct page *page;
+
+			if (!(pfn & (PAGES_PER_SUBSECTION - 1)))
+				pfn_ok = pfn_valid(pfn);
+			if (!pfn_ok)
+				continue;
+			page = pfn_to_page(pfn);
+			if (!PageSlab(page))
+				continue;
+			attribute_page(page, seen, &nseen, ARRAY_SIZE(seen));
+			/* Per page, not per block: a block can hold thousands
+			 * of objects and each one is a fault tolerant read. */
+			cond_resched();
+		}
+	}
+	sort(site_stats, nr_sites, sizeof(*site_stats), by_objects, NULL);
+	sites_available = nr_sites > 0;
+	sites_walked_at = jiffies;
+	sites_walked_once = true;
+}
+
+#else /* CONFIG_MEM_ALLOC_PROFILING */
+
+static void walk_sites(void) { }
+
+#endif
+
 static int by_hostage(const void *a, const void *b)
 {
 	const struct cache_stat *x = a, *y = b;
@@ -263,6 +546,8 @@ static void walk_memory(void)
 	ktime_t t0 = ktime_get();
 
 	nr_stats = 0;
+	nr_hostage = 0;
+	sites_available = false;
 	total_blocks = total_hostage_blocks = hostage_free_pages = 0;
 	hostage_by_1 = hostage_by_2 = hostage_by_3plus = 0;
 	hostage_nonslab = hostage_all_mobile = 0;
@@ -376,6 +661,8 @@ static void walk_memory(void)
 
 				total_hostage_blocks++;
 				hostage_free_pages += freep;
+				if (hostage_pfns && nr_hostage < MAX_HOSTAGE)
+					hostage_pfns[nr_hostage++] = block_start;
 				for (i = 0; i < nseen; i++) {
 					seen[i]->hostage_pages += seen_pages[i];
 					seen[i]->hostage_blocks++;
@@ -416,13 +703,17 @@ static void walk_memory(void)
 	walked_once = true;
 }
 
-static void *slabwho_start(struct seq_file *s, loff_t *pos)
+static void ensure_walk(void)
 {
-	mutex_lock(&walk_lock);
-
 	if (!walked_once ||
 	    time_after(jiffies, walked_at + msecs_to_jiffies(refresh_ms)))
 		walk_memory();
+}
+
+static void *slabwho_start(struct seq_file *s, loff_t *pos)
+{
+	mutex_lock(&walk_lock);
+	ensure_walk();
 
 	if (*pos == 0)
 		return SEQ_START_TOKEN;
@@ -437,6 +728,48 @@ static void *slabwho_next(struct seq_file *s, void *v, loff_t *pos)
 	if (*pos - 1 >= nr_stats)
 		return NULL;
 	return &stats[*pos - 1];
+}
+
+/*
+ * Attribution, in its own file and on its own clock. Walking it costs a fault
+ * tolerant read per object rather than per page, so it must never ride along
+ * with the cache table that a monitor refreshes twice a second.
+ */
+static void *sites_start(struct seq_file *s, loff_t *pos)
+{
+	mutex_lock(&walk_lock);
+	ensure_walk();
+	if (!sites_walked_once ||
+	    time_after(jiffies, sites_walked_at + msecs_to_jiffies(sites_refresh_ms)))
+		walk_sites();
+
+	if (*pos == 0)
+		return SEQ_START_TOKEN;
+	if (*pos - 1 >= nr_sites)
+		return NULL;
+	return &site_stats[*pos - 1];
+}
+
+static void *sites_next(struct seq_file *s, void *v, loff_t *pos)
+{
+	(*pos)++;
+	if (*pos - 1 >= nr_sites)
+		return NULL;
+	return &site_stats[*pos - 1];
+}
+
+static int sites_show(struct seq_file *s, void *v)
+{
+	const struct site_stat *si = v;
+
+	if (v == SEQ_START_TOKEN) {
+		seq_printf(s, "# sites %u age_ms %u\n", sites_available ? nr_sites : 0,
+			   jiffies_to_msecs(jiffies - sites_walked_at));
+		return 0;
+	}
+	seq_printf(s, "@ %llu %u %s %s %s:%u\n", si->objects, si->blocks,
+		   cache_name_of(si->cache), si->name, si->file, si->line);
+	return 0;
 }
 
 static void slabwho_stop(struct seq_file *s, void *v)
@@ -472,6 +805,13 @@ static const struct seq_operations slabwho_ops = {
 	.show = slabwho_show,
 };
 
+static const struct seq_operations sites_ops = {
+	.start = sites_start,
+	.next = sites_next,
+	.stop = slabwho_stop,
+	.show = sites_show,
+};
+
 static int __init slabwho_init(void)
 {
 	if (!layout_is_sane())
@@ -485,12 +825,26 @@ static int __init slabwho_init(void)
 		vfree(stats);
 		return -ENOMEM;
 	}
+
+#ifdef CONFIG_MEM_ALLOC_PROFILING
+	/* Optional: without them the cache table still works, unattributed. */
+	hostage_pfns = vzalloc(array_size(MAX_HOSTAGE, sizeof(*hostage_pfns)));
+	site_stats = vzalloc(array_size(MAX_SITES, sizeof(*site_stats)));
+	site_hash = vzalloc(array_size(1U << SITE_HASH_BITS, sizeof(*site_hash)));
+	if (hostage_pfns && site_stats && site_hash)
+		sites_file = proc_create_seq("slabwho_sites", 0444, NULL, &sites_ops);
+#endif
 	return 0;
 }
 
 static void __exit slabwho_exit(void)
 {
+	if (sites_file)
+		remove_proc_entry("slabwho_sites", NULL);
 	remove_proc_entry("slabwho", NULL);
+	vfree(site_hash);
+	vfree(site_stats);
+	vfree(hostage_pfns);
 	vfree(stats);
 }
 

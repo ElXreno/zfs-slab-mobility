@@ -91,6 +91,35 @@ func readSlabwho() (map[string]whoStat, whoTotals, string) {
 	return out, tot, ""
 }
 
+// Allocation sites, from a separate file on a slower kernel clock. It costs a
+// fault tolerant read per object rather than per page, so a monitor refreshing
+// the map twice a second reads it only while the table that shows it is open.
+func readSites() []siteStat {
+	f, err := openProc("slabwho_sites")
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	var sites []siteStat
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		fl := strings.Fields(sc.Text())
+		if len(fl) < 6 || fl[0] != "@" {
+			continue
+		}
+		num := func(i int) uint64 {
+			n, _ := strconv.ParseUint(fl[i], 10, 64)
+			return n
+		}
+		sites = append(sites, siteStat{
+			objects: num(1), blocks: num(2),
+			cache: fl[3], fn: fl[4], file: fl[5],
+		})
+	}
+	return sites
+}
+
 func hostname() string {
 	b, err := os.ReadFile(procPath("sys/kernel/hostname"))
 	if err != nil {
@@ -142,13 +171,24 @@ func (m *model) collect() {
 	types, _ := readPagetypeinfo()
 	slabs, _ := readSlabinfo()
 	mem, vm, arc := readMeminfo(), readVmstat(), readARC()
+	cacheAliases = loadCacheAliases()
 	who, whoTot, whoErr := readSlabwho()
+
+	// Only while the table that shows them is open, so idle monitoring on the
+	// map never triggers the expensive per object walk in the module.
+	var sites []siteStat
+	if m.f.focusSlab {
+		sites = readSites()
+	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.f.ladder, m.f.types, m.f.slabs = ladder, types, slabs
 	m.f.mem, m.f.vm, m.f.arc = mem, vm, arc
 	m.f.who, m.f.whoTot, m.f.whoErr = who, whoTot, whoErr
+	if sites != nil {
+		m.f.sites = sites
+	}
 }
 
 // Scan [from, to) into scratch space and publish it under the lock. The read
@@ -512,6 +552,7 @@ func main() {
 	if *hostage {
 		m.wantFull = true
 		m.scan()
+		m.f.sites = readSites()
 		hostageReport(m.f)
 		return
 	}
@@ -519,6 +560,7 @@ func main() {
 	if *dump != "" {
 		m.wantFull = true
 		m.scan()
+		m.f.sites = readSites()
 		m.f.taken = *stamp
 		m.f.summarise()
 		if err := writeSnapshot(m.f, *dump, *label); err != nil {

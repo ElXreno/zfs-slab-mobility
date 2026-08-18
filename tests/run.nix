@@ -107,6 +107,11 @@ pkgs.testers.runNixOSTest {
         for f in ("hostname", "osrelease"):
             machine.succeed(f"cat /proc/sys/kernel/{f} > {d}/sys/kernel/{f}")
         machine.succeed(f"cat /proc/slabwho > {d}/slabwho || true")
+        # Which caches SLUB folded together, so a name in the report is never
+        # taken for the only thing living in that cache.
+        machine.succeed(
+            f"find /sys/kernel/slab -maxdepth 1 -type l -printf '%f %l\\n' > {d}/slabmerge"
+        )
         for f in ("kpageflags", "kpagecount"):
             machine.succeed(f"gzip -1 -c /proc/{f} > {d}/{f}.gz")
 
