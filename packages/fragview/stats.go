@@ -203,7 +203,13 @@ func readMeminfo() map[string]uint64 {
 		if err != nil {
 			continue
 		}
-		m[k] = n * 1024
+		// Most of this file is in kilobytes and says so. The huge page rows
+		// are plain counts, and scaling those would put an invented unit on
+		// the one number here that is counted rather than measured.
+		if len(fields) > 1 && fields[1] == "kB" {
+			n *= 1024
+		}
+		m[k] = n
 	}
 	return m
 }

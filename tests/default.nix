@@ -153,6 +153,34 @@ let
       ];
     };
 
+    # The outcome the patches exist for, in the allocator's own currency. Every
+    # other check counts blocks and pages, which are means; this one asks how
+    # much contiguous memory the machine can still hand out with the ARC full.
+    #
+    # No assertion yet: the threshold has to come from what three seeds
+    # actually produce, and putting a number here before measuring would be
+    # inventing one.
+    highorder = mkCompare {
+      name = "highorder";
+      phase = "highorder";
+      order = [
+        "separation"
+        "mobility"
+      ];
+      runs =
+        let
+          # A third of the guest asked for at once, so the request cannot be
+          # met out of whatever happens to be free and has to come from
+          # blocks the ARC is sitting in.
+          demand = { hugeDemand = 1024; };
+        in
+        {
+          separation = runsFor demand "separation";
+          mobility = runsFor demand "mobility";
+        };
+      expect = [ ];
+    };
+
     # Relocation of chunks larger than one page, which is what the machine this
     # was written on allocates almost exclusively. Not a comparison: the thing
     # asserted is that the kernel does not corrupt a list while migrating, so

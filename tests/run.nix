@@ -26,6 +26,7 @@
   readJobs ? 0,
   burstJobs ? 0,
   compactWhileWarm ? false,
+  hugeDemand ? 0,
   compactRounds ? 12,
   compactSeconds ? 90,
   files ? 50000,
@@ -242,6 +243,24 @@ pkgs.testers.runNixOSTest {
                 " under test did not run and this proves nothing"
             )
             snapshot("warm-compacted")
+
+    # What the patches are for, asked as a question the allocator answers in
+    # one number: with the ARC holding its chunks, how much contiguous memory
+    # can the machine still hand out? Counted while the pages are held, since
+    # releasing them first would leave nothing to count.
+    if ${toString hugeDemand} > 0:
+        with subtest("highorder"):
+            before = compound_chunks()
+            machine.succeed("echo ${toString hugeDemand} > /proc/sys/vm/nr_hugepages")
+            got = int(machine.succeed("awk '/^HugePages_Total/{print $2}' /proc/meminfo"))
+            print(f"asked ${toString hugeDemand}, got {got}, compound chunks {before}")
+            assert before > 1000, (
+                f"only {before} chunks larger than a page, so the ARC is not"
+                " holding the memory this is meant to compete with"
+            )
+            snapshot("highorder")
+            machine.succeed("echo 0 > /proc/sys/vm/nr_hugepages")
+            kernel_is_quiet("the high order demand")
 
     with subtest("squeeze"):
         machine.succeed(

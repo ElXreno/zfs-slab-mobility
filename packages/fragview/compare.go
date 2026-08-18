@@ -34,6 +34,7 @@ type snapMetrics struct {
 	slabAll  uint64
 	kswapd   uint64
 	direct   uint64
+	huge     uint64
 }
 
 func measure(f *frame) snapMetrics {
@@ -50,6 +51,7 @@ func measure(f *frame) snapMetrics {
 		slabAll: f.mem["Slab"],
 		kswapd:  f.vm["pgscan_kswapd"],
 		direct:  f.vm["pgscan_direct"],
+		huge:    f.mem["HugePages_Total"],
 	}
 
 	for i, c := range f.m.counts {
@@ -94,6 +96,7 @@ func (m snapMetrics) fields() map[string]float64 {
 		"arc_size":    float64(m.arcSize),
 		"slab_size":   float64(m.slabAll),
 		"kswapd_scan": float64(m.kswapd),
+		"hugepages":   float64(m.huge),
 		"direct_scan": float64(m.direct),
 		"blocks":      float64(m.nblocks),
 	}
@@ -116,6 +119,7 @@ var metricRows = []struct {
 	{key: "pinned", title: "pinned", bytes: true},
 	{key: "slab_in", title: "slab pages in them"},
 	{key: "arc_in", title: "arc pages in them", gapAfter: true},
+	{key: "hugepages", title: "huge pages handed out"},
 	{key: "order10", title: "free at order 10"},
 	{key: "unusable", title: "unusable order-10", percent: true, gapAfter: true},
 	{key: "blocks_unmovable", title: "Unmovable blocks"},
