@@ -1,4 +1,4 @@
-From 9fc25d21db252dc6cbe800a65c2034c803beb4a7 Mon Sep 17 00:00:00 2001
+From b8ca3c92183de68464dd47eaaaec61810dd5dfbb Mon Sep 17 00:00:00 2001
 From: ElXreno <elxreno@gmail.com>
 Date: Tue, 18 Aug 2026 08:40:53 +0300
 Subject: [PATCH] abd: do not free a chunk that compaction is holding
@@ -17,38 +17,43 @@ because a relocation that succeeds leaves a different page in the slot and
 that is the one to free. Holding the gate across the unmark also closes the
 window against a relocation that would otherwise start in the middle of it.
 ---
- module/os/linux/zfs/abd_os.c | 97 +++++++++++++++++++++++++++++++++++-
- 1 file changed, 95 insertions(+), 2 deletions(-)
+ module/os/linux/zfs/abd_os.c | 122 ++++++++++++++++++++++++++++++++++-
+ 1 file changed, 120 insertions(+), 2 deletions(-)
 
 diff --git a/module/os/linux/zfs/abd_os.c b/module/os/linux/zfs/abd_os.c
-index e7a453e14..f16893ccd 100644
+index e7a453e14..0d6c92ae6 100644
 --- a/module/os/linux/zfs/abd_os.c
 +++ b/module/os/linux/zfs/abd_os.c
-@@ -90,6 +90,7 @@ typedef struct abd_stats {
+@@ -90,6 +90,9 @@ typedef struct abd_stats {
  	 */
  	kstat_named_t abdstat_page_isolate_asked;
  	kstat_named_t abdstat_page_isolate_no_owner;
 +	kstat_named_t abdstat_gate_waited;
++	kstat_named_t abdstat_retire_waited;
++	kstat_named_t abdstat_retire_spin_max;
  	kstat_named_t abdstat_page_migrated;
  	kstat_named_t abdstat_page_migrate_busy;
  	kstat_named_t abdstat_page_migrate_lost;
-@@ -149,6 +150,7 @@ static abd_stats_t abd_stats = {
+@@ -149,6 +152,9 @@ static abd_stats_t abd_stats = {
  	{ "scatter_sg_table_retry",		KSTAT_DATA_UINT64 },
  	{ "page_isolate_asked",			KSTAT_DATA_UINT64 },
  	{ "page_isolate_no_owner",		KSTAT_DATA_UINT64 },
 +	{ "gate_waited",			KSTAT_DATA_UINT64 },
++	{ "retire_waited",			KSTAT_DATA_UINT64 },
++	{ "retire_spin_max",			KSTAT_DATA_UINT64 },
  	{ "page_migrated",			KSTAT_DATA_UINT64 },
  	{ "page_migrate_busy",			KSTAT_DATA_UINT64 },
  	{ "page_migrate_lost",			KSTAT_DATA_UINT64 },
-@@ -168,6 +170,7 @@ static struct {
+@@ -168,6 +174,8 @@ static struct {
  	wmsum_t abdstat_scatter_sg_table_retry;
  	wmsum_t abdstat_page_isolate_asked;
  	wmsum_t abdstat_page_isolate_no_owner;
 +	wmsum_t abdstat_gate_waited;
++	wmsum_t abdstat_retire_waited;
  	wmsum_t abdstat_page_migrated;
  	wmsum_t abdstat_page_migrate_busy;
  	wmsum_t abdstat_page_migrate_lost;
-@@ -343,6 +346,12 @@ abd_gate_enter(struct scatterlist *sg, struct page **pagep)
+@@ -343,6 +351,12 @@ abd_gate_enter(struct scatterlist *sg, struct page **pagep)
  			return (owner);
  		}
  
@@ -61,7 +66,7 @@ index e7a453e14..f16893ccd 100644
  		atomic_dec(&ABD_SCATTER(owner).abd_readers);
  		cpu_relax();
  	}
-@@ -528,6 +537,87 @@ abd_gate_drop_page(struct page *page)
+@@ -528,6 +542,103 @@ abd_gate_drop_page(struct page *page)
  #define	abd_unmark_zfs_page(page)
  #endif /* _LP64 */
  
@@ -81,10 +86,26 @@ index e7a453e14..f16893ccd 100644
 + * relocation starting in the middle of it; once the mark is gone the chunk can
 + * no longer be offered at all.
 + */
++/*
++ * One turn of the wait in the retire path, kept apart from the read gate's
++ * because the two spin for different reasons and only this one sits on every
++ * eviction. The longest run is kept as well: a large total spread thinly is a
++ * cost, a large total in one run is a stall.
++ */
++static void
++abd_retire_spun(unsigned int spins)
++{
++	ABDSTAT_BUMP(abdstat_retire_waited);
++	if (spins > abd_stats.abdstat_retire_spin_max.value.ui64)
++		abd_stats.abdstat_retire_spin_max.value.ui64 = spins;
++}
++
 +static struct page *
 +abd_retire_page(struct scatterlist *sg)
 +{
 +#if defined(_LP64) && defined(HAVE_PGTY_MODMOVABLE)
++	unsigned int spins = 0;
++
 +	for (;;) {
 +		struct page *page = sg_page(sg);
 +		struct folio *folio = page_folio(page);
@@ -108,7 +129,7 @@ index e7a453e14..f16893ccd 100644
 +		 * chunk that has already been handed back.
 +		 */
 +		if (!folio_trylock(folio)) {
-+			ABDSTAT_BUMP(abdstat_gate_waited);
++			abd_retire_spun(++spins);
 +			cpu_relax();
 +			continue;
 +		}
@@ -129,7 +150,7 @@ index e7a453e14..f16893ccd 100644
 +		if (PageMovableOpsIsolated(page) || sg_page(sg) != page ||
 +		    page_ref_count(page) > 2) {
 +			folio_unlock(folio);
-+			ABDSTAT_BUMP(abdstat_gate_waited);
++			abd_retire_spun(++spins);
 +			cpu_relax();
 +			continue;
 +		}
@@ -149,7 +170,7 @@ index e7a453e14..f16893ccd 100644
  #ifndef CONFIG_HIGHMEM
  
  /*
-@@ -777,8 +867,7 @@ abd_free_chunks(abd_t *abd)
+@@ -777,8 +888,7 @@ abd_free_chunks(abd_t *abd)
  	 */
  	if (!abd_is_from_pages(abd)) {
  		abd_for_each_sg(abd, sg, nr_pages, i) {
@@ -159,28 +180,32 @@ index e7a453e14..f16893ccd 100644
  			order = compound_order(page);
  			__free_pages(page, order);
  			ASSERT3U(sg->length, <=, PAGE_SIZE << order);
-@@ -943,6 +1032,8 @@ abd_kstats_update(kstat_t *ksp, int rw)
+@@ -943,6 +1053,10 @@ abd_kstats_update(kstat_t *ksp, int rw)
  	    wmsum_value(&abd_sums.abdstat_page_isolate_asked);
  	as->abdstat_page_isolate_no_owner.value.ui64 =
  	    wmsum_value(&abd_sums.abdstat_page_isolate_no_owner);
 +	as->abdstat_gate_waited.value.ui64 =
 +	    wmsum_value(&abd_sums.abdstat_gate_waited);
++	as->abdstat_retire_waited.value.ui64 =
++	    wmsum_value(&abd_sums.abdstat_retire_waited);
  	as->abdstat_page_migrated.value.ui64 =
  	    wmsum_value(&abd_sums.abdstat_page_migrated);
  	as->abdstat_page_migrate_busy.value.ui64 =
-@@ -974,6 +1065,7 @@ abd_init(void)
+@@ -974,6 +1088,8 @@ abd_init(void)
  	wmsum_init(&abd_sums.abdstat_scatter_sg_table_retry, 0);
  	wmsum_init(&abd_sums.abdstat_page_isolate_asked, 0);
  	wmsum_init(&abd_sums.abdstat_page_isolate_no_owner, 0);
 +	wmsum_init(&abd_sums.abdstat_gate_waited, 0);
++	wmsum_init(&abd_sums.abdstat_retire_waited, 0);
  	wmsum_init(&abd_sums.abdstat_page_migrated, 0);
  	wmsum_init(&abd_sums.abdstat_page_migrate_busy, 0);
  	wmsum_init(&abd_sums.abdstat_page_migrate_lost, 0);
-@@ -1033,6 +1125,7 @@ abd_fini(void)
+@@ -1033,6 +1149,8 @@ abd_fini(void)
  	wmsum_fini(&abd_sums.abdstat_scatter_sg_table_retry);
  	wmsum_fini(&abd_sums.abdstat_page_isolate_asked);
  	wmsum_fini(&abd_sums.abdstat_page_isolate_no_owner);
 +	wmsum_fini(&abd_sums.abdstat_gate_waited);
++	wmsum_fini(&abd_sums.abdstat_retire_waited);
  	wmsum_fini(&abd_sums.abdstat_page_migrated);
  	wmsum_fini(&abd_sums.abdstat_page_migrate_busy);
  	wmsum_fini(&abd_sums.abdstat_page_migrate_lost);

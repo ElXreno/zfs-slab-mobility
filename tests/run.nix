@@ -253,11 +253,28 @@ pkgs.testers.runNixOSTest {
             before = compound_chunks()
             machine.succeed("echo ${toString hugeDemand} > /proc/sys/vm/nr_hugepages")
             got = int(machine.succeed("awk '/^HugePages_Total/{print $2}' /proc/meminfo"))
-            print(f"asked ${toString hugeDemand}, got {got}, compound chunks {before}")
+            print(
+                f"asked ${toString hugeDemand}, got {got},"
+                f" compound chunks {before},"
+                f" retire waited {abdstat('retire_waited')}"
+                f" longest {abdstat('retire_spin_max')},"
+                f" gate waited {abdstat('gate_waited')}"
+            )
             assert before > 1000, (
                 f"only {before} chunks larger than a page, so the ARC is not"
                 " holding the memory this is meant to compete with"
             )
+            # The retire path spins rather than sleeps, so what matters is not
+            # how much it waited in total but how long it ever waited at once.
+            # A few hundred turns is microseconds; a run into the thousands
+            # would mean it is waiting on something that sleeps, and that is
+            # the shape worth failing on.
+            longest = abdstat("retire_spin_max")
+            assert longest < 10000, (
+                f"one retire spun {longest} times without giving up the cpu,"
+                " which is a stall rather than a wait"
+            )
+
             snapshot("highorder")
             machine.succeed("echo 0 > /proc/sys/vm/nr_hugepages")
             kernel_is_quiet("the high order demand")
