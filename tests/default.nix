@@ -153,6 +153,23 @@ let
       ];
     };
 
+    # Relocation of chunks larger than one page, which is what the machine this
+    # was written on allocates almost exclusively. Not a comparison: the thing
+    # asserted is that the kernel does not corrupt a list while migrating, so
+    # the run is the check and the assertions live in it.
+    #
+    # One seed rather than three. A comparison needs a median because the
+    # quantity moves between runs; this either walks into the bug or does not,
+    # and a second seed would buy nothing for another guest.
+    #
+    # Only the mobility build. Separation marks no page movable, so compaction
+    # would find nothing of ours and could not fail here however long it ran.
+    abd-migrate = mkRun {
+      variant = "mobility";
+      seed = 1;
+      compactWhileWarm = true;
+    };
+
     # vm.defrag_mode tells the allocator to compact rather than mix migrate types.
     # That is worth something only if the pages it wants to compact can move, so
     # on a stock kernel it should make no measurable difference either way.

@@ -25,6 +25,9 @@
   compression ? "off",
   readJobs ? 0,
   burstJobs ? 0,
+  compactWhileWarm ? false,
+  compactRounds ? 12,
+  compactSeconds ? 90,
   files ? 50000,
   fileSize ? 131072,
   memoryMB ? 6144,
@@ -37,7 +40,9 @@
 }:
 
 let
-  name = "${variant}-${recordSize}-${compression}-seed${toString seed}";
+  name =
+    "${variant}-${recordSize}-${compression}-seed${toString seed}"
+    + lib.optionalString compactWhileWarm "-compactwarm";
   jobsArg = lib.optionalString (readJobs > 0) " -jobs ${toString readJobs}";
 
   # The read pass ends with memory full and the high orders nearly gone, which
@@ -169,6 +174,74 @@ pkgs.testers.runNixOSTest {
             timeout=timedelta(seconds=1800),
         )
         snapshot("warm")
+
+    # Compaction has to run while the ARC still holds the chunks it allocated.
+    # The compact phase further down runs after the squeeze and a cache drop,
+    # by which point almost nothing of ours is left to move, which is why it
+    # never exercised relocation however often it ran.
+    if ${if compactWhileWarm then "True" else "False"}:
+        with subtest("compact-warm"):
+            compound = compound_chunks()
+            assert compound > 1000, (
+                f"only {compound} chunks larger than a page are allocated, so"
+                " compaction has nothing of ours to move and passing here"
+                " would prove nothing"
+            )
+
+            # kcompactd, not just the synchronous pass a sysctl write drives.
+            # The report this reproduces came from the background daemon, and
+            # it runs in a different migration mode against a different target
+            # order, so driving only the sysctl leaves that path untouched.
+            machine.succeed("echo 100 > /proc/sys/vm/compaction_proactiveness")
+
+            # Readers in flight. Relocation refuses a chunk that is being read
+            # and that refusal is a path of its own; on the machine this came
+            # from, exactly one chunk was refused that way before it died.
+            # Without load the guest compacts an ARC nothing is touching.
+            machine.succeed(
+                "systemd-run --unit=abd-readers --collect"
+                " fragload -mode hot -dir /tank/data/set"
+                " -files ${toString files} -size ${toString fileSize}"
+                " -seed ${toString seed} -slice ${toString hotFiles}"
+                " -secs ${toString compactSeconds}"
+            )
+
+            # Deliberately not succeed(). Writing here runs compaction in the
+            # caller's own context, so the corruption being looked for kills
+            # this shell, and a dead shell reads as a failed command rather
+            # than as what the kernel actually said about it.
+            for round in range(${toString compactRounds}):
+                # A genuine high order request. This is what wakes the daemon
+                # on a machine that is merely short of contiguous memory, and
+                # it carries a target order, which decides a branch that both
+                # proactive compaction and the sysctl skip by passing -1.
+                machine.execute("echo 512 > /proc/sys/vm/nr_hugepages")
+                machine.execute("echo 1 > /proc/sys/vm/compact_memory")
+                machine.sleep(duration=timedelta(seconds=5))
+                machine.execute("echo 0 > /proc/sys/vm/nr_hugepages")
+                kernel_is_quiet(f"compaction round {round} against a busy ARC")
+
+            machine.succeed("systemctl stop abd-readers || true")
+            kernel_is_quiet("compaction with a full ARC")
+
+            asked = abdstat("page_isolate_asked")
+            moved = abdstat("page_migrated")
+            busy = abdstat("page_migrate_busy")
+            lost = abdstat("page_migrate_lost")
+            waited = abdstat("gate_waited")
+            woke = machine.succeed(
+                "awk '$1 == \"compact_daemon_wake\" { print $2 }' /proc/vmstat"
+            ).strip()
+            print(
+                f"compound chunks {compound}, offered {asked}, moved {moved},"
+                f" refused busy {busy}, lost {lost}, gate waited {waited},"
+                f" kcompactd woke {woke}"
+            )
+            assert asked > 0, (
+                "compaction never offered a chunk for relocation, so the path"
+                " under test did not run and this proves nothing"
+            )
+            snapshot("warm-compacted")
 
     with subtest("squeeze"):
         machine.succeed(
