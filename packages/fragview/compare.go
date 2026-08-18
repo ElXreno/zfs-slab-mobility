@@ -313,11 +313,16 @@ func markdownTable(gs []*group) string {
 	return b.String()
 }
 
-// One assertion, written as metric:from->to<=ratio or >=ratio.
+// One assertion, written as metric:from->to<=ratio or >=ratio, optionally
+// followed by @gate:floor. The gate names the metric whose baseline decides
+// whether the phenomenon happened at all, which is not always the metric being
+// asserted on: a consequence cannot be read when its cause never occurred.
 type expectation struct {
 	metric, from, to string
 	atMost           bool
 	bound            float64
+	gate             string
+	floor            float64
 }
 
 func parseExpectation(spec string) (expectation, error) {
@@ -343,6 +348,19 @@ func parseExpectation(spec string) (expectation, error) {
 		return e, fmt.Errorf("no -> in %q", spec)
 	}
 	e.from, e.to = from, to
+
+	if bound, gateStr, hasGate := strings.Cut(boundStr, "@"); hasGate {
+		boundStr = bound
+		name, floorStr, ok := strings.Cut(gateStr, ":")
+		if !ok {
+			return e, fmt.Errorf("no metric:floor after @ in %q", spec)
+		}
+		f, err := strconv.ParseFloat(floorStr, 64)
+		if err != nil {
+			return e, fmt.Errorf("bad floor in %q: %w", spec, err)
+		}
+		e.gate, e.floor = name, f
+	}
 
 	b, err := strconv.ParseFloat(boundStr, 64)
 	if err != nil {
@@ -377,10 +395,17 @@ func judge(gs []*group, specs []expectation) []verdict {
 			v.missing = e.to
 		default:
 			v.a, v.b = from.median[e.metric], to.median[e.metric]
-			if v.a == 0 {
-				// Nothing to compare against. A ratio of zero would satisfy any
-				// upper bound and the assertion would pass having measured
-				// nothing, which is worse than no assertion at all.
+			gauge := v.a
+			if e.gate != "" {
+				gauge = from.median[e.gate]
+			}
+			if v.a == 0 || (e.floor > 0 && gauge < e.floor) {
+				// Nothing worth comparing against. A zero baseline makes any
+				// upper bound pass having measured nothing; a baseline of one
+				// or two is no better, and divides noise by noise to produce a
+				// ratio that looks like a finding. The floor says how much the
+				// phenomenon has to show up before the comparison means
+				// anything.
 				v.nosignal = true
 				break
 			}

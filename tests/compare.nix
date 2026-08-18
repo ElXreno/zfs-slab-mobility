@@ -11,7 +11,11 @@
   phase ? "compacted",
   # Column order, and the order assertions read in.
   order ? lib.attrNames runs,
-  # { metric, from, to, atMost | atLeast }
+  # { metric, from, to, atMost | atLeast, floor ?, gate ? }
+  # floor is the smallest baseline the ratio may be taken from: below it the
+  # comparison reports no signal instead of dividing noise by noise. gate names
+  # the metric that floor applies to, for asserting on a consequence whose
+  # cause is measured elsewhere; it defaults to the asserted metric.
   expect ? [ ],
 }:
 
@@ -21,8 +25,9 @@ let
     let
       op = if e ? atMost then "<=" else ">=";
       bound = toString (e.atMost or e.atLeast);
+      floor = lib.optionalString (e ? floor) "@${e.gate or e.metric}:${toString e.floor}";
     in
-    "--expect ${lib.escapeShellArg "${e.metric}:${e.from}->${e.to}${op}${bound}"}";
+    "--expect ${lib.escapeShellArg "${e.metric}:${e.from}->${e.to}${op}${bound}${floor}"}";
 
   dumpsFor =
     label:
