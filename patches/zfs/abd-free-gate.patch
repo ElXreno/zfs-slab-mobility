@@ -1,0 +1,142 @@
+From 67adb728c32b4da31591e197627d494608ea25ab Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Tue, 18 Aug 2026 08:40:53 +0300
+Subject: [PATCH] abd: do not free a chunk that compaction is holding
+
+Relocation raises the isolation flag on a chunk and only then asks us to
+move it, so between those two moments the chunk belongs to compaction. The
+free path walked past that: it dropped the mark and handed the pages back
+while the migration still meant to unlock the page and drop a reference on
+it, and the page reached the allocator with both outstanding. It showed up
+as a bad page state under a compacting kernel, and later as a corrupted
+free list once the allocator had handed the page out again.
+
+Free through the gate the read path already uses. It stands back while the
+flag is up and rereads the scatterlist entry afterwards, which matters
+because a relocation that succeeds leaves a different page in the slot and
+that is the one to free. Holding the gate across the unmark also closes the
+window against a relocation that would otherwise start in the middle of it.
+---
+ module/os/linux/zfs/abd_os.c | 50 ++++++++++++++++++++++++++++++++++--
+ 1 file changed, 48 insertions(+), 2 deletions(-)
+
+diff --git a/module/os/linux/zfs/abd_os.c b/module/os/linux/zfs/abd_os.c
+index e7a453e14..1a27bc9c9 100644
+--- a/module/os/linux/zfs/abd_os.c
++++ b/module/os/linux/zfs/abd_os.c
+@@ -90,6 +90,7 @@ typedef struct abd_stats {
+ 	 */
+ 	kstat_named_t abdstat_page_isolate_asked;
+ 	kstat_named_t abdstat_page_isolate_no_owner;
++	kstat_named_t abdstat_gate_waited;
+ 	kstat_named_t abdstat_page_migrated;
+ 	kstat_named_t abdstat_page_migrate_busy;
+ 	kstat_named_t abdstat_page_migrate_lost;
+@@ -149,6 +150,7 @@ static abd_stats_t abd_stats = {
+ 	{ "scatter_sg_table_retry",		KSTAT_DATA_UINT64 },
+ 	{ "page_isolate_asked",			KSTAT_DATA_UINT64 },
+ 	{ "page_isolate_no_owner",		KSTAT_DATA_UINT64 },
++	{ "gate_waited",			KSTAT_DATA_UINT64 },
+ 	{ "page_migrated",			KSTAT_DATA_UINT64 },
+ 	{ "page_migrate_busy",			KSTAT_DATA_UINT64 },
+ 	{ "page_migrate_lost",			KSTAT_DATA_UINT64 },
+@@ -168,6 +170,7 @@ static struct {
+ 	wmsum_t abdstat_scatter_sg_table_retry;
+ 	wmsum_t abdstat_page_isolate_asked;
+ 	wmsum_t abdstat_page_isolate_no_owner;
++	wmsum_t abdstat_gate_waited;
+ 	wmsum_t abdstat_page_migrated;
+ 	wmsum_t abdstat_page_migrate_busy;
+ 	wmsum_t abdstat_page_migrate_lost;
+@@ -343,6 +346,12 @@ abd_gate_enter(struct scatterlist *sg, struct page **pagep)
+ 			return (owner);
+ 		}
+ 
++		/*
++		 * Counted because this is the one place here that spins, and
++		 * the free path reaches it on every eviction: if it turns out
++		 * to be common, waiting is the wrong answer.
++		 */
++		ABDSTAT_BUMP(abdstat_gate_waited);
+ 		atomic_dec(&ABD_SCATTER(owner).abd_readers);
+ 		cpu_relax();
+ 	}
+@@ -528,6 +537,40 @@ abd_gate_drop_page(struct page *page)
+ #define	abd_unmark_zfs_page(page)
+ #endif /* _LP64 */
+ 
++/*
++ * Take a chunk back from the page allocator so that it can be freed.
++ *
++ * Compaction may be holding this one: it raises the isolation flag and then
++ * asks us to relocate, and until that finishes the chunk belongs to it rather
++ * than to us. Freeing underneath leaves it with a page it still means to move,
++ * to unlock and to drop a reference on, and the page reaches the allocator
++ * with those still outstanding.
++ *
++ * The gate the read path already uses settles this: it stands back while the
++ * flag is up and rereads the entry afterwards, because a relocation that
++ * succeeds puts a different page in this slot and that one is now ours to
++ * free. Holding the gate across the unmark also closes the window against a
++ * relocation starting in the middle of it; once the mark is gone the chunk can
++ * no longer be offered at all.
++ */
++static struct page *
++abd_retire_page(struct scatterlist *sg)
++{
++#if defined(_LP64) && defined(HAVE_PGTY_MODMOVABLE)
++	struct page *page;
++	abd_t *owner = abd_gate_enter(sg, &page);
++
++	abd_unmark_movable_page(page);
++	abd_gate_exit(owner);
++	return (page);
++#else
++	struct page *page = sg_page(sg);
++
++	abd_unmark_movable_page(page);
++	return (page);
++#endif
++}
++
+ #ifndef CONFIG_HIGHMEM
+ 
+ /*
+@@ -777,8 +820,7 @@ abd_free_chunks(abd_t *abd)
+ 	 */
+ 	if (!abd_is_from_pages(abd)) {
+ 		abd_for_each_sg(abd, sg, nr_pages, i) {
+-			page = sg_page(sg);
+-			abd_unmark_movable_page(page);
++			page = abd_retire_page(sg);
+ 			order = compound_order(page);
+ 			__free_pages(page, order);
+ 			ASSERT3U(sg->length, <=, PAGE_SIZE << order);
+@@ -943,6 +985,8 @@ abd_kstats_update(kstat_t *ksp, int rw)
+ 	    wmsum_value(&abd_sums.abdstat_page_isolate_asked);
+ 	as->abdstat_page_isolate_no_owner.value.ui64 =
+ 	    wmsum_value(&abd_sums.abdstat_page_isolate_no_owner);
++	as->abdstat_gate_waited.value.ui64 =
++	    wmsum_value(&abd_sums.abdstat_gate_waited);
+ 	as->abdstat_page_migrated.value.ui64 =
+ 	    wmsum_value(&abd_sums.abdstat_page_migrated);
+ 	as->abdstat_page_migrate_busy.value.ui64 =
+@@ -974,6 +1018,7 @@ abd_init(void)
+ 	wmsum_init(&abd_sums.abdstat_scatter_sg_table_retry, 0);
+ 	wmsum_init(&abd_sums.abdstat_page_isolate_asked, 0);
+ 	wmsum_init(&abd_sums.abdstat_page_isolate_no_owner, 0);
++	wmsum_init(&abd_sums.abdstat_gate_waited, 0);
+ 	wmsum_init(&abd_sums.abdstat_page_migrated, 0);
+ 	wmsum_init(&abd_sums.abdstat_page_migrate_busy, 0);
+ 	wmsum_init(&abd_sums.abdstat_page_migrate_lost, 0);
+@@ -1033,6 +1078,7 @@ abd_fini(void)
+ 	wmsum_fini(&abd_sums.abdstat_scatter_sg_table_retry);
+ 	wmsum_fini(&abd_sums.abdstat_page_isolate_asked);
+ 	wmsum_fini(&abd_sums.abdstat_page_isolate_no_owner);
++	wmsum_fini(&abd_sums.abdstat_gate_waited);
+ 	wmsum_fini(&abd_sums.abdstat_page_migrated);
+ 	wmsum_fini(&abd_sums.abdstat_page_migrate_busy);
+ 	wmsum_fini(&abd_sums.abdstat_page_migrate_lost);
+-- 
+2.55.0
+

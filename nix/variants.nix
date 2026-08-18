@@ -32,6 +32,7 @@ let
     "abd-reader-gate"
     "abd-relocate"
     "abd-movable-migratetype"
+    "abd-free-gate"
   ];
 
   mkVariant =
