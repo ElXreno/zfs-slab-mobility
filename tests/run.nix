@@ -260,13 +260,19 @@ pkgs.testers.runNixOSTest {
             busy = abdstat("page_migrate_busy")
             lost = abdstat("page_migrate_lost")
             waited = abdstat("gate_waited")
+            # Anything but zero here is a chunk that reached relocation
+            # holding fewer references than this code keeps on one it owns.
+            # The guard declines the put rather than freeing a page the
+            # caller still holds locked, so the run survives it, but the
+            # count is the only trace left and it belongs in the report.
+            short = abdstat("migrate_ref_short")
             woke = machine.succeed(
                 "awk '$1 == \"compact_daemon_wake\" { print $2 }' /proc/vmstat"
             ).strip()
             print(
                 f"compound chunks {compound}, offered {asked}, moved {moved},"
                 f" refused busy {busy}, lost {lost}, gate waited {waited},"
-                f" kcompactd woke {woke}"
+                f" refs short {short}, kcompactd woke {woke}"
             )
             assert asked > 0, (
                 "compaction never offered a chunk for relocation, so the path"
