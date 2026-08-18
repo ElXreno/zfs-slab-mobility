@@ -1,4 +1,4 @@
-From 3cbd36a17b8b3fbb07101fa2b12a2a4966f3dfd3 Mon Sep 17 00:00:00 2001
+From 62c9855f9736980654e4a7ed3d719f780a5e67be Mon Sep 17 00:00:00 2001
 From: ElXreno <elxreno@gmail.com>
 Date: Tue, 18 Aug 2026 18:59:40 +0300
 Subject: [PATCH] dbuf: count whether a dbuf could be relocated, without moving
@@ -22,11 +22,11 @@ The allocator offers allocated objects only, so anything seen here was live
 when it was picked; it can still be freed underneath, which is what the lock
 and the objset recheck are for.
 ---
- module/zfs/dbuf.c | 117 +++++++++++++++++++++++++++++++++++++++++++++-
- 1 file changed, 116 insertions(+), 1 deletion(-)
+ module/zfs/dbuf.c | 119 +++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 117 insertions(+), 2 deletions(-)
 
 diff --git a/module/zfs/dbuf.c b/module/zfs/dbuf.c
-index a4fe3e519..4a422cef9 100644
+index a4fe3e519..7c996dff8 100644
 --- a/module/zfs/dbuf.c
 +++ b/module/zfs/dbuf.c
 @@ -118,6 +118,21 @@ typedef struct dbuf_stats {
@@ -162,10 +162,12 @@ index a4fe3e519..4a422cef9 100644
  	return (0);
  }
  
-@@ -991,6 +1087,7 @@ dbuf_init(void)
+@@ -990,7 +1086,8 @@ dbuf_init(void)
+ 
  	dbuf_kmem_cache = kmem_cache_create("dmu_buf_impl_t",
  	    sizeof (dmu_buf_impl_t),
- 	    0, dbuf_cons, dbuf_dest, NULL, NULL, NULL, 0);
+-	    0, dbuf_cons, dbuf_dest, NULL, NULL, NULL, 0);
++	    0, dbuf_cons, dbuf_dest, NULL, NULL, NULL, KMC_MOBILE);
 +	kmem_cache_set_move(dbuf_kmem_cache, dbuf_move_probe);
  	dbuf_dirty_kmem_cache = kmem_cache_create("dbuf_dirty_record_t",
  	    sizeof (dbuf_dirty_record_t), 0, NULL, NULL, NULL, NULL, NULL, 0);
