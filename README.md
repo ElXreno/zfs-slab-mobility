@@ -188,6 +188,33 @@ Nothing here distributes a built kernel: CI publishes the comparison tables,
 the metrics and the snapshots, and keeps its build cache inside the GitHub
 Actions cache.
 
+## What it buys, in the allocator's own currency
+
+Blocks and pages are means. The end is whether the machine can still hand out
+contiguous memory while the ARC holds its chunks, so the `highorder` check asks
+exactly that: fill the ARC, request a third of the guest as huge pages, count
+what came back.
+
+```text
+huge pages handed out, of 1024 asked
+  separation   193, 200, 1024
+  mobility    1024, 1024, 1024
+```
+
+Two of the three separation runs could not find a third of the guest in one
+piece. Every mobility run could. The third separation run is worth as much as
+the other two: a guest can get lucky and find the memory unaided, which is why
+the check guards a ratio of one and a half rather than the five its medians
+would support.
+
+This also answers a question that was asked the wrong way for a long time. The
+relocation counters look small next to the number of chunks in the ARC, which
+reads like a mechanism that barely fires. It is not: compaction isolates at most
+`COMPACT_CLUSTER_MAX` pages per pass and one order 5 chunk fills that quota by
+itself, so the counter is bounded by chunk size rather than by how well
+relocation works. Counting what the allocator managed to hand out sidesteps the
+question.
+
 ## The vmalloc path
 
 The caches SPL grows through `__vmalloc` are a third route that neither patch

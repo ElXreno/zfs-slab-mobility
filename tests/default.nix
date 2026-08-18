@@ -157,9 +157,11 @@ let
     # other check counts blocks and pages, which are means; this one asks how
     # much contiguous memory the machine can still hand out with the ARC full.
     #
-    # No assertion yet: the threshold has to come from what three seeds
-    # actually produce, and putting a number here before measuring would be
-    # inventing one.
+    # Measured before asserted: mobility handed out all 1024 on every seed,
+    # separation 193, 200 and 1024. That spread is why the guard is loose
+    # rather than near the ratio of five the medians give. The third
+    # separation run shows a guest can find the memory unaided, so a tight
+    # bound would fail on luck rather than on a regression.
     highorder = mkCompare {
       name = "highorder";
       phase = "highorder";
@@ -178,7 +180,14 @@ let
           separation = runsFor demand "separation";
           mobility = runsFor demand "mobility";
         };
-      expect = [ ];
+      expect = [
+        {
+          metric = "hugepages";
+          from = "separation";
+          to = "mobility";
+          atLeast = 1.5;
+        }
+      ];
     };
 
     # Relocation of chunks larger than one page, which is what the machine this

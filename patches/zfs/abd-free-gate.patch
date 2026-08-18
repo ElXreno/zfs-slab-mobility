@@ -1,4 +1,4 @@
-From 67adb728c32b4da31591e197627d494608ea25ab Mon Sep 17 00:00:00 2001
+From 9fc25d21db252dc6cbe800a65c2034c803beb4a7 Mon Sep 17 00:00:00 2001
 From: ElXreno <elxreno@gmail.com>
 Date: Tue, 18 Aug 2026 08:40:53 +0300
 Subject: [PATCH] abd: do not free a chunk that compaction is holding
@@ -17,11 +17,11 @@ because a relocation that succeeds leaves a different page in the slot and
 that is the one to free. Holding the gate across the unmark also closes the
 window against a relocation that would otherwise start in the middle of it.
 ---
- module/os/linux/zfs/abd_os.c | 50 ++++++++++++++++++++++++++++++++++--
- 1 file changed, 48 insertions(+), 2 deletions(-)
+ module/os/linux/zfs/abd_os.c | 97 +++++++++++++++++++++++++++++++++++-
+ 1 file changed, 95 insertions(+), 2 deletions(-)
 
 diff --git a/module/os/linux/zfs/abd_os.c b/module/os/linux/zfs/abd_os.c
-index e7a453e14..1a27bc9c9 100644
+index e7a453e14..f16893ccd 100644
 --- a/module/os/linux/zfs/abd_os.c
 +++ b/module/os/linux/zfs/abd_os.c
 @@ -90,6 +90,7 @@ typedef struct abd_stats {
@@ -61,7 +61,7 @@ index e7a453e14..1a27bc9c9 100644
  		atomic_dec(&ABD_SCATTER(owner).abd_readers);
  		cpu_relax();
  	}
-@@ -528,6 +537,40 @@ abd_gate_drop_page(struct page *page)
+@@ -528,6 +537,87 @@ abd_gate_drop_page(struct page *page)
  #define	abd_unmark_zfs_page(page)
  #endif /* _LP64 */
  
@@ -85,12 +85,59 @@ index e7a453e14..1a27bc9c9 100644
 +abd_retire_page(struct scatterlist *sg)
 +{
 +#if defined(_LP64) && defined(HAVE_PGTY_MODMOVABLE)
-+	struct page *page;
-+	abd_t *owner = abd_gate_enter(sg, &page);
++	for (;;) {
++		struct page *page = sg_page(sg);
++		struct folio *folio = page_folio(page);
 +
-+	abd_unmark_movable_page(page);
-+	abd_gate_exit(owner);
-+	return (page);
++		/*
++		 * Never offered for relocation, so nothing can be looking at
++		 * it and there is nothing to take the lock against.
++		 */
++		if (abd_page_owner(page) == NULL) {
++			abd_unmark_movable_page(page);
++			return (page);
++		}
++
++		/*
++		 * The lock on the folio, because that is what the page
++		 * allocator holds across the two steps that matter: deciding a
++		 * chunk is ours to move and marking it isolated, and later the
++		 * relocation itself. Testing the isolation flag without it
++		 * leaves a window between those two steps, and the mark can be
++		 * dropped inside that window, leaving compaction working on a
++		 * chunk that has already been handed back.
++		 */
++		if (!folio_trylock(folio)) {
++			ABDSTAT_BUMP(abdstat_gate_waited);
++			cpu_relax();
++			continue;
++		}
++
++		/*
++		 * Under the lock the answer is stable. Isolated means the
++		 * chunk belongs to compaction until it is done, and a
++		 * relocation that finished in the meantime put a different
++		 * page in this slot, which is the one to retire instead.
++		 *
++		 * The count is the third condition and the one the flag misses:
++		 * a reference is taken before the isolation is decided and
++		 * before the lock is held, so a chunk can be spoken for while
++		 * still looking free to take. Two is what this code keeps on a
++		 * chunk it owns, one from the allocation and one from marking
++		 * it, so anything above two is somebody else holding on.
++		 */
++		if (PageMovableOpsIsolated(page) || sg_page(sg) != page ||
++		    page_ref_count(page) > 2) {
++			folio_unlock(folio);
++			ABDSTAT_BUMP(abdstat_gate_waited);
++			cpu_relax();
++			continue;
++		}
++
++		abd_unmark_movable_page(page);
++		folio_unlock(folio);
++		return (page);
++	}
 +#else
 +	struct page *page = sg_page(sg);
 +
@@ -102,7 +149,7 @@ index e7a453e14..1a27bc9c9 100644
  #ifndef CONFIG_HIGHMEM
  
  /*
-@@ -777,8 +820,7 @@ abd_free_chunks(abd_t *abd)
+@@ -777,8 +867,7 @@ abd_free_chunks(abd_t *abd)
  	 */
  	if (!abd_is_from_pages(abd)) {
  		abd_for_each_sg(abd, sg, nr_pages, i) {
@@ -112,7 +159,7 @@ index e7a453e14..1a27bc9c9 100644
  			order = compound_order(page);
  			__free_pages(page, order);
  			ASSERT3U(sg->length, <=, PAGE_SIZE << order);
-@@ -943,6 +985,8 @@ abd_kstats_update(kstat_t *ksp, int rw)
+@@ -943,6 +1032,8 @@ abd_kstats_update(kstat_t *ksp, int rw)
  	    wmsum_value(&abd_sums.abdstat_page_isolate_asked);
  	as->abdstat_page_isolate_no_owner.value.ui64 =
  	    wmsum_value(&abd_sums.abdstat_page_isolate_no_owner);
@@ -121,7 +168,7 @@ index e7a453e14..1a27bc9c9 100644
  	as->abdstat_page_migrated.value.ui64 =
  	    wmsum_value(&abd_sums.abdstat_page_migrated);
  	as->abdstat_page_migrate_busy.value.ui64 =
-@@ -974,6 +1018,7 @@ abd_init(void)
+@@ -974,6 +1065,7 @@ abd_init(void)
  	wmsum_init(&abd_sums.abdstat_scatter_sg_table_retry, 0);
  	wmsum_init(&abd_sums.abdstat_page_isolate_asked, 0);
  	wmsum_init(&abd_sums.abdstat_page_isolate_no_owner, 0);
@@ -129,7 +176,7 @@ index e7a453e14..1a27bc9c9 100644
  	wmsum_init(&abd_sums.abdstat_page_migrated, 0);
  	wmsum_init(&abd_sums.abdstat_page_migrate_busy, 0);
  	wmsum_init(&abd_sums.abdstat_page_migrate_lost, 0);
-@@ -1033,6 +1078,7 @@ abd_fini(void)
+@@ -1033,6 +1125,7 @@ abd_fini(void)
  	wmsum_fini(&abd_sums.abdstat_scatter_sg_table_retry);
  	wmsum_fini(&abd_sums.abdstat_page_isolate_asked);
  	wmsum_fini(&abd_sums.abdstat_page_isolate_no_owner);
