@@ -229,11 +229,24 @@ func readVmstat() map[string]uint64 {
 	return m
 }
 
+// Whether the chunks holding ARC data can be relocated at all. The counter
+// only exists on a build carrying the relocation patch, so its presence is the
+// signal; its value is not, because a machine that has never been short of
+// contiguous memory has never been asked to move anything.
+func abdRelocationBuilt() bool {
+	_, ok := readKstat("spl/kstat/zfs/abdstats")["page_isolate_asked"]
+	return ok
+}
+
 // ARC is the elephant in the room on these machines and htop counts it as
 // neither cache nor free, so it gets read separately.
 func readARC() map[string]uint64 {
+	return readKstat("spl/kstat/zfs/arcstats")
+}
+
+func readKstat(rel string) map[string]uint64 {
 	m := map[string]uint64{}
-	f, err := openProc("spl/kstat/zfs/arcstats")
+	f, err := openProc(rel)
 	if err != nil {
 		return m
 	}

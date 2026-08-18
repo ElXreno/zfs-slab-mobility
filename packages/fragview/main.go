@@ -543,6 +543,7 @@ func main() {
 	}
 
 	nameClassesForHost(len(readARC()) > 0)
+	abdMovable = abdRelocationBuilt()
 
 	if *flags {
 		dumpFlags(bm, ppb, 40)

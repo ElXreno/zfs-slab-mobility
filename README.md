@@ -66,27 +66,33 @@ reclaimable pool and the scatter ABD asking for movable pages, ZFS has nothing
 left in Reclaimable at all, and the fourteen blocks remaining are the rest of
 the system.
 
-Whether that turns into less pinned memory was measured twice and answered
-differently each time, so both are worth stating. The first round said no: the
-seeds gave one range, not two. That round ran against a build in which freeing
-a chunk raced with relocating it, which the `abd-migrate` check now catches, so
-it was not measuring what it appeared to be. With the race fixed:
+Whether that turns into less pinned memory took three rounds to read, and the
+first two were reading it wrong. The first ran against a build in which freeing
+a chunk raced with relocating it, which the `abd-migrate` check now catches. The
+second was measured with a tool that still counted an ARC chunk as something the
+allocator cannot move, which is exactly what these patches stop being true, so
+it was scoring the patched build with the unpatched rulebook. `fragview` now
+decides that per snapshot, from whether the machine carried the relocation
+counters at all:
 
 ```text
-pinned, MiB       separation  292, 363, 399    mobility  159, 258, 322
-hostage blocks    separation  154, 192, 212    mobility   85, 137, 170
+pinned, MiB          separation  241, 257, 397    mobility  155, 181, 211
+hostage blocks       separation  127, 135, 210    mobility   82,  97, 111
+ARC pages in them    separation 1922,1974,4065    mobility    0,   0,  69
+slab pages in them   separation  693, 734, 896    mobility  822,1371,1599
 ```
 
-Eight of the nine pairings favour mobility on each, and the direction is the
-opposite of the first round. Three seeds do not settle it: the highest mobility
-run still lands above the lowest separation run on both, so this reads as a
-consistent trend rather than a measured improvement, and the check asserts only
-that nothing gets worse.
+Read this knowing the two columns no longer share a definition, and that this is
+the point rather than a flaw: on the separation build an ARC page really does
+pin its block, on the mobility build it does not, and the third row is that
+difference and nothing else. The check still asserts only that nothing gets
+worse, because three seeds cannot carry more than that.
 
-The mechanism behind the earlier doubt is still there and still visible: moving
-the ABD out of a block takes its occupancy below an eighth, so a block that held
-slab beside data becomes a hostage holding slab alone. Pages of slab inside
-hostage blocks go up by half again even as the count of those blocks falls.
+The mechanism behind the earlier doubt is still there and still visible in the
+last row: moving the ABD out of a block takes its occupancy below an eighth, so
+a block that held slab beside data becomes a hostage holding slab alone. Slab
+inside hostage blocks goes up by half again even as the count of those blocks
+falls by a third.
 
 Compaction without mobility makes things worse: it consolidates the movable
 pages and leaves blocks that still hold one immovable page more exposed, so the

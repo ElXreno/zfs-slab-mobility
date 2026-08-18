@@ -87,10 +87,10 @@ let
           to = "mobility";
           atLeast = 1.5;
         }
-        # A guard, not a claim. The seeds now favour mobility, 159/258/322 MiB
-        # against 292/363/399, but the ranges still touch and three runs cannot
-        # carry the claim alone. Kept loose so it catches mobility breaking
-        # something outright rather than tracking the trend.
+        # A guard, not a claim. The seeds favour mobility, 155/181/211 MiB
+        # against 241/257/397, but part of that gap is the two builds no longer
+        # agreeing on what counts as immovable, which is what the patch changes.
+        # Kept loose so it catches mobility breaking something outright.
         {
           metric = "pinned";
           from = "separation";

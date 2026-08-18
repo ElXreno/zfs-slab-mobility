@@ -45,7 +45,11 @@ type snapshot struct {
 	Mem    map[string]uint64  `json:"meminfo"`
 	Vm     map[string]uint64  `json:"vmstat"`
 	Arc    map[string]uint64  `json:"arcstats,omitempty"`
-	Unseen map[string]uint64  `json:"unclassified,omitempty"`
+	// Whether the machine could relocate ARC chunks, not whether it did.
+	// Without this a snapshot taken on a patched kernel reads back as if the
+	// chunks were pinned, and every hostage count above is then too high.
+	AbdMovable bool              `json:"abd_movable,omitempty"`
+	Unseen     map[string]uint64 `json:"unclassified,omitempty"`
 	// Additive, so a reader without it still loads an older snapshot and a
 	// reader with it degrades to unannotated names.
 	Aliases map[string][]string `json:"cache_aliases,omitempty"`
@@ -119,6 +123,7 @@ func (f *frame) toSnapshot(label string) *snapshot {
 		Mem:           f.mem,
 		Vm:            f.vm,
 		Arc:           f.arc,
+		AbdMovable:    abdMovable,
 		WhoTot: snapWhoTot{f.whoTot.blocks, f.whoTot.hostageBlocks,
 			f.whoTot.hostageFreePages, f.whoTot.walkUS},
 		Aliases: cacheAliases,
@@ -238,8 +243,9 @@ func readSnapshot(path string) (*frame, error) {
 	}
 	cacheAliases = s.Aliases
 
-	// The class names depend on whether the machine that took the snapshot ran
-	// ZFS, and that is a property of the snapshot rather than of this machine.
+	// Both of these are properties of the machine the snapshot came from
+	// rather than of this one, so they travel with it.
 	nameClassesForHost(len(s.Arc) > 0)
+	abdMovable = s.AbdMovable
 	return f, nil
 }

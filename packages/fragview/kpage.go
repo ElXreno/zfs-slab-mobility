@@ -97,12 +97,21 @@ func nameClassesForHost(haveZFS bool) {
 	}
 }
 
+// Set when the machine the numbers came from carries the patch that lets the
+// allocator relocate ARC chunks. Package level for the same reason the names
+// above are: a class knows nothing about the machine it was read from, and
+// judging movability by a flag is not possible here because the page type the
+// patch uses is not among the ones kpageflags exports.
+var abdMovable bool
+
 // True for classes the page allocator cannot migrate out of a pageblock. This
 // is the whole reason the tool exists: one such page in an otherwise empty
 // block is enough to deny an order-9 allocation.
 func (c class) immovable() bool {
 	switch c {
-	case clABD, clSlab, clPgtab, clCompound, clUncached, clKernel, clReserved, clUnknown:
+	case clABD:
+		return !abdMovable
+	case clSlab, clPgtab, clCompound, clUncached, clKernel, clReserved, clUnknown:
 		return true
 	}
 	return false
