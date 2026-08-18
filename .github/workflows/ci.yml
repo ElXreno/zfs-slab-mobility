@@ -103,7 +103,13 @@ jobs:
         run: |
           [ -s "$RUNNER_TEMP/paths" ] || exit 0
           while read -r p; do
-            [ -f "$p/summary.md" ] && cat "$p/summary.md" >> "$GITHUB_STEP_SUMMARY"
+            # Not every check writes one: a comparison does, a bare run does
+            # not. Under `bash -e` a bare test as the last command in the loop
+            # body fails the whole step, which is how a passing run was
+            # reported as a failure.
+            if [ -f "$p/summary.md" ]; then
+              cat "$p/summary.md" >> "$GITHUB_STEP_SUMMARY"
+            fi
           done < "$RUNNER_TEMP/paths"
 
       - name: Collect artifacts
