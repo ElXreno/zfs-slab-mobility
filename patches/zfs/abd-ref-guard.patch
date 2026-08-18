@@ -1,0 +1,129 @@
+From 72490585a95330c113ac4fdf899ae58482ab0a4f Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Tue, 18 Aug 2026 21:21:07 +0300
+Subject: [PATCH] abd: decline a put that would free a chunk the caller still
+ holds
+
+---
+ module/os/linux/zfs/abd_os.c | 49 +++++++++++++++++++++++++++++++++++-
+ 1 file changed, 48 insertions(+), 1 deletion(-)
+
+diff --git a/module/os/linux/zfs/abd_os.c b/module/os/linux/zfs/abd_os.c
+index 0d6c92ae6..e62c417bf 100644
+--- a/module/os/linux/zfs/abd_os.c
++++ b/module/os/linux/zfs/abd_os.c
+@@ -96,6 +96,7 @@ typedef struct abd_stats {
+ 	kstat_named_t abdstat_page_migrated;
+ 	kstat_named_t abdstat_page_migrate_busy;
+ 	kstat_named_t abdstat_page_migrate_lost;
++	kstat_named_t abdstat_migrate_ref_short;
+ } abd_stats_t;
+ 
+ static abd_stats_t abd_stats = {
+@@ -158,6 +159,7 @@ static abd_stats_t abd_stats = {
+ 	{ "page_migrated",			KSTAT_DATA_UINT64 },
+ 	{ "page_migrate_busy",			KSTAT_DATA_UINT64 },
+ 	{ "page_migrate_lost",			KSTAT_DATA_UINT64 },
++	{ "migrate_ref_short",			KSTAT_DATA_UINT64 },
+ };
+ 
+ static struct {
+@@ -179,6 +181,7 @@ static struct {
+ 	wmsum_t abdstat_page_migrated;
+ 	wmsum_t abdstat_page_migrate_busy;
+ 	wmsum_t abdstat_page_migrate_lost;
++	wmsum_t abdstat_migrate_ref_short;
+ } abd_sums;
+ 
+ #define	abd_for_each_sg(abd, sg, n, i)	\
+@@ -468,6 +471,21 @@ abd_page_migrate(struct page *dst, struct page *src, enum migrate_mode mode)
+ 
+ 	order = compound_order(src);
+ 	npages = 1U << order;
++
++	/*
++	 * Three is what this chunk must be holding here: one from the
++	 * allocation, one from the mark, and one the isolation took. Anything
++	 * else means the count this code keeps has already been miscounted
++	 * somewhere earlier, and the two puts below would take the page away
++	 * from under the caller that still holds it locked.
++	 */
++	if (page_ref_count(src) != 3) {
++		printk(KERN_ERR "abdrefs: migrate src ref %d order %u "
++		    "isolated %d modmovable %d private %px\n",
++		    page_ref_count(src), order,
++		    !!PageMovableOpsIsolated(src), !!PageModMovable(src),
++		    (void *)page_private(src));
++	}
+ 	/*
+ 	 * Subpages of a compound page are contiguous in the memory map, so
+ 	 * the whole chunk is reachable by index from its head.
+@@ -499,7 +517,26 @@ abd_page_migrate(struct page *dst, struct page *src, enum migrate_mode mode)
+ 	sg_set_page(found, dst, found->length, found->offset);
+ 
+ 	abd_unmark_movable_page(src);
+-	put_page(src);
++
++	/*
++	 * Two references should be left on the chunk at this point: the one it
++	 * was allocated with, which the put below hands back, and the one the
++	 * isolation took, which the caller drops once this returns. A chunk
++	 * that arrives holding fewer than that lost one somewhere earlier, and
++	 * putting it again would free the page while the caller still holds it
++	 * locked, which corrupts the allocator rather than this module.
++	 *
++	 * Declining the put is not a leak: the caller's own is the last one
++	 * either way, so the page is still freed, just by the side that is
++	 * allowed to free it.
++	 */
++	if (unlikely(page_ref_count(src) < 2)) {
++		ABDSTAT_BUMP(abdstat_migrate_ref_short);
++		printk(KERN_ERR "abdrefs: declined to put src, ref %d "
++		    "order %u\n", page_ref_count(src), order);
++	} else {
++		put_page(src);
++	}
+ 
+ 	ABDSTAT_BUMP(abdstat_page_migrated);
+ 
+@@ -627,6 +664,12 @@ abd_retire_page(struct scatterlist *sg)
+ 			continue;
+ 		}
+ 
++		if (page_ref_count(page) != 2) {
++			printk(KERN_ERR "abdrefs: retire ref %d order %u "
++			    "modmovable %d\n", page_ref_count(page),
++			    compound_order(page), !!PageModMovable(page));
++		}
++
+ 		abd_unmark_movable_page(page);
+ 		folio_unlock(folio);
+ 		return (page);
+@@ -1063,6 +1106,8 @@ abd_kstats_update(kstat_t *ksp, int rw)
+ 	    wmsum_value(&abd_sums.abdstat_page_migrate_busy);
+ 	as->abdstat_page_migrate_lost.value.ui64 =
+ 	    wmsum_value(&abd_sums.abdstat_page_migrate_lost);
++	as->abdstat_migrate_ref_short.value.ui64 =
++	    wmsum_value(&abd_sums.abdstat_migrate_ref_short);
+ 	return (0);
+ }
+ 
+@@ -1093,6 +1138,7 @@ abd_init(void)
+ 	wmsum_init(&abd_sums.abdstat_page_migrated, 0);
+ 	wmsum_init(&abd_sums.abdstat_page_migrate_busy, 0);
+ 	wmsum_init(&abd_sums.abdstat_page_migrate_lost, 0);
++	wmsum_init(&abd_sums.abdstat_migrate_ref_short, 0);
+ 
+ 	abd_ksp = kstat_create("zfs", 0, "abdstats", "misc", KSTAT_TYPE_NAMED,
+ 	    sizeof (abd_stats) / sizeof (kstat_named_t), KSTAT_FLAG_VIRTUAL);
+@@ -1154,6 +1200,7 @@ abd_fini(void)
+ 	wmsum_fini(&abd_sums.abdstat_page_migrated);
+ 	wmsum_fini(&abd_sums.abdstat_page_migrate_busy);
+ 	wmsum_fini(&abd_sums.abdstat_page_migrate_lost);
++	wmsum_fini(&abd_sums.abdstat_migrate_ref_short);
+ 
+ 	if (abd_cache) {
+ 		kmem_cache_destroy(abd_cache);
+-- 
+2.55.0
+
