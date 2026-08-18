@@ -1,17 +1,49 @@
+# Garbage collection for the build cache.
+#
+# Must run on the default branch: a pull request's cache scope is read only
+# towards the default branch and dies with the pull request, while the default
+# branch's own scope grows until something prunes it.
+#
+# Adapted from hestia's own gc.yml, which the project offers as the reference
+# for other repositories.
 name: cache-gc
+
+# A second collection racing the first would read packs the first is deleting,
+# so a manual run queues behind the nightly one rather than joining it.
+concurrency:
+  group: hestia-gc
+  cancel-in-progress: false
 
 on:
   schedule:
     - cron: "0 3 * * *"
   workflow_dispatch:
+    inputs:
+      dry-run:
+        description: Plan only; delete nothing.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
 
 jobs:
   gc:
     runs-on: ubuntu-24.04
     permissions:
-      contents: read
+      # Deleting cache entries goes through the REST API.
       actions: write
+      contents: read
     steps:
       - uses: actions/checkout@v6
       - uses: cachix/install-nix-action@v31.11.1
-      - uses: Mic92/hestia/gc@v3
+
+      # Collection needs the cache API tokens, and those are visible only to a
+      # JavaScript action, which is why the binary is reached through the
+      # action rather than run on its own.
+      - uses: Mic92/hestia@v3
+
+      - name: Run garbage collection
+        run: '"$HESTIA_BIN" gc ${{ inputs.dry-run && ''--dry-run'' || '''' }}'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
