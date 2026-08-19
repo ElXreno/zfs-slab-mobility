@@ -9,33 +9,14 @@
 let
   ccache = import ./ccache.nix { inherit pkgs; };
 
+  # The series itself lives next door, because a machine that runs what this
+  # measures has to apply the same files in the same order.
+  patches = import ./patches.nix;
+
   kernelPatch = name: {
     inherit name;
-    patch = ../patches/kernel/${name}.patch;
+    patch = patches.kernel.${name};
   };
-
-  zfsPatch = name: ../patches/zfs/${name}.patch;
-
-  # Order matters. no-reclaim-account and mobile-cache-flag touch the same lines
-  # of spl_kmem_cache_create, and the second only applies after the first.
-  mobilityZfsPatches = [
-    "dnode-handles-on-linux"
-    "dnode-invalidate-on-construct"
-    "dnode-move-mutex-window"
-    "slab-mobility"
-    "arc-hdr-mobility"
-    "arc-move-counters"
-    "no-reclaim-account"
-    "mobile-cache-flag"
-    "mobile-cache-flag-userspace"
-    "abd-page-mobility"
-    "abd-reader-gate"
-    "abd-relocate"
-    "abd-movable-migratetype"
-    "abd-free-gate"
-    "dbuf-move-probe"
-    "abd-ref-guard"
-  ];
 
   mkVariant =
     {
@@ -71,11 +52,11 @@ let
       zfsExtra =
         (
           if slabMobilityZfs then
-            map zfsPatch mobilityZfsPatches
+            patches.zfs.withProbes
           else
-            lib.optional noReclaimAccount (zfsPatch "no-reclaim-account")
+            lib.optional noReclaimAccount patches.zfs.each.no-reclaim-account
         )
-        ++ lib.optional noKswapdWake (zfsPatch "no-kswapd-wake");
+        ++ lib.optional noKswapdWake patches.zfs.each.no-kswapd-wake;
 
       packages = pkgs.linuxPackagesFor kernel;
     in
