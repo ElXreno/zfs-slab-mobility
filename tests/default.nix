@@ -144,13 +144,16 @@ let
           from = "separation";
           to = "nokswapd";
           atMost = 0.5;
-          # A runner that never ran short scanned a single page, and one
-          # against eighty-three is a ratio of noise rather than a finding.
-          # Locally the baseline is in the hundreds.
-          floor = 50;
-          # A shared runner has memory to spare, so kswapd never wakes there
-          # and this can only ever read as no signal. Skipping says that
-          # plainly; failing would report the host as a regression.
+          # Calibrated from both ends. On a shared runner the baseline came
+          # out 1, 1 and 93 across three runs and the direction flipped: once
+          # the patched variant scanned 83 pages against 1, once 0 against 93.
+          # On a machine where the phenomenon is real it came out 493 against
+          # 43, with the arc 8.5% larger for it. The floor sits between the
+          # two bands, well above the noise and well below the finding.
+          floor = 250;
+          # A runner with memory to spare never puts kswapd to work, so this
+          # can only ever read as no signal there. Skipping says that plainly;
+          # failing would report the host as a regression.
           skipNoSignal = true;
         }
         # The consequence rather than the indicator: what kswapd reclaims when
@@ -163,7 +166,10 @@ let
           to = "nokswapd";
           atLeast = 1.05;
           gate = "kswapd_scan";
-          floor = 50;
+          # The same band, for the same reason: while the cause was at runner
+          # size the arc held within a percent and a half either way, which is
+          # the noise this asks to see through.
+          floor = 250;
           skipNoSignal = true;
         }
       ];
