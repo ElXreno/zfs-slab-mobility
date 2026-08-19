@@ -24,6 +24,7 @@ let
       modulePageMobility ? false,
       noReclaimAccount ? false,
       slabMobilityZfs ? false,
+      withProbes ? false,
       noKswapdWake ? false,
       memProfiling ? false,
     }:
@@ -52,7 +53,7 @@ let
       zfsExtra =
         (
           if slabMobilityZfs then
-            patches.zfs.withProbes
+            (if withProbes then patches.zfs.withProbes else patches.zfs.relocation)
           else
             lib.optional noReclaimAccount patches.zfs.each.no-reclaim-account
         )
@@ -104,10 +105,23 @@ in
   profiling = mkVariant { memProfiling = true; };
 
   # The above plus object relocation in SLUB and movable pages for the scatter
-  # ABD, so that what is left in a block can be moved out of the way.
+  # ABD, so that what is left in a block can be moved out of the way. Carries
+  # what a machine would run and nothing else, because everything it is
+  # compared against runs a stock allocator: a probe that changes how a cache
+  # is built would be a difference of its own, counted as if it were this one.
   mobility = mkVariant {
     slabMobility = true;
     modulePageMobility = true;
     slabMobilityZfs = true;
+  };
+
+  # The same, plus the probes. Kept apart because dbuf-move-probe creates its
+  # cache mobile, and that flag costs the cache its per CPU sheaves and its
+  # merging, which moves the slab footprint the comparisons above measure.
+  probes = mkVariant {
+    slabMobility = true;
+    modulePageMobility = true;
+    slabMobilityZfs = true;
+    withProbes = true;
   };
 }

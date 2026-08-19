@@ -229,7 +229,10 @@ let
     # Only the mobility build. Separation marks no page movable, so compaction
     # would find nothing of ours and could not fail here however long it ran.
     abd-migrate = mkRun {
-      variant = "mobility";
+      # The probe build: this check asks what relocation did, not how big the
+      # slab ended up, so the probe's cost to the dbuf cache does not distort
+      # what it reads.
+      variant = "probes";
       seed = 1;
       compactWhileWarm = true;
     };
