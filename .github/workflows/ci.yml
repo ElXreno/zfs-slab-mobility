@@ -62,10 +62,16 @@ jobs:
             extra-substituters = https://elxreno.cachix.org
             extra-trusted-public-keys = elxreno.cachix.org-1:ozSPSY5S3/TpbcXi+/DdtSj1JlK3CPz3G+F92yRBXDQ=
 
+      # The cache directory has to belong to the runner, not to root. The
+      # restore below unpacks it with tar as the runner, and tar sets the
+      # modification time and the mode of the directory it unpacks into, both
+      # of which only the owner may do. World-write is not enough for that: a
+      # root-owned directory makes tar exit with an error, the whole restore is
+      # dropped, and the build then compiles a cold cache from scratch.
       - name: Prepare build and cache directories
         run: |
           sudo mkdir -p /nix/_build
-          sudo install -d -m 0777 /nix/ccache
+          sudo install -d -m 0777 -o "$(id -u)" -g "$(id -g)" /nix/ccache
           echo "TMPDIR=" >> "$GITHUB_ENV"
 
       # Per check on purpose: merging would mix objects built with different
