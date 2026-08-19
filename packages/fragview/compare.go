@@ -323,6 +323,7 @@ type expectation struct {
 	bound            float64
 	gate             string
 	floor            float64
+	ceiling          float64
 	skipNoSignal     bool
 }
 
@@ -357,15 +358,23 @@ func parseExpectation(spec string) (expectation, error) {
 
 	if bound, gateStr, hasGate := strings.Cut(boundStr, "@"); hasGate {
 		boundStr = bound
-		name, floorStr, ok := strings.Cut(gateStr, ":")
+		name, bounds, ok := strings.Cut(gateStr, ":")
 		if !ok {
 			return e, fmt.Errorf("no metric:floor after @ in %q", spec)
 		}
+		floorStr, ceilingStr, hasCeiling := strings.Cut(bounds, ":")
 		f, err := strconv.ParseFloat(floorStr, 64)
 		if err != nil {
 			return e, fmt.Errorf("bad floor in %q: %w", spec, err)
 		}
 		e.gate, e.floor = name, f
+		if hasCeiling {
+			c, err := strconv.ParseFloat(ceilingStr, 64)
+			if err != nil {
+				return e, fmt.Errorf("bad ceiling in %q: %w", spec, err)
+			}
+			e.ceiling = c
+		}
 	}
 
 	b, err := strconv.ParseFloat(boundStr, 64)
@@ -420,13 +429,20 @@ func judge(gs []*group, specs []expectation) []verdict {
 			if e.gate != "" {
 				gauge = from.median[e.gate]
 			}
-			if v.a == 0 || (e.floor > 0 && gauge < e.floor) {
+			if v.a == 0 || (e.floor > 0 && gauge < e.floor) ||
+				(e.ceiling > 0 && gauge >= e.ceiling) {
 				// Nothing worth comparing against. A zero baseline makes any
 				// upper bound pass having measured nothing; a baseline of one
 				// or two is no better, and divides noise by noise to produce a
 				// ratio that looks like a finding. The floor says how much the
 				// phenomenon has to show up before the comparison means
 				// anything.
+				//
+				// The ceiling is the same idea from the other end, for a metric
+				// that is capped by what the run asked for: a baseline that
+				// already got everything leaves the patch nothing to improve,
+				// and the ratio of one that follows says only that the host was
+				// never short, not that the patch failed.
 				v.nosignal = true
 				break
 			}

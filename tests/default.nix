@@ -187,35 +187,43 @@ let
     # full ARC then loses to separation with a collapsed one. So the demand
     # stays at a third and the noise is answered with seeds instead: five
     # rather than three, so a single lucky run moves the median less.
-    highorder = mkCompare {
-      name = "highorder";
-      phase = "highorder";
-      order = [
-        "separation"
-        "mobility"
-      ];
-      runs =
-        let
-          # A third of the guest. More turns the request into an eviction and
-          # measures the ARC's collapse instead of the chunks' mobility.
-          demand = {
-            hugeDemand = 1024;
+    highorder =
+      let
+        # A third of the guest. More turns the request into an eviction and
+        # measures the ARC's collapse instead of the chunks' mobility.
+        hugeDemand = 1024;
+      in
+      mkCompare {
+        name = "highorder";
+        phase = "highorder";
+        order = [
+          "separation"
+          "mobility"
+        ];
+        runs =
+          let
+            fiveSeeds = runsForSeeds [ 1 2 3 4 5 ] { inherit hugeDemand; };
+          in
+          {
+            separation = fiveSeeds "separation";
+            mobility = fiveSeeds "mobility";
           };
-          fiveSeeds = runsForSeeds [ 1 2 3 4 5 ] demand;
-        in
-        {
-          separation = fiveSeeds "separation";
-          mobility = fiveSeeds "mobility";
-        };
-      expect = [
-        {
-          metric = "hugepages";
-          from = "separation";
-          to = "mobility";
-          atLeast = 1.5;
-        }
-      ];
-    };
+        expect = [
+          {
+            metric = "hugepages";
+            from = "separation";
+            to = "mobility";
+            atLeast = 1.5;
+            # What the run asked for is also what it can hand out at most. A
+            # baseline that already got every page it wanted was never short of
+            # contiguous memory, so there is nothing here for relocation to
+            # improve, and the ratio of one that follows would read as a
+            # regression rather than as a host that never fragmented.
+            ceiling = hugeDemand;
+            skipNoSignal = true;
+          }
+        ];
+      };
 
     # Relocation of chunks larger than one page, which is what the machine this
     # was written on allocates almost exclusively. Not a comparison: the thing
