@@ -258,12 +258,17 @@ pkgs.testers.runNixOSTest {
             # one landed seven minutes before the failure. A snapshot ends a
             # transaction group, which is the boundary cloning cares about.
             if ${if snapshotWhileCloning then "True" else "False"}:
+                # Absolute paths throughout: a systemd-run unit gets none of
+                # the login shell's PATH, and a missing sleep turns a paced
+                # loop into a spin that starves the load it was meant to
+                # accompany.
                 machine.succeed(
                     "systemd-run --unit=snap-load --property=Type=simple"
                     " /bin/sh -c 'i=0; while true; do"
                     " zfs snapshot tank/data@s$i 2>/dev/null;"
                     " zfs destroy tank/data@s$((i-8)) 2>/dev/null;"
-                    " i=$((i+1)); sleep 2; done'"
+                    " i=$((i+1));"
+                    " /run/current-system/sw/bin/sleep 2; done'"
                 )
 
             # Same three levers that made the last relocation bug show itself:
