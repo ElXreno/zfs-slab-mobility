@@ -1,0 +1,81 @@
+From 97c8f8c9139c4661729c3eb5ddb5ca435e4bd8a1 Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Mon, 24 Aug 2026 00:39:27 +0300
+Subject: [PATCH] diag: name the block when a silent EIO leaves the dbuf layer
+
+---
+ module/zfs/dbuf.c | 26 ++++++++++++++++++++++++++
+ module/zfs/dmu.c  | 13 +++++++++++++
+ 2 files changed, 39 insertions(+)
+
+diff --git a/module/zfs/dbuf.c b/module/zfs/dbuf.c
+index 7c996dff8..0e7837cce 100644
+--- a/module/zfs/dbuf.c
++++ b/module/zfs/dbuf.c
+@@ -1917,6 +1917,19 @@ dbuf_read(dmu_buf_impl_t *db, zio_t *pio, dmu_flags_t flags)
+ 			cv_wait(&db->db_changed, &db->db_mtx);
+ 		} while (db->db_state == DB_READ || db->db_state == DB_FILL);
+ 		if (db->db_state == DB_UNCACHED) {
++			/*
++			 * Somebody else's fill failed and left the buffer
++			 * here. This thread issued no read of its own, so
++			 * this EIO reaches userspace without a single line
++			 * anywhere else: no ereport, because no zio of ours
++			 * ran, and no error log, because nothing decided the
++			 * data was bad. Say it here or it goes unsaid.
++			 */
++			zfs_dbgmsg("woke to DB_UNCACHED: objset=%llu "
++			    "object=%llu level=%d blkid=%llu",
++			    (u_longlong_t)dmu_objset_id(db->db_objset),
++			    (u_longlong_t)db->db.db_object, db->db_level,
++			    (u_longlong_t)db->db_blkid);
+ 			err = SET_ERROR(EIO);
+ 			mutex_exit(&db->db_mtx);
+ 			DB_DNODE_EXIT(db);
+@@ -3590,6 +3603,19 @@ dbuf_findbp(dnode_t *dn, int level, uint64_t blkid, int fail_sparse,
+ 		err = dbuf_read(*parentp, NULL, DB_RF_CANFAIL |
+ 		    DB_RF_HAVESTRUCT | DMU_READ_NO_PREFETCH);
+ 		if (err) {
++			/*
++			 * The one place the real error is still known. Every
++			 * caller above turns this into a bare EIO, so without
++			 * this line a failure here is indistinguishable from
++			 * a media error, and nothing else records it: the
++			 * read that actually failed belonged to whoever was
++			 * filling the buffer, not to us.
++			 */
++			zfs_dbgmsg("indirect read failed: objset=%llu "
++			    "object=%llu level=%d blkid=%llu err=%d",
++			    (u_longlong_t)dmu_objset_id(dn->dn_objset),
++			    (u_longlong_t)dn->dn_object, level,
++			    (u_longlong_t)blkid, err);
+ 			dbuf_rele(*parentp, NULL);
+ 			*parentp = NULL;
+ 			return (err);
+diff --git a/module/zfs/dmu.c b/module/zfs/dmu.c
+index ad654b163..13dd1915d 100644
+--- a/module/zfs/dmu.c
++++ b/module/zfs/dmu.c
+@@ -550,6 +550,19 @@ dmu_buf_hold_array_by_dnode(dnode_t *dn, uint64_t offset, uint64_t length,
+ 	for (i = 0; i < nblks; i++) {
+ 		dmu_buf_impl_t *db = dbuf_hold(dn, blkid + i, tag);
+ 		if (db == NULL) {
++			/*
++			 * dbuf_hold reports every failure the same way, by
++			 * handing back nothing, and the EIO below is this
++			 * function's guess at what that meant. Block cloning
++			 * arrives here through dmu_read_l0_bps, so a clone
++			 * that dies with EIO says nothing about what went
++			 * wrong. Name the block at least.
++			 */
++			zfs_dbgmsg("dbuf_hold gave nothing, returning EIO: "
++			    "objset=%llu object=%llu blkid=%llu",
++			    (u_longlong_t)dmu_objset_id(dn->dn_objset),
++			    (u_longlong_t)dn->dn_object,
++			    (u_longlong_t)(blkid + i));
+ 			if (zs) {
+ 				dmu_zfetch_run(&dn->dn_zfetch, zs, missed,
+ 				    B_TRUE, (flags & DMU_UNCACHEDIO));
+-- 
+2.55.0
+

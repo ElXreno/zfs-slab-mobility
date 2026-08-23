@@ -24,6 +24,7 @@ let
     "abd-movable-migratetype"
     "abd-free-gate"
     "abd-ref-guard"
+    "eio-diag"
   ];
 
   # What only answers a question. dbuf-move-probe creates the dbuf cache
