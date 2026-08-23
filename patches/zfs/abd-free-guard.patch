@@ -1,0 +1,95 @@
+From 1d960f59beb28fd1d0385d9dbf19a03618d9e378 Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Mon, 24 Aug 2026 02:09:22 +0300
+Subject: [PATCH] abd: refuse to free a chunk that is not holding the one
+ reference left to it
+
+---
+ module/os/linux/zfs/abd_os.c | 29 ++++++++++++++++++++++++++++-
+ 1 file changed, 28 insertions(+), 1 deletion(-)
+
+diff --git a/module/os/linux/zfs/abd_os.c b/module/os/linux/zfs/abd_os.c
+index a90b2e9a3..979ff8801 100644
+--- a/module/os/linux/zfs/abd_os.c
++++ b/module/os/linux/zfs/abd_os.c
+@@ -97,6 +97,7 @@ typedef struct abd_stats {
+ 	kstat_named_t abdstat_page_migrate_busy;
+ 	kstat_named_t abdstat_page_migrate_lost;
+ 	kstat_named_t abdstat_migrate_ref_short;
++	kstat_named_t abdstat_free_ref_short;
+ } abd_stats_t;
+ 
+ static abd_stats_t abd_stats = {
+@@ -160,6 +161,7 @@ static abd_stats_t abd_stats = {
+ 	{ "page_migrate_busy",			KSTAT_DATA_UINT64 },
+ 	{ "page_migrate_lost",			KSTAT_DATA_UINT64 },
+ 	{ "migrate_ref_short",			KSTAT_DATA_UINT64 },
++	{ "free_ref_short",			KSTAT_DATA_UINT64 },
+ };
+ 
+ static struct {
+@@ -182,6 +184,7 @@ static struct {
+ 	wmsum_t abdstat_page_migrate_busy;
+ 	wmsum_t abdstat_page_migrate_lost;
+ 	wmsum_t abdstat_migrate_ref_short;
++	wmsum_t abdstat_free_ref_short;
+ } abd_sums;
+ 
+ #define	abd_for_each_sg(abd, sg, n, i)	\
+@@ -959,7 +962,27 @@ abd_free_chunks(abd_t *abd)
+ 		abd_for_each_sg(abd, sg, nr_pages, i) {
+ 			page = abd_retire_page(sg);
+ 			order = compound_order(page);
+-			__free_pages(page, order);
++			/*
++			 * Retiring dropped the reference the mark held, so one
++			 * is left: the allocation's, which the free below
++			 * takes. A chunk that arrives here holding anything
++			 * else is either still spoken for or has already been
++			 * handed back, and freeing it a second time corrupts
++			 * the allocator rather than this module.
++			 *
++			 * Leaking a chunk is a bounded loss. Freeing a page
++			 * twice is not, and it surfaces far from here: the
++			 * next owner of that page gets it while somebody else
++			 * still believes it is theirs.
++			 */
++			if (unlikely(page_ref_count(page) != 1)) {
++				ABDSTAT_BUMP(abdstat_free_ref_short);
++				printk(KERN_ERR "abdrefs: declined to free, "
++				    "ref %d order %d\n",
++				    page_ref_count(page), order);
++			} else {
++				__free_pages(page, order);
++			}
+ 			ASSERT3U(sg->length, <=, PAGE_SIZE << order);
+ 			ABDSTAT_BUMPDOWN(abdstat_scatter_orders[order]);
+ 		}
+@@ -1134,6 +1157,8 @@ abd_kstats_update(kstat_t *ksp, int rw)
+ 	    wmsum_value(&abd_sums.abdstat_page_migrate_lost);
+ 	as->abdstat_migrate_ref_short.value.ui64 =
+ 	    wmsum_value(&abd_sums.abdstat_migrate_ref_short);
++	as->abdstat_free_ref_short.value.ui64 =
++	    wmsum_value(&abd_sums.abdstat_free_ref_short);
+ 	return (0);
+ }
+ 
+@@ -1165,6 +1190,7 @@ abd_init(void)
+ 	wmsum_init(&abd_sums.abdstat_page_migrate_busy, 0);
+ 	wmsum_init(&abd_sums.abdstat_page_migrate_lost, 0);
+ 	wmsum_init(&abd_sums.abdstat_migrate_ref_short, 0);
++	wmsum_init(&abd_sums.abdstat_free_ref_short, 0);
+ 
+ 	abd_ksp = kstat_create("zfs", 0, "abdstats", "misc", KSTAT_TYPE_NAMED,
+ 	    sizeof (abd_stats) / sizeof (kstat_named_t), KSTAT_FLAG_VIRTUAL);
+@@ -1227,6 +1253,7 @@ abd_fini(void)
+ 	wmsum_fini(&abd_sums.abdstat_page_migrate_busy);
+ 	wmsum_fini(&abd_sums.abdstat_page_migrate_lost);
+ 	wmsum_fini(&abd_sums.abdstat_migrate_ref_short);
++	wmsum_fini(&abd_sums.abdstat_free_ref_short);
+ 
+ 	if (abd_cache) {
+ 		kmem_cache_destroy(abd_cache);
+-- 
+2.55.0
+
