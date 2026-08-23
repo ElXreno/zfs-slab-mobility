@@ -44,6 +44,11 @@ let
           pkgs.linux_latest.override {
             stdenv = ccache.wrapStdenv pkgs.stdenv;
             kernelPatches = pkgs.linux_latest.kernelPatches ++ extraPatches;
+            # KASAN makes the kernel's Rust support unavailable, and nixpkgs
+            # asks for it in the config it shares with every kernel, so the
+            # strict check reports options that were never ours. Loosened for
+            # this variant alone; everything measured keeps the check.
+            ignoreConfigErrors = kasan;
             structuredExtraConfig =
               lib.optionalAttrs memProfiling {
                 MEM_ALLOC_PROFILING = lib.kernel.yes;
@@ -61,9 +66,10 @@ let
                 # mutex_lock becomes GPL only and configure gives up. Nothing
                 # here selects it, but olddefconfig is happy to turn it back
                 # on, so it is spelled out.
+                # LOCKDEP itself is selected, never set: naming it here is an
+                # error rather than a no-op. These are the ones that select it.
                 PROVE_LOCKING = lib.kernel.no;
                 DEBUG_LOCK_ALLOC = lib.kernel.no;
-                LOCKDEP = lib.kernel.no;
                 DEBUG_MUTEXES = lib.kernel.no;
                 DEBUG_RWSEMS = lib.kernel.no;
                 DEBUG_SPINLOCK = lib.kernel.no;
