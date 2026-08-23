@@ -24,6 +24,7 @@ let
     "abd-movable-migratetype"
     "abd-free-gate"
     "abd-ref-guard"
+    "abd-ref-trace"
     "eio-diag"
   ];
 

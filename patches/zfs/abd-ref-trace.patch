@@ -1,0 +1,78 @@
+From 4ca837fa26ff65403795f8d39e1c58233bd1aabd Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Mon, 24 Aug 2026 01:28:57 +0300
+Subject: [PATCH] diag: trace which step of relocation loses a chunk reference
+
+---
+ module/os/linux/zfs/abd_os.c | 26 ++++++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/module/os/linux/zfs/abd_os.c b/module/os/linux/zfs/abd_os.c
+index e62c417bf..a90b2e9a3 100644
+--- a/module/os/linux/zfs/abd_os.c
++++ b/module/os/linux/zfs/abd_os.c
+@@ -448,6 +448,24 @@ abd_page_migrate(struct page *dst, struct page *src, enum migrate_mode mode)
+ 	abd_t *abd = abd_page_owner(src);
+ 	struct scatterlist *sg, *found = NULL;
+ 	unsigned int i, order, npages;
++	int refs;
++
++	/*
++	 * Every reference this chunk gains or loses between here and the end,
++	 * with the step that was just taken. One of the steps below is losing
++	 * one that nothing in this function accounts for, and a count printed
++	 * only at the ends cannot say which.
++	 */
++#define	ABD_REF_STEP(n)							\
++	do {								\
++		int now_ = page_ref_count(src);				\
++		if (now_ != refs) {					\
++			printk(KERN_ERR "abdrefs: src ref %d -> %d "	\
++			    "after step %d, order %u\n",		\
++			    refs, now_, (n), order);			\
++			refs = now_;					\
++		}							\
++	} while (0)
+ 
+ 	if (abd == NULL)
+ 		return (-EAGAIN);
+@@ -490,8 +508,10 @@ abd_page_migrate(struct page *dst, struct page *src, enum migrate_mode mode)
+ 	 * Subpages of a compound page are contiguous in the memory map, so
+ 	 * the whole chunk is reachable by index from its head.
+ 	 */
++	refs = page_ref_count(src);
+ 	for (i = 0; i < npages; i++)
+ 		copy_highpage(dst + i, src + i);
++	ABD_REF_STEP(1);
+ 
+ 	/*
+ 	 * The replacement has to be recognisable as ours before anything can
+@@ -511,12 +531,17 @@ abd_page_migrate(struct page *dst, struct page *src, enum migrate_mode mode)
+ 	 * has left, so that one is dropped here.
+ 	 */
+ 	abd_mark_zfs_page(dst);
++	ABD_REF_STEP(2);
+ 	abd_make_page_movable(dst, abd);
++	ABD_REF_STEP(3);
+ 	get_page(dst);
++	ABD_REF_STEP(4);
+ 
+ 	sg_set_page(found, dst, found->length, found->offset);
++	ABD_REF_STEP(5);
+ 
+ 	abd_unmark_movable_page(src);
++	ABD_REF_STEP(6);
+ 
+ 	/*
+ 	 * Two references should be left on the chunk at this point: the one it
+@@ -540,6 +565,7 @@ abd_page_migrate(struct page *dst, struct page *src, enum migrate_mode mode)
+ 
+ 	ABDSTAT_BUMP(abdstat_page_migrated);
+ 
++#undef	ABD_REF_STEP
+ 	return (0);
+ }
+ 
+-- 
+2.55.0
+
