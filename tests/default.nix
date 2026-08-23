@@ -265,6 +265,42 @@ let
       writeWhileCloning = true;
     };
 
+    # The same workload on a build carrying none of the relocation patches.
+    # Nine runs proved the workload safe with them; without a baseline that
+    # says nothing, because it might be the workload that is harmless.
+    bclone-stock = mkRun {
+      variant = "stock";
+      seed = 1;
+      cloneWhileWarm = true;
+      fileSize = 4 * 1024 * 1024;
+      files = 512;
+      readJobs = 8;
+      cloneJobs = 8;
+      cloneSeconds = 300;
+      encrypted = true;
+      dedupDest = true;
+      snapshotWhileCloning = true;
+      writeWhileCloning = true;
+    };
+
+    # Cloning that returns a shortened range instead of waiting for the dirty
+    # block's transaction group: the other half of zfs_clone_range.
+    bclone-nowait = mkRun {
+      variant = "mobility";
+      seed = 3;
+      cloneWhileWarm = true;
+      fileSize = 4 * 1024 * 1024;
+      files = 512;
+      readJobs = 8;
+      cloneJobs = 8;
+      cloneSeconds = 300;
+      encrypted = true;
+      dedupDest = true;
+      snapshotWhileCloning = true;
+      writeWhileCloning = true;
+      bcloneWaitDirty = 0;
+    };
+
     # The same workload under KASAN. Fewer files and more memory: the shadow
     # takes an eighth of RAM and every access is checked, so the guest needs
     # room and gets through far less in the same time.

@@ -37,6 +37,10 @@
   dedupDest ? false,
   snapshotWhileCloning ? false,
   writeWhileCloning ? false,
+  # Whether cloning waits for a dirty block's transaction group or hands the
+  # caller a shortened range to fall back on. The two take different paths out
+  # of zfs_clone_range, and only one of them has ever been exercised here.
+  bcloneWaitDirty ? null,
   hugeDemand ? 0,
   compactRounds ? 12,
   compactSeconds ? 90,
@@ -233,6 +237,11 @@ pkgs.testers.runNixOSTest {
             # the set sharing blocks and the size check would not mean what it
             # says. On now, which is the whole point of this phase.
             machine.succeed("echo 1 > /sys/module/zfs/parameters/zfs_bclone_enabled")
+            ${lib.optionalString (bcloneWaitDirty != null) ''
+              machine.succeed(
+                  "echo ${toString bcloneWaitDirty} >"
+                  " /sys/module/zfs/parameters/zfs_bclone_wait_dirty"
+              )''}
 
             machine.succeed(
                 "systemd-run --unit=clone-load"
