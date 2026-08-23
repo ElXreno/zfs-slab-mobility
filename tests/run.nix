@@ -26,6 +26,17 @@
   readJobs ? 0,
   burstJobs ? 0,
   compactWhileWarm ? false,
+  cloneWhileWarm ? false,
+  cloneJobs ? 4,
+  cloneSeconds ? 90,
+  # The machine this reproduces has an encrypted pool, dedup on the dataset
+  # being cloned into, and a snapshot every fifteen minutes. Each of those puts
+  # code in the path that a plain pool never runs, so each is a knob rather
+  # than an assumption.
+  encrypted ? false,
+  dedupDest ? false,
+  snapshotWhileCloning ? false,
+  writeWhileCloning ? false,
   hugeDemand ? 0,
   compactRounds ? 12,
   compactSeconds ? 90,
@@ -43,7 +54,8 @@
 let
   name =
     "${variant}-${recordSize}-${compression}-seed${toString seed}"
-    + lib.optionalString compactWhileWarm "-compactwarm";
+    + lib.optionalString compactWhileWarm "-compactwarm"
+    + lib.optionalString cloneWhileWarm "-clonewarm";
   jobsArg = lib.optionalString (readJobs > 0) " -jobs ${toString readJobs}";
 
   # The read pass ends with memory full and the high orders nearly gone, which
@@ -92,7 +104,16 @@ pkgs.testers.runNixOSTest {
 
     machine.succeed("modprobe zfs")
     machine.succeed("modprobe slabwho")
-    machine.succeed("zpool create -f -o ashift=12 tank /dev/vdb")
+    # Not a secret and not pretending to be one: the point is that the pool
+    # runs the encrypted read path, where a dnode block has to be decrypted
+    # before anything can be read out of it.
+    if ${if encrypted then "True" else "False"}:
+        machine.succeed("echo stand-not-a-secret > /run/zfskey")
+    machine.succeed(
+        "zpool create -f -o ashift=12"
+        "${lib.optionalString encrypted " -O encryption=aes-256-gcm -O keyformat=passphrase -O keylocation=file:///run/zfskey"}"
+        " tank /dev/vdb"
+    )
     machine.succeed(
         "zfs create -o recordsize=${recordSize} -o compression=${compression}"
         " -o atime=off tank/data"
@@ -167,6 +188,14 @@ pkgs.testers.runNixOSTest {
             " /proc/spl/kstat/zfs/abdstats"
         ))
 
+    # Whatever the diagnostic patch said. Nothing else records the failure
+    # being hunted: it reaches userspace as a bare EIO with no ereport and no
+    # entry in the pool's error log, so this ring buffer is the only witness.
+    def zfs_said(pattern):
+        return machine.succeed(
+            f"grep -E '{pattern}' /proc/spl/kstat/zfs/dbgmsg || true"
+        ).strip()
+
     # The dbuf relocation probe counts in dbufstats. Absent without the probe
     # patch, which reads as zero.
     def dbufstat(name):
@@ -184,6 +213,98 @@ pkgs.testers.runNixOSTest {
             timeout=timedelta(seconds=1800),
         )
         snapshot("warm")
+
+    # A build clones every file it installs from the build directory into the
+    # store, and on a machine where both live in one pool that clone reads the
+    # source's indirect blocks. One such read came back EIO with nothing
+    # anywhere to say why. The suspicion is that relocation moved something
+    # out from under it, so the clones have to run while compaction is
+    # actually moving pages: an earlier attempt ran six hundred of them on a
+    # quiet machine and proved nothing.
+    if ${if cloneWhileWarm then "True" else "False"}:
+        with subtest("clone-warm"):
+            machine.succeed(
+                "zfs create -o recordsize=${recordSize}"
+                " -o compression=${compression} -o atime=off"
+                "${lib.optionalString dedupDest " -o dedup=blake3"}"
+                " tank/clone"
+            )
+            # Off for the write phase above, because a clone there would leave
+            # the set sharing blocks and the size check would not mean what it
+            # says. On now, which is the whole point of this phase.
+            machine.succeed("echo 1 > /sys/module/zfs/parameters/zfs_bclone_enabled")
+
+            machine.succeed(
+                "systemd-run --unit=clone-load"
+                " fragload -mode clone -dir /tank/data/set -dest /tank/clone"
+                " -files ${toString files} -size ${toString fileSize}"
+                " -jobs ${toString cloneJobs} -secs ${toString cloneSeconds}"
+            )
+
+            # A build does not stop compiling while it installs. Both earlier
+            # attempts cloned against an otherwise idle pool, which leaves out
+            # every path that needs a write in flight: a block with a pending
+            # clone written before the txg syncs goes to DB_UNCACHED, and
+            # anyone waiting on it wakes to EIO.
+            if ${if writeWhileCloning then "True" else "False"}:
+                machine.succeed(
+                    "systemd-run --unit=write-load"
+                    " fragload -mode write -dir /tank/clone/churn"
+                    " -files 4096 -size ${toString fileSize}"
+                    " -seed ${toString (seed + 7)} -jobs 4"
+                )
+
+            # The machine that hit this takes one every fifteen minutes, and
+            # one landed seven minutes before the failure. A snapshot ends a
+            # transaction group, which is the boundary cloning cares about.
+            if ${if snapshotWhileCloning then "True" else "False"}:
+                machine.succeed(
+                    "systemd-run --unit=snap-load --property=Type=simple"
+                    " /bin/sh -c 'i=0; while true; do"
+                    " zfs snapshot tank/data@s$i 2>/dev/null;"
+                    " zfs destroy tank/data@s$((i-8)) 2>/dev/null;"
+                    " i=$((i+1)); sleep 2; done'"
+                )
+
+            # Same three levers that made the last relocation bug show itself:
+            # a real high order request rather than the sysctl alone, repeated
+            # rounds, and load in flight the whole time.
+            for round in range(${toString compactRounds}):
+                machine.execute("echo 512 > /proc/sys/vm/nr_hugepages")
+                machine.execute("echo 1 > /proc/sys/vm/compact_memory")
+                machine.sleep(duration=timedelta(seconds=5))
+                machine.execute("echo 0 > /proc/sys/vm/nr_hugepages")
+                kernel_is_quiet(f"clone round {round}")
+
+            machine.wait_until_fails(
+                "systemctl is-active clone-load",
+                timeout=timedelta(seconds=${toString (cloneSeconds + 120)}),
+            )
+            if ${if snapshotWhileCloning then "True" else "False"}:
+                machine.succeed("systemctl stop snap-load || true")
+            if ${if writeWhileCloning then "True" else "False"}:
+                machine.succeed("systemctl stop write-load || true")
+            status = machine.succeed(
+                "systemctl show -p ExecMainStatus --value clone-load"
+            ).strip()
+            said = machine.succeed(
+                "journalctl -u clone-load --no-pager -o cat || true"
+            ).strip()
+            print(f"clone unit exited {status}: {said}")
+
+            # The diagnostic patch names the block whenever a read dies on the
+            # way out of the dbuf layer, whether or not the clone noticed.
+            diag = zfs_said("indirect read failed|woke to DB_UNCACHED"
+                            "|dbuf_hold gave nothing")
+            if diag:
+                print(f"zfs said:\n{diag}")
+
+            kernel_is_quiet("cloning against a moving ARC")
+            assert status == "0", (
+                f"cloning failed while relocation was running (exit {status}):"
+                f"\n{said}\nzfs said:\n{diag or '(nothing)'}"
+            )
+            snapshot("clone-warm")
 
     # Compaction has to run while the ARC still holds the chunks it allocated.
     # The compact phase further down runs after the squeeze and a cache drop,

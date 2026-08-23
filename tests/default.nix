@@ -236,6 +236,35 @@ let
     #
     # Only the mobility build. Separation marks no page movable, so compaction
     # would find nothing of ours and could not fail here however long it ran.
+    # Reproduces the silent EIO a build hit while cloning what it had just
+    # written. Four megabytes a file rather than the usual one record: a file
+    # of a single record has no indirect block at all, and the read that
+    # failed was of an indirect block, so the set everything else uses could
+    # never have shown this however long it ran.
+    bclone-eio = mkRun {
+      variant = "mobility";
+      seed = 1;
+      cloneWhileWarm = true;
+      fileSize = 4 * 1024 * 1024;
+      files = 512;
+      readJobs = 8;
+      cloneJobs = 8;
+      # The event being chased happened once in days of building, so the base
+      # rate is somewhere below one in a million clones. Two minutes of them
+      # is not a sample, it is a formality.
+      cloneSeconds = 600;
+      compactRounds = 60;
+      # Everything the failing machine has that a plain pool does not. Without
+      # these the run exercises a different pool than the one that failed: the
+      # first attempt cloned half a million times against live relocation and
+      # never touched the decrypt path at all, because there was nothing to
+      # decrypt.
+      encrypted = true;
+      dedupDest = true;
+      snapshotWhileCloning = true;
+      writeWhileCloning = true;
+    };
+
     abd-migrate = mkRun {
       # The probe build: this check asks what relocation did, not how big the
       # slab ended up, so the probe's cost to the dbuf cache does not distort
