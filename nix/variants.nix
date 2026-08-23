@@ -27,6 +27,7 @@ let
       withProbes ? false,
       noKswapdWake ? false,
       memProfiling ? false,
+      kasan ? false,
     }:
     let
       extraPatches =
@@ -37,17 +38,36 @@ let
       # unconditionally changes the derivation for the unpatched variants too,
       # and those would stop coming out of the binary cache.
       kernel =
-        if extraPatches == [ ] && !memProfiling then
+        if extraPatches == [ ] && !memProfiling && !kasan then
           pkgs.linux_latest
         else
           pkgs.linux_latest.override {
             stdenv = ccache.wrapStdenv pkgs.stdenv;
             kernelPatches = pkgs.linux_latest.kernelPatches ++ extraPatches;
-            structuredExtraConfig = lib.optionalAttrs memProfiling {
-              MEM_ALLOC_PROFILING = lib.kernel.yes;
-              MEM_ALLOC_PROFILING_ENABLED_BY_DEFAULT = lib.kernel.yes;
-              MEM_ALLOC_PROFILING_DEBUG = lib.kernel.no;
-            };
+            structuredExtraConfig =
+              lib.optionalAttrs memProfiling {
+                MEM_ALLOC_PROFILING = lib.kernel.yes;
+                MEM_ALLOC_PROFILING_ENABLED_BY_DEFAULT = lib.kernel.yes;
+                MEM_ALLOC_PROFILING_DEBUG = lib.kernel.no;
+              }
+              // lib.optionalAttrs kasan {
+                # Names both ends of a use after free instead of leaving the
+                # allocator to notice the damage later, which is all a bare
+                # bad-page report can say.
+                KASAN = lib.kernel.yes;
+                KASAN_GENERIC = lib.kernel.yes;
+                KASAN_OUTLINE = lib.kernel.yes;
+                # ZFS refuses to build against a kernel carrying lockdep:
+                # mutex_lock becomes GPL only and configure gives up. Nothing
+                # here selects it, but olddefconfig is happy to turn it back
+                # on, so it is spelled out.
+                PROVE_LOCKING = lib.kernel.no;
+                DEBUG_LOCK_ALLOC = lib.kernel.no;
+                LOCKDEP = lib.kernel.no;
+                DEBUG_MUTEXES = lib.kernel.no;
+                DEBUG_RWSEMS = lib.kernel.no;
+                DEBUG_SPINLOCK = lib.kernel.no;
+              };
           };
 
       zfsExtra =
@@ -113,6 +133,17 @@ in
     slabMobility = true;
     modulePageMobility = true;
     slabMobilityZfs = true;
+  };
+
+  # Relocation under KASAN. A bad-page report says only that the allocator
+  # found damage; KASAN says who freed the object and who touched it after.
+  # Slow enough that it is a variant of its own rather than something the
+  # measured runs carry.
+  kasan = mkVariant {
+    slabMobility = true;
+    modulePageMobility = true;
+    slabMobilityZfs = true;
+    kasan = true;
   };
 
   # The same, plus the probes. Kept apart because dbuf-move-probe creates its

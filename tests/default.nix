@@ -243,7 +243,7 @@ let
     # never have shown this however long it ran.
     bclone-eio = mkRun {
       variant = "mobility";
-      seed = 1;
+      seed = 2;
       cloneWhileWarm = true;
       fileSize = 4 * 1024 * 1024;
       files = 512;
@@ -259,6 +259,26 @@ let
       # first attempt cloned half a million times against live relocation and
       # never touched the decrypt path at all, because there was nothing to
       # decrypt.
+      encrypted = true;
+      dedupDest = true;
+      snapshotWhileCloning = true;
+      writeWhileCloning = true;
+    };
+
+    # The same workload under KASAN. Fewer files and more memory: the shadow
+    # takes an eighth of RAM and every access is checked, so the guest needs
+    # room and gets through far less in the same time.
+    bclone-kasan = mkRun {
+      variant = "kasan";
+      seed = 1;
+      cloneWhileWarm = true;
+      fileSize = 4 * 1024 * 1024;
+      files = 256;
+      readJobs = 4;
+      cloneJobs = 4;
+      cloneSeconds = 300;
+      compactRounds = 30;
+      memoryMB = 12288;
       encrypted = true;
       dedupDest = true;
       snapshotWhileCloning = true;
