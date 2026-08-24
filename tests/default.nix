@@ -135,8 +135,13 @@ let
           };
         in
         {
-          separation = runsFor bigRecords "separation";
-          nokswapd = runsFor bigRecords "nokswapd";
+          # Five seeds rather than three. The consequence has come in at
+          # 1.029, 1.066 and 1.084 across runs, so the threshold sits inside
+          # the spread and a three seed median lands on either side of it by
+          # luck. The threshold is what the patch has to clear and does not
+          # move; the sample is what was too small.
+          separation = runsForSeeds [ 1 2 3 4 5 ] bigRecords "separation";
+          nokswapd = runsForSeeds [ 1 2 3 4 5 ] bigRecords "nokswapd";
         };
       expect = [
         {
