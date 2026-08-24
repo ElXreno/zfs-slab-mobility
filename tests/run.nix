@@ -41,6 +41,9 @@
   # caller a shortened range to fall back on. The two take different paths out
   # of zfs_clone_range, and only one of them has ever been exercised here.
   bcloneWaitDirty ? null,
+  # Refuses header relocation without reading the header, so a run that still
+  # goes wrong says the trouble is not there.
+  arcMoveDisable ? false,
   hugeDemand ? 0,
   compactRounds ? 12,
   compactSeconds ? 90,
@@ -107,6 +110,8 @@ pkgs.testers.runNixOSTest {
     machine.wait_for_unit("multi-user.target")
 
     machine.succeed("modprobe zfs")
+    if ${if arcMoveDisable then "True" else "False"}:
+        machine.succeed("echo 1 > /sys/module/zfs/parameters/zfs_arc_move_disable")
     machine.succeed("modprobe slabwho")
     # Not a secret and not pretending to be one: the point is that the pool
     # runs the encrypted read path, where a dnode block has to be decrypted

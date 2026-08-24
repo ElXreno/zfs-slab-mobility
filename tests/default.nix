@@ -301,6 +301,28 @@ let
       bcloneWaitDirty = 0;
     };
 
+    # KASAN named arc_hdr_move as the reader of a freed header. This is the
+    # other half of that claim: the same build, the same workload, with the
+    # callback answering before it reads anything. If the report goes away,
+    # the read is what causes it.
+    bclone-kasan-nomove = mkRun {
+      variant = "kasan";
+      seed = 1;
+      cloneWhileWarm = true;
+      fileSize = 4 * 1024 * 1024;
+      files = 256;
+      readJobs = 4;
+      cloneJobs = 4;
+      cloneSeconds = 300;
+      compactRounds = 30;
+      memoryMB = 12288;
+      encrypted = true;
+      dedupDest = true;
+      snapshotWhileCloning = true;
+      writeWhileCloning = true;
+      arcMoveDisable = true;
+    };
+
     # The same workload under KASAN. Fewer files and more memory: the shadow
     # takes an eighth of RAM and every access is checked, so the guest needs
     # room and gets through far less in the same time.

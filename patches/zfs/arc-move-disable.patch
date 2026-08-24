@@ -1,0 +1,52 @@
+From 9ed5aa537dd377060394007619df4eb18875f52b Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Mon, 24 Aug 2026 03:44:03 +0300
+Subject: [PATCH] diag: let a run tell header relocation apart from everything
+ else
+
+---
+ module/zfs/arc.c | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/module/zfs/arc.c b/module/zfs/arc.c
+index 8ebc05b58..98793c320 100644
+--- a/module/zfs/arc.c
++++ b/module/zfs/arc.c
+@@ -491,6 +491,14 @@ static taskq_t *arc_flush_taskq;
+  */
+ static uint_t zfs_arc_evict_threads = 0;
+ 
++/*
++ * Set to tell relocation apart from the rest of a run. slab_defrag can offer a
++ * header that another thread freed after it was chosen, and the callback finds
++ * out only by reading it; with this on it never reads, so a run that still
++ * corrupts memory is corrupting it somewhere else.
++ */
++static int zfs_arc_move_disable = 0;
++
+ /* The 7 states: */
+ arc_state_t ARC_anon;
+ arc_state_t ARC_mru;
+@@ -3471,6 +3479,12 @@ arc_hdr_move(void *buf, void *newbuf, size_t size, void *arg)
+ 	arc_state_t *state;
+ 	boolean_t defer = B_FALSE;
+ 
++	/* Answers without dereferencing hdr, which may already be freed. */
++	if (zfs_arc_move_disable) {
++		ARCSTAT_BUMP(arcstat_move_not_live);
++		return (KMEM_CBRC_DONT_KNOW);
++	}
++
+ 	if (HDR_EMPTY(hdr)) {
+ 		ARCSTAT_BUMP(arcstat_move_not_live);
+ 		return (KMEM_CBRC_DONT_KNOW);
+@@ -11527,3 +11541,6 @@ ZFS_MODULE_PARAM(zfs_arc, zfs_arc_, prune_task_threads, INT, ZMOD_RW,
+ 
+ ZFS_MODULE_PARAM(zfs_arc, zfs_arc_, evict_threads, UINT, ZMOD_RD,
+ 	"Number of threads to use for ARC eviction.");
++
++ZFS_MODULE_PARAM(zfs_arc, zfs_arc_, move_disable, INT, ZMOD_RW,
++	"Refuse every header relocation without inspecting the header.");
+-- 
+2.55.0
+

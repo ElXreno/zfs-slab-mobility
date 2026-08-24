@@ -26,6 +26,7 @@ let
     "abd-ref-guard"
     "abd-free-guard"
     "abd-ref-trace"
+    "arc-move-disable"
     "eio-diag"
   ];
 
