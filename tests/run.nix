@@ -44,6 +44,10 @@
   # Refuses header relocation without reading the header, so a run that still
   # goes wrong says the trouble is not there.
   arcMoveDisable ? false,
+  # Which caches carry a relocation callback and which do not. Two of them are
+  # unmovable by construction rather than by choice, and nothing else in the
+  # suite would notice a callback being added to one of those by mistake.
+  assertMobility ? false,
   hugeDemand ? 0,
   compactRounds ? 12,
   compactSeconds ? 90,
@@ -222,6 +226,39 @@ pkgs.testers.runNixOSTest {
             timeout=timedelta(seconds=1800),
         )
         snapshot("warm")
+
+    if ${if assertMobility then "True" else "False"}:
+        with subtest("cache-mobility"):
+            # slabwho column six: whether the cache was created with a move
+            # callback. A cache absent from the file reads as zero, which is
+            # why the movable ones are asserted too: a typo in a name would
+            # otherwise pass as "not mobile".
+            def cache_mobile(name):
+                out = machine.succeed(
+                    f"awk '$1 == \"{name}\" {{ print $6; found=1 }}"
+                    f" END {{ if (!found) print \"absent\" }}' /proc/slabwho"
+                ).strip()
+                return out
+
+            for name in ("dnode_t", "arc_buf_hdr_t_full"):
+                got = cache_mobile(name)
+                assert got == "1", (
+                    f"{name} should carry a relocation callback, slabwho says"
+                    f" {got}"
+                )
+
+            # Proved unmovable by reading the code: a znode contains the VFS
+            # inode the kernel reaches it through, and zio_buf_alloc hands out
+            # a bare pointer nothing tracks. dmu_buf_impl_t is movable in
+            # principle but its probe belongs to the probes variant, so the
+            # build a machine would run must not carry it.
+            for name in ("zfs_znode_cache", "zio_buf_comb_16384",
+                         "dmu_buf_impl_t"):
+                got = cache_mobile(name)
+                assert got in ("0", "absent"), (
+                    f"{name} must not carry a relocation callback, slabwho"
+                    f" says {got}"
+                )
 
     # A build clones every file it installs from the build directory into the
     # store, and on a machine where both live in one pool that clone reads the

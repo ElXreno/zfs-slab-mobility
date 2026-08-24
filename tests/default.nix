@@ -279,6 +279,18 @@ let
       writeWhileCloning = true;
     };
 
+    # Which caches may be relocated at all. Two of the five the suite was asked
+    # to cover cannot be: a znode contains the inode the kernel reaches it
+    # through, and zio_buf_alloc hands out a pointer nothing tracks. For those
+    # the regression to guard is that nobody registers a callback for them
+    # later; for the two that do carry one, that it is still there.
+    cache-mobility = mkRun {
+      variant = "mobility";
+      seed = 1;
+      files = 4000;
+      assertMobility = true;
+    };
+
     # The same workload on a build carrying none of the relocation patches.
     # Nine runs proved the workload safe with them; without a baseline that
     # says nothing, because it might be the workload that is harmless.
