@@ -202,7 +202,21 @@ let
         ];
         runs =
           let
-            fiveSeeds = runsForSeeds [ 1 2 3 4 5 ] { inherit hugeDemand; };
+            # Nine rather than five. One run's seeds spread 217 to 1024, and at
+            # five the median swung from 882 to 348 between two runs of the same
+            # check. Widening the sample is the only answer left: the threshold
+            # is what the patch is supposed to clear, so it does not move.
+            fiveSeeds = runsForSeeds [
+              1
+              2
+              3
+              4
+              5
+              6
+              7
+              8
+              9
+            ] { inherit hugeDemand; };
           in
           {
             separation = fiveSeeds "separation";
