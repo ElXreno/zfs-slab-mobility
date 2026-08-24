@@ -25,6 +25,7 @@ let
     "abd-free-gate"
     "abd-ref-guard"
     "abd-free-guard"
+    "abd-retire-guard"
     "arc-move-disable"
     "eio-diag"
   ];
