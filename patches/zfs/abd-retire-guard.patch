@@ -1,18 +1,18 @@
-From 90de755f4a342f29fd895c5bc7b8fe6e890b04cf Mon Sep 17 00:00:00 2001
+From 036576f8ef982740d97cbe239728d9245bfb247b Mon Sep 17 00:00:00 2001
 From: ElXreno <elxreno@gmail.com>
 Date: Mon, 24 Aug 2026 04:21:58 +0300
 Subject: [PATCH] abd: refuse to retire a chunk that is already at zero
  references
 
 ---
- module/os/linux/zfs/abd_os.c | 18 ++++++++++++++++++
- 1 file changed, 18 insertions(+)
+ module/os/linux/zfs/abd_os.c | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
 
 diff --git a/module/os/linux/zfs/abd_os.c b/module/os/linux/zfs/abd_os.c
-index 979ff8801..95b871749 100644
+index 979ff8801..6ac5851c8 100644
 --- a/module/os/linux/zfs/abd_os.c
 +++ b/module/os/linux/zfs/abd_os.c
-@@ -652,6 +652,22 @@ abd_retire_page(struct scatterlist *sg)
+@@ -652,6 +652,26 @@ abd_retire_page(struct scatterlist *sg)
  		 * Never offered for relocation, so nothing can be looking at
  		 * it and there is nothing to take the lock against.
  		 */
@@ -23,8 +23,12 @@ index 979ff8801..95b871749 100644
 +		 * one has already lost the mark's somewhere else, and then the
 +		 * unmark frees the page here, inside a function whose caller
 +		 * is about to free it again.
++		 *
++		 * More than two is somebody holding the chunk, usually
++		 * compaction having isolated it, and that is what the wait
++		 * below is for. Only fewer is the broken case.
 +		 */
-+		if (unlikely(page_ref_count(page) != 2)) {
++		if (unlikely(page_ref_count(page) < 2)) {
 +			ABDSTAT_BUMP(abdstat_free_ref_short);
 +			printk(KERN_ERR "abdrefs: declined to retire, "
 +			    "ref %d order %d\n", page_ref_count(page),
@@ -35,7 +39,7 @@ index 979ff8801..95b871749 100644
  		if (abd_page_owner(page) == NULL) {
  			abd_unmark_movable_page(page);
  			return (page);
-@@ -961,6 +977,8 @@ abd_free_chunks(abd_t *abd)
+@@ -961,6 +981,8 @@ abd_free_chunks(abd_t *abd)
  	if (!abd_is_from_pages(abd)) {
  		abd_for_each_sg(abd, sg, nr_pages, i) {
  			page = abd_retire_page(sg);
