@@ -263,11 +263,12 @@ let
       files = 512;
       readJobs = 8;
       cloneJobs = 8;
-      # The event being chased happened once in days of building, so the base
-      # rate is somewhere below one in a million clones. Two minutes of them
-      # is not a sample, it is a formality.
-      cloneSeconds = 600;
-      compactRounds = 60;
+      # Two minutes rather than ten. Measured: at 120 seconds the clones run
+      # at 18831 MiB/s, at 600 they fall to 985, because the write load beside
+      # them puts sixteen gigabytes into a twenty four gigabyte disk and the
+      # pool fills. The longer run does less work, not more.
+      cloneSeconds = 120;
+      compactRounds = 12;
       # Everything the failing machine has that a plain pool does not. Without
       # these the run exercises a different pool than the one that failed: the
       # first attempt cloned half a million times against live relocation and
