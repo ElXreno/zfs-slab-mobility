@@ -25,7 +25,6 @@ let
     "abd-free-gate"
     "abd-ref-guard"
     "abd-free-guard"
-    "abd-ref-trace"
     "arc-move-disable"
     "eio-diag"
   ];
@@ -36,6 +35,11 @@ let
   # a measurement the stand has already taken.
   probes = [
     "dbuf-move-probe"
+    # A line printed at every step of every relocation. It slows relocation
+    # enough that the free path waits longer for it, and the stall guard in
+    # the highorder run fires at twelve thousand spins. Diagnostics that move
+    # a number do not belong in the build that number is measured on.
+    "abd-ref-trace"
   ];
 
   # Applied on their own rather than as part of a series, to isolate one
