@@ -391,6 +391,7 @@ type verdict struct {
 	ok          bool
 	missing     string
 	nosignal    bool
+	dropped     int
 }
 
 // A no-signal verdict fails the run, because a threshold that measured nothing
@@ -406,6 +407,31 @@ func (v verdict) fatal() bool {
 		return !v.skipNoSignal
 	}
 	return !v.ok
+}
+
+// Medians over the seeds where the baseline stayed under the cap, dropping
+// each saturated seed from both sides so the two stay paired. A seed whose
+// baseline got everything it asked for measures the request, not the patch,
+// and leaving it in drags the median toward the cap on one side only.
+func pairedBelow(from, to *group, metric string, ceiling float64) (float64,
+	float64, int) {
+	var a, b []float64
+	dropped := 0
+	for i, s := range from.seeds {
+		if i >= len(to.seeds) {
+			break
+		}
+		if s[metric] >= ceiling {
+			dropped++
+			continue
+		}
+		a = append(a, s[metric])
+		b = append(b, to.seeds[i][metric])
+	}
+	if len(a) == 0 {
+		return from.median[metric], to.median[metric], dropped
+	}
+	return median(a), median(b), dropped
 }
 
 func judge(gs []*group, specs []expectation) []verdict {
@@ -425,6 +451,10 @@ func judge(gs []*group, specs []expectation) []verdict {
 			v.missing = e.to
 		default:
 			v.a, v.b = from.median[e.metric], to.median[e.metric]
+			if e.ceiling > 0 {
+				v.a, v.b, v.dropped = pairedBelow(from, to,
+					e.metric, e.ceiling)
+			}
 			gauge := v.a
 			if e.gate != "" {
 				gauge = from.median[e.gate]
@@ -480,9 +510,16 @@ func (v verdict) state() string {
 func verdictText(vs []verdict) string {
 	var b strings.Builder
 	for _, v := range vs {
-		fmt.Fprintf(&b, "%-12s %-12s %10s -> %-12s %10s  ratio %.3f  %s (needs %s %g)\n",
+		fmt.Fprintf(&b, "%-12s %-12s %10s -> %-12s %10s  ratio %.3f  %s (needs %s %g)",
 			v.metric, v.from, showValue(v.metric, v.a), v.to, showValue(v.metric, v.b),
 			v.ratio, v.state(), v.op(), v.bound)
+		// Silently dropping a seed would read as a smaller sample that
+		// happened to agree, so say how many and why.
+		if v.dropped > 0 {
+			fmt.Fprintf(&b, "  [%d seed(s) dropped: baseline at the cap]",
+				v.dropped)
+		}
+		b.WriteString("\n")
 	}
 	return b.String()
 }
