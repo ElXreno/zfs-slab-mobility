@@ -28,6 +28,7 @@ let
     "abd-retire-guard"
     "arc-move-disable"
     "eio-diag"
+    "arc-hdr-accounting"
   ];
 
   # What only answers a question. dbuf-move-probe creates the dbuf cache
