@@ -34,47 +34,45 @@ let
         lib.optional slabMobility (kernelPatch "slab-object-mobility")
         ++ lib.optional modulePageMobility (kernelPatch "module-movable-pages");
 
-      # Only wrap the compiler where a kernel is actually built. Wrapping it
-      # unconditionally changes the derivation for the unpatched variants too,
-      # and those would stop coming out of the binary cache.
-      kernel =
-        if extraPatches == [ ] && !memProfiling && !kasan then
-          pkgs.linux_latest
-        else
-          pkgs.linux_latest.override {
-            stdenv = ccache.wrapStdenv pkgs.stdenv;
-            kernelPatches = pkgs.linux_latest.kernelPatches ++ extraPatches;
-            # KASAN makes the kernel's Rust support unavailable, and nixpkgs
-            # asks for it in the config it shares with every kernel, so the
-            # strict check reports options that were never ours. Loosened for
-            # this variant alone; everything measured keeps the check.
-            ignoreConfigErrors = kasan;
-            structuredExtraConfig =
-              lib.optionalAttrs memProfiling {
+      # Boot-time shuffling of object and page placement, none of it switchable at runtime.
+      deterministic = {
+        SLAB_FREELIST_RANDOM = lib.mkForce lib.kernel.no;
+        RANDOM_KMALLOC_CACHES = lib.mkForce lib.kernel.no;
+        SHUFFLE_PAGE_ALLOCATOR = lib.mkForce lib.kernel.no;
+      };
+
+      kernel = pkgs.linux_latest.override {
+        stdenv = ccache.wrapStdenv pkgs.stdenv;
+        kernelPatches = pkgs.linux_latest.kernelPatches ++ extraPatches;
+        # KASAN removes the Rust support the shared nixpkgs config asks for.
+        ignoreConfigErrors = kasan;
+        structuredExtraConfig =
+          deterministic
+          // lib.optionalAttrs memProfiling {
                 MEM_ALLOC_PROFILING = lib.kernel.yes;
                 MEM_ALLOC_PROFILING_ENABLED_BY_DEFAULT = lib.kernel.yes;
                 MEM_ALLOC_PROFILING_DEBUG = lib.kernel.no;
               }
-              // lib.optionalAttrs kasan {
-                # Names both ends of a use after free instead of leaving the
-                # allocator to notice the damage later, which is all a bare
-                # bad-page report can say.
-                KASAN = lib.kernel.yes;
-                KASAN_GENERIC = lib.kernel.yes;
-                KASAN_OUTLINE = lib.kernel.yes;
-                # ZFS refuses to build against a kernel carrying lockdep:
-                # mutex_lock becomes GPL only and configure gives up. Nothing
-                # here selects it, but olddefconfig is happy to turn it back
-                # on, so it is spelled out.
-                # LOCKDEP itself is selected, never set: naming it here is an
-                # error rather than a no-op. These are the ones that select it.
-                PROVE_LOCKING = lib.kernel.no;
-                DEBUG_LOCK_ALLOC = lib.kernel.no;
-                DEBUG_MUTEXES = lib.kernel.no;
-                DEBUG_RWSEMS = lib.kernel.no;
-                DEBUG_SPINLOCK = lib.kernel.no;
-              };
+          // lib.optionalAttrs kasan {
+            # Names both ends of a use after free instead of leaving the
+            # allocator to notice the damage later, which is all a bare
+            # bad-page report can say.
+            KASAN = lib.kernel.yes;
+            KASAN_GENERIC = lib.kernel.yes;
+            KASAN_OUTLINE = lib.kernel.yes;
+            # ZFS refuses to build against a kernel carrying lockdep:
+            # mutex_lock becomes GPL only and configure gives up. Nothing
+            # here selects it, but olddefconfig is happy to turn it back
+            # on, so it is spelled out.
+            # LOCKDEP itself is selected, never set: naming it here is an
+            # error rather than a no-op. These are the ones that select it.
+            PROVE_LOCKING = lib.kernel.no;
+            DEBUG_LOCK_ALLOC = lib.kernel.no;
+            DEBUG_MUTEXES = lib.kernel.no;
+            DEBUG_RWSEMS = lib.kernel.no;
+            DEBUG_SPINLOCK = lib.kernel.no;
           };
+      };
 
       zfsExtra =
         (
