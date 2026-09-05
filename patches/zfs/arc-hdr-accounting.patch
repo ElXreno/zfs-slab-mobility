@@ -1,0 +1,108 @@
+From a2870b687ed580030a577fdc5ebae93f45167782 Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Sat, 5 Sep 2026 10:43:59 +0300
+Subject: [PATCH] arc: account a header when it is allocated, not when it is
+ constructed
+
+The header cache charges ARC_SPACE_HDRS from its constructor and refunds it
+from its destructor. That is exact only while every construction is followed
+by exactly one destruction, which held on illumos, where the allocator
+constructs each object once and destroys it once, and on Linux, where the SPL
+constructs on every allocation and destroys on every free.
+
+A cache that relocates its objects breaks the pairing. The allocator
+constructs every object of a slab when the slab is created, so that a slot
+never handed out still reads as an empty header to the move callback, and
+those objects are destroyed by nobody: a slot that is later allocated is
+constructed a second time and destroyed once, and a slab that is discarded
+takes its untouched slots with it. Every header slab therefore leaves
+34 x 240 bytes charged for good.
+
+Measured on a 62G desktop after 2.8 days: hdr_size 2,024,707,760 against
+38,507,280 bytes of headers in the cache, after 1.45M relocations. The charge
+is also added to arcstat_size and meta_used, so the ARC evicted against memory
+it did not hold: with zfs_arc_max at 3G, data_size was 21M and arc_prune had
+been called 6M times.
+
+Charge and refund where the header is allocated and destroyed instead:
+arc_hdr_alloc, arc_hdr_destroy, both directions of arc_hdr_realloc, and the
+eviction markers, which come from the same cache. What is counted does not
+change; only a slot that was never allocated stops being counted. arc_buf_t
+keeps its constructor accounting, because that cache does not relocate.
+---
+ module/zfs/arc.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/module/zfs/arc.c b/module/zfs/arc.c
+index 98793c320..3cbb67b42 100644
+--- a/module/zfs/arc.c
++++ b/module/zfs/arc.c
+@@ -1217,7 +1217,6 @@ hdr_full_cons(void *vbuf, void *unused, int kmflag)
+ #endif
+ 	multilist_link_init(&hdr->b_l1hdr.b_arc_node);
+ 	list_link_init(&hdr->b_l2hdr.b_l2node);
+-	arc_space_consume(HDR_FULL_SIZE, ARC_SPACE_HDRS);
+ 
+ 	return (0);
+ }
+@@ -1262,7 +1261,6 @@ hdr_full_dest(void *vbuf, void *unused)
+ 	mutex_destroy(&hdr->b_l1hdr.b_freeze_lock);
+ #endif
+ 	ASSERT(!multilist_link_active(&hdr->b_l1hdr.b_arc_node));
+-	arc_space_return(HDR_FULL_SIZE, ARC_SPACE_HDRS);
+ }
+ 
+ static void
+@@ -3317,6 +3315,7 @@ arc_hdr_alloc(uint64_t spa, int32_t psize, int32_t lsize,
+ 
+ 	VERIFY(type == ARC_BUFC_DATA || type == ARC_BUFC_METADATA);
+ 	hdr = kmem_cache_alloc(hdr_full_cache, KM_PUSHPAGE);
++	arc_space_consume(HDR_FULL_SIZE, ARC_SPACE_HDRS);
+ 
+ 	ASSERT(HDR_EMPTY(hdr));
+ #ifdef ZFS_DEBUG
+@@ -3365,6 +3364,8 @@ arc_hdr_realloc(arc_buf_hdr_t *hdr, kmem_cache_t *old, kmem_cache_t *new)
+ 	    (old == hdr_l2only_cache && new == hdr_full_cache));
+ 
+ 	nhdr = kmem_cache_alloc(new, KM_PUSHPAGE);
++	if (new == hdr_full_cache)
++		arc_space_consume(HDR_FULL_SIZE, ARC_SPACE_HDRS);
+ 
+ 	ASSERT(MUTEX_HELD(HDR_LOCK(hdr)));
+ 	buf_hash_remove(hdr);
+@@ -3445,6 +3446,8 @@ arc_hdr_realloc(arc_buf_hdr_t *hdr, kmem_cache_t *old, kmem_cache_t *new)
+ 	    arc_hdr_size(nhdr), nhdr);
+ 
+ 	buf_discard_identity(hdr);
++	if (old == hdr_full_cache)
++		arc_space_return(HDR_FULL_SIZE, ARC_SPACE_HDRS);
+ 	kmem_cache_free(old, hdr);
+ 
+ 	return (nhdr);
+@@ -3899,6 +3902,7 @@ arc_hdr_destroy(arc_buf_hdr_t *hdr)
+ #ifdef ZFS_DEBUG
+ 		ASSERT0P(hdr->b_l1hdr.b_freeze_cksum);
+ #endif
++		arc_space_return(HDR_FULL_SIZE, ARC_SPACE_HDRS);
+ 		kmem_cache_free(hdr_full_cache, hdr);
+ 	} else {
+ 		kmem_cache_free(hdr_l2only_cache, hdr);
+@@ -4213,6 +4217,7 @@ static arc_buf_hdr_t *
+ arc_state_alloc_marker(void)
+ {
+ 	arc_buf_hdr_t *marker = kmem_cache_alloc(hdr_full_cache, KM_SLEEP);
++	arc_space_consume(HDR_FULL_SIZE, ARC_SPACE_HDRS);
+ 
+ 	/*
+ 	 * A b_spa of 0 is used to indicate that this header is
+@@ -4226,6 +4231,7 @@ arc_state_alloc_marker(void)
+ static void
+ arc_state_free_marker(arc_buf_hdr_t *marker)
+ {
++	arc_space_return(HDR_FULL_SIZE, ARC_SPACE_HDRS);
+ 	kmem_cache_free(hdr_full_cache, marker);
+ }
+ 
+-- 
+2.55.0
+

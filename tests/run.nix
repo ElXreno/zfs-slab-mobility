@@ -260,6 +260,23 @@ pkgs.testers.runNixOSTest {
                     f" says {got}"
                 )
 
+        # hdr_size is the bytes the two header caches hold and nothing else.
+        # A build that constructs an object when its slab is created, on top
+        # of constructing it when it is handed out, counts every slot once
+        # more than it ever returns, and the ARC then evicts against memory
+        # it does not hold. Both numbers in one command, so that the churn
+        # between two reads cannot be mistaken for the defect.
+        with subtest("arc-accounting"):
+            said = machine.succeed(
+                "awk '$1 == \"hdr_size\" { print $3 }' /proc/spl/kstat/zfs/arcstats;"
+                " awk '$1 == \"arc_buf_hdr_t_full\" || $1 == \"arc_buf_t\" { n += $4 }"
+                " END { print n+0 }' /proc/spl/kmem/slab"
+            ).split()
+            hdr_size, held = int(said[0]), int(said[1])
+            assert abs(hdr_size - held) <= max(held // 10, 1 << 20), (
+                f"hdr_size says {hdr_size} bytes, the header caches hold {held}"
+            )
+
     # A build clones every file it installs from the build directory into the
     # store, and on a machine where both live in one pool that clone reads the
     # source's indirect blocks. One such read came back EIO with nothing
