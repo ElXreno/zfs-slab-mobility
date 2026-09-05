@@ -182,25 +182,15 @@ let
 
     # The outcome the patches exist for, in the allocator's own currency. Every
     # other check counts blocks and pages, which are means; this one asks how
-    # much contiguous memory the machine can still hand out with the ARC full.
-    #
-    # Measured before asserted, and the measurement has a ceiling. Ask for a
-    # third of the guest and the demand is met out of chunks the ARC holds,
-    # which is the thing under test; ask for half and the request itself
-    # evicts the ARC, so what gets handed out tracks how far the ARC happened
-    # to fall rather than whether its chunks could move, and mobility with a
-    # full ARC then loses to separation with a collapsed one. So the demand
-    # stays at a third and the noise is answered with seeds instead: five
-    # rather than three, so a single lucky run moves the median less.
+    # much contiguous memory the machine can still hand out with the ARC held
+    # at one size in both builds; the run checks the demand fits beside it.
     highorder =
       let
-        # A third of the guest. More turns the request into an eviction and
-        # measures the ARC's collapse instead of the chunks' mobility.
         hugeDemand = 1024;
       in
       mkCompare {
         name = "highorder";
-        phase = "highorder";
+        phase = "frozen";
         order = [
           "separation"
           "mobility"
@@ -229,16 +219,13 @@ let
           };
         expect = [
           {
-            metric = "hugepages";
+            # Free order-10 blocks after one compaction pass with the ARC held
+            # at the same size in both builds: the guest has 1792 of them.
+            metric = "order10";
             from = "separation";
             to = "mobility";
             atLeast = 1.5;
-            # What the run asked for is also what it can hand out at most. A
-            # baseline that already got every page it wanted was never short of
-            # contiguous memory, so there is nothing here for relocation to
-            # improve, and the ratio of one that follows would read as a
-            # regression rather than as a host that never fragmented.
-            ceiling = hugeDemand;
+            ceiling = 1792;
             skipNoSignal = true;
           }
         ];

@@ -49,6 +49,7 @@
   # suite would notice a callback being added to one of those by mistake.
   assertMobility ? false,
   hugeDemand ? 0,
+  arcFreezeMB ? 3072,
   compactRounds ? 12,
   compactSeconds ? 90,
   files ? 50000,
@@ -481,6 +482,36 @@ pkgs.testers.runNixOSTest {
     if ${toString hugeDemand} > 0:
         with subtest("highorder"):
             before = compound_chunks()
+            # Both builds hold the same ARC and kswapd may not shrink it, so
+            # the count is about the layout of what is free, not about eviction.
+            freeze = ${toString (arcFreezeMB * 1024 * 1024)}
+            machine.succeed(f"echo {freeze} > /sys/module/zfs/parameters/zfs_arc_max")
+            # A lower ceiling evicts nothing by itself: the ARC gives way on
+            # the next allocation, so read a little until it has.
+            for _ in range(60):
+                size = int(machine.succeed("awk '$1==\"size\"{print $3}' /proc/spl/kstat/zfs/arcstats"))
+                if size <= freeze:
+                    break
+                machine.succeed(
+                    "fragload -mode hot -dir /tank/data/set"
+                    " -files ${toString files} -size ${toString fileSize}"
+                    " -seed ${toString seed} -slice 256 -secs 2",
+                    timeout=timedelta(seconds=60),
+                )
+            assert size <= freeze + freeze // 20, (
+                f"the ARC is still {size} bytes against a ceiling of {freeze}"
+            )
+            machine.succeed("echo 1 > /sys/module/zfs/parameters/zfs_arc_shrinker_limit")
+            machine.succeed("echo 1 > /proc/sys/vm/compact_memory")
+            snapshot("frozen")
+            free10 = machine.succeed("awk '{ n += $NF } END { print n+0 }' /proc/buddyinfo").strip()
+            free = int(machine.succeed("awk '/^MemFree/{print $2}' /proc/meminfo")) * 1024
+            print(f"frozen: ARC {size}, free {free}, order-10 free blocks {free10}")
+            want = ${toString hugeDemand} * 2 * 1024 * 1024
+            assert free >= want, (
+                f"{free} bytes free against a demand of {want}: the demand"
+                " could only be met by evicting, which is not what is measured"
+            )
             machine.succeed("echo ${toString hugeDemand} > /proc/sys/vm/nr_hugepages")
             got = int(machine.succeed("awk '/^HugePages_Total/{print $2}' /proc/meminfo"))
             print(
@@ -507,6 +538,7 @@ pkgs.testers.runNixOSTest {
 
             snapshot("highorder")
             machine.succeed("echo 0 > /proc/sys/vm/nr_hugepages")
+            machine.succeed("echo 0 > /sys/module/zfs/parameters/zfs_arc_shrinker_limit")
             kernel_is_quiet("the high order demand")
 
     with subtest("squeeze"):
