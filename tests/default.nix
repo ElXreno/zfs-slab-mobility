@@ -127,6 +127,7 @@ let
             # Each reader in flight holds a megabyte linear buffer, and those
             # come from the cache whose slabs are the order 10 request. Four
             # readers asked for fewer of them than the guest had left.
+            cores = 4;
             readJobs = 32;
             # Demand has to outrun supply at the moment of the request. The
             # first pass leaves about eighty order 10 blocks free, so the burst
@@ -253,6 +254,7 @@ let
       cloneWhileWarm = true;
       fileSize = 4 * 1024 * 1024;
       files = 512;
+      cores = 4;
       readJobs = 8;
       cloneJobs = 8;
       # Two minutes rather than ten. Measured: at 120 seconds the clones run
@@ -293,6 +295,7 @@ let
       cloneWhileWarm = true;
       fileSize = 4 * 1024 * 1024;
       files = 512;
+      cores = 4;
       readJobs = 8;
       cloneJobs = 8;
       cloneSeconds = 300;
@@ -310,6 +313,7 @@ let
       cloneWhileWarm = true;
       fileSize = 4 * 1024 * 1024;
       files = 512;
+      cores = 4;
       readJobs = 8;
       cloneJobs = 8;
       cloneSeconds = 300;
@@ -330,6 +334,7 @@ let
       cloneWhileWarm = true;
       fileSize = 4 * 1024 * 1024;
       files = 256;
+      cores = 4;
       readJobs = 4;
       cloneJobs = 4;
       cloneSeconds = 300;
@@ -351,6 +356,7 @@ let
       cloneWhileWarm = true;
       fileSize = 4 * 1024 * 1024;
       files = 256;
+      cores = 4;
       readJobs = 4;
       cloneJobs = 4;
       cloneSeconds = 300;
@@ -368,6 +374,7 @@ let
       # what it reads.
       variant = "probes";
       seed = 1;
+      cores = 4;
       compactWhileWarm = true;
     };
 

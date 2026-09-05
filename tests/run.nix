@@ -55,7 +55,9 @@
   files ? 50000,
   fileSize ? 131072,
   memoryMB ? 6144,
-  cores ? 4,
+  # One vCPU unless a run needs contention: per-CPU allocator lists on four
+  # cost separation eleven percent of spread between two runs, one costs two.
+  cores ? 1,
   diskMB ? 24000,
   arcFloorMB ? 512,
   quietSeconds ? 60,
@@ -80,7 +82,8 @@ let
     + " -seed ${toString (seed + 1)} -jobs ${toString burstJobs}";
   setBytes = files * fileSize;
 in
-pkgs.testers.runNixOSTest {
+# Never substituted: a run is a sample, not a function of its inputs.
+(pkgs.testers.runNixOSTest {
   name = "fragmentation-${name}";
 
   nodes.machine = {
@@ -95,7 +98,15 @@ pkgs.testers.runNixOSTest {
       kernelPackages = variants.${variant};
       supportedFilesystems = [ "zfs" ];
       extraModulePackages = [ variants.${variant}.slabwho ];
-      kernel.sysctl = lib.optionalAttrs (defragMode != null) {
+      # The guest's own dice: kernel placement and khugepaged. The allocator's are in nix/variants.nix.
+      kernelParams = [
+        "nokaslr"
+        "transparent_hugepage=never"
+      ];
+      kernel.sysctl = {
+        "kernel.randomize_va_space" = 0;
+      }
+      // lib.optionalAttrs (defragMode != null) {
         "vm.defrag_mode" = defragMode;
       };
     };
@@ -153,7 +164,32 @@ pkgs.testers.runNixOSTest {
 
     machine.succeed("echo 3 > /proc/sys/vm/drop_caches")
 
+    # A snapshot taken while kswapd, kcompactd, the evict thread or a
+    # transaction group is still at work records a moment, and two runs never
+    # share a moment. Wait until the counters those actors move have stood
+    # still for a second. Bounded: a guest that never settles is reported,
+    # not waited for.
+    def settle(where, seconds=30):
+        machine.succeed("sync; zpool sync tank")
+        probe = (
+            "awk '$1 ~ /^(compact_stall|compact_daemon_wake|compact_isolated"
+            "|pgscan_kswapd|pgsteal_kswapd|pgscan_direct|pgmigrate_success"
+            "|pgmigrate_fail)$/ { s = s $2 \",\" } END { print s }' /proc/vmstat;"
+            " awk '$1 ~ /^(memory_direct_count|memory_indirect_count"
+            "|evict_skip)$/ { s = s $3 \",\" } END { print s }'"
+            " /proc/spl/kstat/zfs/arcstats"
+        )
+        last = None
+        for _ in range(seconds):
+            now = machine.succeed(probe)
+            if now == last:
+                return
+            last = now
+            machine.sleep(duration=timedelta(seconds=1))
+        print(f"{where}: memory was still moving after {seconds}s")
+
     def snapshot(phase):
+        settle(phase)
         d = f"/tmp/proc/{phase}"
         machine.succeed(f"mkdir -p {d}/spl/kstat/zfs {d}/sys/kernel")
         for f in ("iomem", "buddyinfo", "pagetypeinfo", "slabinfo", "meminfo", "vmstat"):
@@ -584,4 +620,7 @@ pkgs.testers.runNixOSTest {
     os.makedirs(os.environ["out"], exist_ok=True)
     machine.copy_from_machine("/tmp/proc", "")
   '';
-}
+}).overrideTestDerivation
+  (_: {
+    allowSubstitutes = false;
+  })
