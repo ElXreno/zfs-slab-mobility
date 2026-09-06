@@ -545,21 +545,12 @@ in
             asked = abdstat("page_isolate_asked")
             moved = abdstat("page_migrated")
             busy = abdstat("page_migrate_busy")
-            lost = abdstat("page_migrate_lost")
-            waited = abdstat("gate_waited")
-            # Anything but zero here is a chunk that reached relocation
-            # holding fewer references than this code keeps on one it owns.
-            # The guard declines the put rather than freeing a page the
-            # caller still holds locked, so the run survives it, but the
-            # count is the only trace left and it belongs in the report.
-            short = abdstat("migrate_ref_short")
             woke = machine.succeed(
                 "awk '$1 == \"compact_daemon_wake\" { print $2 }' /proc/vmstat"
             ).strip()
             print(
                 f"compound chunks {compound}, offered {asked}, moved {moved},"
-                f" refused busy {busy}, lost {lost}, gate waited {waited},"
-                f" refs short {short}, kcompactd woke {woke}"
+                f" refused busy {busy}, kcompactd woke {woke}"
             )
             assert asked > 0, (
                 "compaction never offered a chunk for relocation, so the path"
@@ -657,23 +648,11 @@ in
             print(
                 f"asked ${toString hugeDemand}, got {got},"
                 f" compound chunks {before},"
-                f" retire waited {abdstat('retire_waited')}"
-                f" longest {abdstat('retire_spin_max')},"
-                f" gate waited {abdstat('gate_waited')}"
+                f" kernel evicted {abdstat('lru_release')}"
             )
             assert before > 1000, (
                 f"only {before} chunks larger than a page, so the ARC is not"
                 " holding the memory this is meant to compete with"
-            )
-            # The retire path spins rather than sleeps, so what matters is not
-            # how much it waited in total but how long it ever waited at once.
-            # A few hundred turns is microseconds; a run into the thousands
-            # would mean it is waiting on something that sleeps, and that is
-            # the shape worth failing on.
-            longest = abdstat("retire_spin_max")
-            assert longest < 10000, (
-                f"one retire spun {longest} times without giving up the cpu,"
-                " which is a stall rather than a wait"
             )
 
             snapshot("highorder")

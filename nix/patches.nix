@@ -19,14 +19,6 @@ let
     "mobile-cache-flag"
     "mobile-cache-flag-userspace"
     "mobile-cache-rcu"
-    "abd-page-mobility"
-    "abd-reader-gate"
-    "abd-relocate"
-    "abd-movable-migratetype"
-    "abd-free-gate"
-    "abd-ref-guard"
-    "abd-free-guard"
-    "abd-retire-guard"
     "arc-move-disable"
     "eio-diag"
     "arc-hdr-accounting"
@@ -60,11 +52,6 @@ let
   # a measurement the stand has already taken.
   probes = [
     "dbuf-move-probe"
-    # A line printed at every step of every relocation. It slows relocation
-    # enough that the free path waits longer for it, and the stall guard in
-    # the highorder run fires at twelve thousand spins. Diagnostics that move
-    # a number do not belong in the build that number is measured on.
-    "abd-ref-trace"
   ];
 
   # Applied on their own rather than as part of a series, to isolate one
@@ -113,7 +100,6 @@ else
 
     kernel = {
       slab-object-mobility = kernelFile "slab-object-mobility";
-      module-movable-pages = kernelFile "module-movable-pages";
       filemap-exports = kernelFile "filemap-exports";
       compaction-large-folio = kernelFile "compaction-large-folio";
     };

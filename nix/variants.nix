@@ -21,7 +21,6 @@ let
   mkVariant =
     {
       slabMobility ? false,
-      modulePageMobility ? false,
       filemapExports ? false,
       largeFolioCompaction ? false,
       noReclaimAccount ? false,
@@ -36,7 +35,6 @@ let
     let
       extraPatches =
         lib.optional slabMobility (kernelPatch "slab-object-mobility")
-        ++ lib.optional modulePageMobility (kernelPatch "module-movable-pages")
         ++ lib.optional filemapExports (kernelPatch "filemap-exports")
         ++ lib.optional largeFolioCompaction (kernelPatch "compaction-large-folio");
 
@@ -143,17 +141,6 @@ in
   # really held by. Its own cost is a pointer per object, so it is a separate
   # variant rather than something the measured ones carry.
   profiling = mkVariant { memProfiling = true; };
-
-  # The above plus object relocation in SLUB and movable pages for the scatter
-  # ABD, so that what is left in a block can be moved out of the way. Carries
-  # what a machine would run and nothing else, because everything it is
-  # compared against runs a stock allocator: a probe that changes how a cache
-  # is built would be a difference of its own, counted as if it were this one.
-  mobility = mkVariant {
-    slabMobility = true;
-    modulePageMobility = true;
-    slabMobilityZfs = true;
-  };
 
   # Header relocation plus clean ARC buffers as folios in the page cache, which
   # the kernel reclaims and moves itself, so the abd-* series is not applied.
