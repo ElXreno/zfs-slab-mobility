@@ -1,0 +1,213 @@
+Compaction gives up on a large folio too easily. compaction_alloc looks
+for a free page of the folio's order once, and isolate_freepages returns
+at once whenever any free page is already isolated, so a leftover of small
+pages from earlier targets is enough to fail every large folio that
+follows. The folio is then split, and a folio that cannot be split turns
+the failure into -ENOMEM, which ends the whole pass as COMPACT_CONTENDED.
+Clean ARC buffers are large folios that never split, so a full pass over
+a zone holding them stops within a few pageblocks.
+
+The free scanner also goes blind among large folios. It samples a block
+with a stride that doubles after every block without free pages, and
+skipping a compound page moves the sample point to that page's last pfn,
+so from then on every sample lands on the tail of whatever is aligned:
+a free block of the folio's order is never seen again, the scanners meet
+with the holes still there, and a second pass finds nothing either.
+
+Let the free scanner keep going for a large folio until a page of its
+order is isolated, the scanners meet, the zone lock is contended, a
+thousand pages are isolated or a call makes no progress. Order-0 folios
+keep the single attempt. Keep the samples stride-aligned after a compound
+page or a taken free page. For MR_COMPACTION a large folio that neither
+gets a target nor splits is a permanent failure of that folio alone
+instead of the end of the pass. Research build only.
+
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@ -566,17 +566,30 @@
+ 	return false;
+ }
+ 
++/* Whether a free page of at least @order is isolated, ready to be a target. */
++static bool compact_has_free_order(struct compact_control *cc,
++				unsigned int order)
++{
++	for (; order < NR_PAGE_ORDERS; order++)
++		if (!list_empty(&cc->freepages[order]))
++			return true;
++	return false;
++}
++
+ /*
+  * Isolate free pages onto a private freelist. If @strict is true, will abort
+  * returning 0 on any invalid PFNs or non-free pages inside of the pageblock
+- * (even though it may still end up isolating some pages).
++ * (even though it may still end up isolating some pages). Unless @strict,
++ * stop once the isolated pages cover the migration list and one of them is
++ * of at least @min_order.
+  */
+ static unsigned long isolate_freepages_block(struct compact_control *cc,
+ 				unsigned long *start_pfn,
+ 				unsigned long end_pfn,
+ 				struct list_head *freelist,
+ 				unsigned int stride,
+-				bool strict)
++				bool strict,
++				unsigned int min_order)
+ {
+ 	int nr_scanned = 0, total_isolated = 0;
+ 	struct page *page;
+@@ -616,11 +629,19 @@
+ 		if (PageCompound(page)) {
+ 			const unsigned int order = compound_order(page);
+ 
++			/*
++			 * Land the next sample on a stride-aligned pfn past the
++			 * page, or every sample after it would hit the tail of a
++			 * free block and never its head.
++			 */
+ 			if ((order <= MAX_PAGE_ORDER) &&
+ 			    (blockpfn + (1UL << order) <= end_pfn)) {
+-				blockpfn += (1UL << order) - 1;
+-				page += (1UL << order) - 1;
++				unsigned long next = ALIGN(blockpfn + (1UL << order),
++							   stride) - stride;
++
+ 				nr_scanned += (1UL << order) - 1;
++				page += next - blockpfn;
++				blockpfn = next;
+ 			}
+ 
+ 			goto isolate_fail;
+@@ -651,13 +672,19 @@
+ 		cc->nr_freepages += isolated;
+ 		list_add_tail(&page->lru, &freelist[order]);
+ 
+-		if (!strict && cc->nr_migratepages <= cc->nr_freepages) {
++		if (!strict && cc->nr_migratepages <= cc->nr_freepages &&
++		    compact_has_free_order(cc, min_order)) {
+ 			blockpfn += isolated;
+ 			break;
+ 		}
+-		/* Advance to the end of split page */
+-		blockpfn += isolated - 1;
+-		page += isolated - 1;
++		/* Advance to the end of split page, keeping the samples aligned */
++		{
++			unsigned long next = ALIGN(blockpfn + isolated, stride) -
++					     stride;
++
++			page += next - blockpfn;
++			blockpfn = next;
++		}
+ 		continue;
+ 
+ isolate_fail:
+@@ -748,7 +775,7 @@
+ 			break;
+ 
+ 		isolated = isolate_freepages_block(cc, &isolate_start_pfn,
+-					block_end_pfn, cc->freepages, 0, true);
++					block_end_pfn, cc->freepages, 0, true, 0);
+ 
+ 		/*
+ 		 * In strict mode, isolate_freepages_block() returns 0 if
+@@ -1493,7 +1520,8 @@
+ 	if (!page)
+ 		return;
+ 
+-	isolate_freepages_block(cc, &start_pfn, end_pfn, cc->freepages, 1, false);
++	isolate_freepages_block(cc, &start_pfn, end_pfn, cc->freepages, 1, false,
++				0);
+ 
+ 	/* Skip this pageblock in the future as it's full or nearly full */
+ 	if (start_pfn == end_pfn && !cc->no_set_skip_hint)
+@@ -1689,9 +1717,10 @@
+ 
+ /*
+  * Based on information in the current compact_control, find blocks
+- * suitable for isolating free pages from and then isolate them.
++ * suitable for isolating free pages from and then isolate them. A folio of
++ * @order is waiting for a target, so pages below that order do not count.
+  */
+-static void isolate_freepages(struct compact_control *cc)
++static void isolate_freepages(struct compact_control *cc, unsigned int order)
+ {
+ 	struct zone *zone = cc->zone;
+ 	struct page *page;
+@@ -1703,7 +1732,7 @@
+ 
+ 	/* Try a small search of the free lists for a candidate */
+ 	fast_isolate_freepages(cc);
+-	if (cc->nr_freepages)
++	if (cc->nr_freepages && compact_has_free_order(cc, order))
+ 		return;
+ 
+ 	/*
+@@ -1764,7 +1793,8 @@
+ 
+ 		/* Found a block suitable for isolating free pages from. */
+ 		nr_isolated = isolate_freepages_block(cc, &isolate_start_pfn,
+-					block_end_pfn, cc->freepages, stride, false);
++					block_end_pfn, cc->freepages, stride, false,
++					order);
+ 
+ 		/* Update the skip hint if the full pageblock was scanned */
+ 		if (isolate_start_pfn == block_end_pfn)
+@@ -1772,7 +1802,8 @@
+ 					      pageblock_nr_pages);
+ 
+ 		/* Are enough freepages isolated? */
+-		if (cc->nr_freepages >= cc->nr_migratepages) {
++		if (cc->nr_freepages >= cc->nr_migratepages &&
++		    compact_has_free_order(cc, order)) {
+ 			if (isolate_start_pfn >= block_end_pfn) {
+ 				/*
+ 				 * Restart at previous pageblock if more
+@@ -1826,11 +1857,24 @@
+ 		if (!list_empty(&cc->freepages[start_order]))
+ 			break;
+ 
+-	/* no free pages in the list */
++	/*
++	 * No free page of this order in the lists. A large folio keeps the
++	 * free scanner going until one turns up, the scanners meet, the zone
++	 * lock is contended or too much is isolated; splitting the folio is
++	 * what happens otherwise, and that is worse than a longer scan.
++	 */
+ 	if (start_order == NR_PAGE_ORDERS) {
+-		if (has_isolated_pages)
++		unsigned long free_pfn = cc->free_pfn;
++		unsigned long nr_freepages = cc->nr_freepages;
++
++		if (has_isolated_pages &&
++		    (!order || cc->contended || compact_scanners_met(cc) ||
++		     cc->nr_freepages >= COMPACT_CLUSTER_MAX << 5))
++			return NULL;
++		isolate_freepages(cc, order);
++		if (has_isolated_pages && cc->free_pfn == free_pfn &&
++		    cc->nr_freepages == nr_freepages)
+ 			return NULL;
+-		isolate_freepages(cc);
+ 		has_isolated_pages = true;
+ 		goto again;
+ 	}
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -1945,6 +1945,16 @@
+ 						nr_failed--;
+ 						stats->nr_thp_failed -= is_thp;
+ 						break;
++					} else if (reason == MR_COMPACTION) {
++						/*
++						 * Compaction has no free page of this
++						 * order and the folio will not split:
++						 * give up on it alone, smaller folios
++						 * behind it may still find targets.
++						 */
++						stats->nr_failed_pages += nr_pages;
++						list_move_tail(&folio->lru, ret_folios);
++						break;
+ 					}
+ 				}
+ 
