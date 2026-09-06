@@ -16,6 +16,7 @@
   lib,
   variants,
   fragload,
+  fragcheck,
 }:
 
 {
@@ -49,7 +50,22 @@
   # suite would notice a callback being added to one of those by mistake.
   assertMobility ? false,
   hugeDemand ? 0,
+  # Anonymous memory held beside a full ARC, with swap under the guest so that
+  # what the kernel chose to give up is visible as a counter.
+  anonHogMB ? 0,
+  hogSeconds ? 60,
+  expectSwap ? null,
+  verifyAfter ? false,
+  # Hours of readers, writers, cloners, hogs and compaction at once, checked
+  # for kernel complaints as it goes and byte for byte at the end.
+  soakSeconds ? 0,
+  # A cache vdev, so buffers are written to and read back from the l2arc.
+  l2arc ? false,
+  # Three disks in a raidz instead of one, for the parity and reconstruction paths.
+  raidz ? false,
   arcFreezeMB ? 3072,
+  # A second pass right after the first, to see what the first left behind.
+  compactTwice ? false,
   compactRounds ? 12,
   compactSeconds ? 90,
   files ? 50000,
@@ -81,9 +97,16 @@ let
     + " -files ${toString files} -size ${toString fileSize}"
     + " -seed ${toString (seed + 1)} -jobs ${toString burstJobs}";
   setBytes = files * fileSize;
+
+  # The pool takes the first empty images, swap and the cache vdev come after.
+  poolDisks = if raidz then 3 else 1;
+  letters = "bcdefg";
+  poolVdevs = if raidz then "raidz /dev/vdb /dev/vdc /dev/vdd" else "/dev/vdb";
+  swapDev = "/dev/vd${builtins.substring poolDisks 1 letters}";
+  l2Dev = "/dev/vd${builtins.substring (poolDisks + 1) 1 letters}";
 in
 # Never substituted: a run is a sample, not a function of its inputs.
-(pkgs.testers.runNixOSTest {
+(pkgs.testers.runNixOSTest ({
   name = "fragmentation-${name}";
 
   nodes.machine = {
@@ -91,7 +114,10 @@ in
       memorySize = memoryMB;
       inherit cores;
       diskSize = 4096;
-      emptyDiskImages = [ diskMB ];
+      emptyDiskImages =
+        (if raidz then lib.replicate 3 (diskMB / 2) else [ diskMB ])
+        ++ lib.optional (anonHogMB > 0 || soakSeconds > 0 || l2arc) 2048
+        ++ lib.optional l2arc 2048;
     };
 
     boot = {
@@ -102,17 +128,28 @@ in
       kernelParams = [
         "nokaslr"
         "transparent_hugepage=never"
+      ]
+      ++ lib.optionals (anonHogMB > 0 || soakSeconds > 0) [
+        "zswap.enabled=1"
+        "psi=1"
       ];
       kernel.sysctl = {
         "kernel.randomize_va_space" = 0;
       }
       // lib.optionalAttrs (defragMode != null) {
         "vm.defrag_mode" = defragMode;
+      }
+      # The test driver panics the guest on OOM; a hog run wants the counters instead.
+      // lib.optionalAttrs (anonHogMB > 0 || soakSeconds > 0) {
+        "vm.panic_on_oom" = lib.mkForce 0;
       };
     };
 
     networking.hostId = "deadbeef";
-    environment.systemPackages = [ fragload ];
+    environment.systemPackages = [
+      fragload
+    ]
+    ++ lib.optional (anonHogMB > 0 || soakSeconds > 0 || verifyAfter) fragcheck;
 
     documentation.enable = false;
     services.udisks2.enable = false;
@@ -137,12 +174,21 @@ in
     machine.succeed(
         "zpool create -f -o ashift=12"
         "${lib.optionalString encrypted " -O encryption=aes-256-gcm -O keyformat=passphrase -O keylocation=file:///run/zfskey"}"
-        " tank /dev/vdb"
+        " tank ${poolVdevs}"
     )
     machine.succeed(
         "zfs create -o recordsize=${recordSize} -o compression=${compression}"
         " -o atime=off tank/data"
-    )
+    )${lib.optionalString l2arc (
+      "\n"
+      + ''
+        machine.succeed("zpool add tank cache ${l2Dev}")
+        for p in ("l2arc_write_max", "l2arc_write_boost"):
+            machine.succeed(f"echo 268435456 > /sys/module/zfs/parameters/{p}")
+        machine.succeed("echo 0 > /sys/module/zfs/parameters/l2arc_noprefetch")
+        machine.succeed("echo 8 > /sys/module/zfs/parameters/l2arc_headroom")
+      ''
+    )}
 
     # ZFS keeps its own tuning: holding the ARC down leaves memory free, and
     # then the allocator never runs short of the high orders being measured.
@@ -262,7 +308,17 @@ in
             "${jobsArg}",
             timeout=timedelta(seconds=1800),
         )
-        snapshot("warm")
+        snapshot("warm")${lib.optionalString l2arc (
+          "\n"
+          + ''
+            with subtest("l2arc-warm"):
+                l2_size = int(machine.succeed(
+                    "awk '$1==\"l2_size\"{print $3}' /proc/spl/kstat/zfs/arcstats"
+                ))
+                print(f"l2arc holds {l2_size} bytes after the warm pass")
+                assert l2_size > 0, "nothing reached the cache device, so the l2arc write path did not run"
+          ''
+        )}
 
     if ${if assertMobility then "True" else "False"}:
         with subtest("cache-mobility"):
@@ -542,7 +598,55 @@ in
             snapshot("frozen")
             free10 = machine.succeed("awk '{ n += $NF } END { print n+0 }' /proc/buddyinfo").strip()
             free = int(machine.succeed("awk '/^MemFree/{print $2}' /proc/meminfo")) * 1024
-            print(f"frozen: ARC {size}, free {free}, order-10 free blocks {free10}")
+            print(f"frozen: ARC {size}, free {free}, order-10 free blocks {free10}")${lib.optionalString compactTwice (
+      "\n"
+      + ''
+    # A second pass over what the first one left behind.
+            arc_before = int(machine.succeed("awk '$1==\"size\"{print $3}' /proc/spl/kstat/zfs/arcstats"))
+            evicted_before = abdstat("lru_folios")
+            tracing = "/sys/kernel/tracing"
+            machine.succeed(
+                f"echo 0 > {tracing}/tracing_on",
+                f"echo > {tracing}/trace",
+                f"echo 131072 > {tracing}/buffer_size_kb",
+                f"echo > {tracing}/set_ftrace_filter",
+                *(
+                    f"echo {fn} >> {tracing}/set_ftrace_filter || true"
+                    for fn in (
+                        "try_split_folio",
+                        "__folio_split",
+                        "filemap_release_folio",
+                        "abd_lru_release_folio",
+                        "abd_lru_migrate_folio",
+                        "compaction_alloc_noprof",
+                        "migrate_folio_unmap",
+                        "migrate_folio_move",
+                        "move_to_new_folio",
+                        "folio_migrate_mapping",
+                    )
+                ),
+                f"echo function > {tracing}/current_tracer",
+                f"echo 1 > {tracing}/events/compaction/mm_compaction_isolate_migratepages/enable",
+                f"echo 1 > {tracing}/events/compaction/mm_compaction_isolate_freepages/enable",
+                f"echo 1 > {tracing}/events/compaction/mm_compaction_migratepages/enable",
+                f"echo 1 > {tracing}/events/compaction/mm_compaction_begin/enable",
+                f"echo 1 > {tracing}/events/compaction/mm_compaction_end/enable",
+                f"echo 1 > {tracing}/events/migrate/mm_migrate_pages/enable",
+                f"echo 1 > {tracing}/tracing_on",
+            )
+            machine.succeed("echo 1 > /proc/sys/vm/compact_memory")
+            machine.succeed(f"echo 0 > {tracing}/tracing_on")
+            snapshot("frozen2")
+            machine.succeed(f"gzip -1 -c {tracing}/trace > /tmp/proc/frozen2/trace.gz")
+            machine.succeed(f"echo nop > {tracing}/current_tracer")
+            free10b = machine.succeed("awk '{ n += $NF } END { print n+0 }' /proc/buddyinfo").strip()
+            arc_after = int(machine.succeed("awk '$1==\"size\"{print $3}' /proc/spl/kstat/zfs/arcstats"))
+            print(
+                f"frozen2: ARC {arc_before} -> {arc_after},"
+                f" lru folios {evicted_before} -> {abdstat('lru_folios')},"
+                f" order-10 free blocks {free10} -> {free10b}"
+            )''
+    )}
             want = ${toString hugeDemand} * 2 * 1024 * 1024
             assert free >= want, (
                 f"{free} bytes free against a demand of {want}: the demand"
@@ -575,7 +679,215 @@ in
             snapshot("highorder")
             machine.succeed("echo 0 > /proc/sys/vm/nr_hugepages")
             machine.succeed("echo 0 > /sys/module/zfs/parameters/zfs_arc_shrinker_limit")
-            kernel_is_quiet("the high order demand")
+            kernel_is_quiet("the high order demand")${lib.optionalString (anonHogMB > 0) (
+      "\n"
+      + ''
+    # Thresholds fixed before any run: a folio backend swaps nothing and stalls
+    # under three seconds; stock has to swap, or the pressure was not real.
+    hog = {}
+    if True:
+        with subtest("hog"):
+            def vmstat(name):
+                return int(machine.succeed(
+                    f"awk '$1 == \"{name}\" {{ print $2 }}' /proc/vmstat"
+                ).strip() or 0)
+
+            def meminfo(name):
+                return int(machine.succeed(
+                    f"awk '$1 == \"{name}:\" {{ print $2 }}' /proc/meminfo"
+                ).strip()) * 1024
+
+            def psi_full():
+                return int(machine.succeed(
+                    "awk '$1 == \"full\" { sub(\"total=\", \"\", $5); print $5 }'"
+                    " /proc/pressure/memory"
+                ).strip() or 0)
+
+            def arcstat(name):
+                return int(machine.succeed(
+                    f"awk '$1 == \"{name}\" {{ print $3 }}' /proc/spl/kstat/zfs/arcstats"
+                ).strip() or 0)
+
+            machine.succeed("mkswap ${swapDev} && swapon ${swapDev}")
+            machine.succeed("echo 1 > /sys/module/zswap/parameters/enabled")
+
+            # Into the kernel log every two seconds, so the numbers outlive the guest:
+            # what reclaim asked of the ARC, what it got, where the folios sit by generation.
+            hogstat = "\n".join([
+                "#!/bin/sh",
+                "PATH=/run/current-system/sw/bin",
+                "while true; do",
+                "  a=$(awk '$1 ~ /^(lru_folios|lru_release|lru_release_busy|lru_release_lock_miss|lru_release_refused|lru_grab_retry)$/ { printf \"%s=%s \", $1, $3 }' /proc/spl/kstat/zfs/abdstats)",
+                "  b=$(awk '$1 ~ /^(size|c|c_max|lru_evict|lru_evict_skip|lru_evict_held|l2_size|l2_writes_sent|evict_skip|evict_l2_skip|mutex_miss|memory_direct_count|memory_indirect_count)$/ { printf \"%s=%s \", $1, $3 }' /proc/spl/kstat/zfs/arcstats)",
+                "  c=$(awk '$1 ~ /^(zswpout|pswpout|nr_active_file|nr_inactive_file|nr_free_pages|pgscan_kswapd|pgscan_direct|pgsteal_kswapd|pgsteal_direct|pgactivate|pgdeactivate)$/ { printf \"%s=%s \", $1, $2 }' /proc/vmstat)",
+                "  g=$(awk 'NR>2 && NR<=6 { printf \"gen%s=%s/%s \", $1, $3, $4 }' /sys/kernel/debug/lru_gen 2>/dev/null)",
+                "  echo \"hogstat $(date +%s) $a$b$c$g\" > /dev/kmsg",
+                "  sleep 2",
+                "done",
+            ])
+            machine.succeed(f"cat > /run/hogstat.sh <<'EOF'\n{hogstat}\nEOF\nchmod +x /run/hogstat.sh")
+            machine.succeed(
+                "systemd-run --unit=hog-sampler --collect --property=Type=simple"
+                " /run/hogstat.sh"
+            )
+
+            hog["arc_size"] = arcstat("size")
+            hog["lru_bytes"] = abdstat("lru_bytes")
+            hog["lru_folios"] = abdstat("lru_folios")
+            hog["mem_free"] = meminfo("MemFree")
+            hog["mem_available"] = meminfo("MemAvailable")
+            before = {
+                "zswpout": vmstat("zswpout"),
+                "pswpout": vmstat("pswpout"),
+                "psi_full": psi_full(),
+                "lru_evict": arcstat("lru_evict"),
+            }
+
+            machine.succeed(
+                "systemd-run --unit=anon-hog --collect"
+                " fragcheck -mode hog -mb ${toString anonHogMB}"
+                " -secs ${toString hogSeconds}"
+            )
+            machine.wait_until_fails(
+                "systemctl is-active anon-hog",
+                timeout=timedelta(seconds=${toString (hogSeconds + 600)}),
+            )
+            machine.succeed("systemctl stop hog-sampler || true")
+            status = machine.succeed(
+                "systemctl show -p ExecMainStatus --value anon-hog"
+            ).strip()
+            assert status == "0", f"the hog exited {status}"
+
+            hog["zswpout"] = vmstat("zswpout") - before["zswpout"]
+            hog["pswpout"] = vmstat("pswpout") - before["pswpout"]
+            hog["psi_full_us"] = psi_full() - before["psi_full"]
+            hog["lru_evict"] = arcstat("lru_evict") - before["lru_evict"]
+            hog["arc_size_after"] = arcstat("size")
+            print(
+                f"hog of ${toString anonHogMB} MiB for ${toString hogSeconds} s:"
+                f" ARC {hog['arc_size']} -> {hog['arc_size_after']},"
+                f" page cache folios {hog['lru_folios']} holding {hog['lru_bytes']},"
+                f" MemAvailable {hog['mem_available']} against MemFree {hog['mem_free']},"
+                f" zswpout {hog['zswpout']}, pswpout {hog['pswpout']},"
+                f" memory full {hog['psi_full_us']} us,"
+                f" kernel evicted {hog['lru_evict']} buffers"
+            )
+            kernel_is_quiet("the anonymous hog")
+
+            if ${if expectSwap == false then "True" else "False"}:
+                assert hog["lru_folios"] > 0, (
+                    "the ARC holds no page cache folios, so the backend under"
+                    " test is not running"
+                )
+                assert hog["mem_available"] - hog["mem_free"] >= hog["lru_bytes"] * 8 // 10, (
+                    f"MemAvailable counts {hog['mem_available'] - hog['mem_free']} bytes"
+                    f" beyond MemFree, the ARC holds {hog['lru_bytes']} in the page cache"
+                )
+                assert hog["zswpout"] == 0 and hog["pswpout"] == 0, (
+                    f"{hog['zswpout']} pages went to zswap and {hog['pswpout']} to"
+                    " the swap device while the ARC held reclaimable memory"
+                )
+                assert hog["psi_full_us"] <= 3000000, (
+                    f"everything stood still for memory {hog['psi_full_us']} us"
+                    " of the hog"
+                )
+            if ${if expectSwap == true then "True" else "False"}:
+                assert hog["zswpout"] + hog["pswpout"] > 0, (
+                    "nothing was swapped: the hog did not press on memory hard"
+                    " enough for a comparison to say anything"
+                )
+            snapshot("hogged")
+            machine.succeed("swapoff ${swapDev}")
+      ''
+    )}${lib.optionalString (soakSeconds > 0) (
+      "\n"
+      + ''
+    if True:
+        with subtest("soak"):
+            soak = ${toString soakSeconds}
+            machine.succeed("mkswap ${swapDev} && swapon ${swapDev}")
+            machine.succeed("echo 1 > /sys/module/zswap/parameters/enabled")
+            machine.succeed(
+                "zfs create -o recordsize=${recordSize}"
+                " -o compression=${compression} -o atime=off tank/clone"
+            )
+            machine.succeed("echo 1 > /sys/module/zfs/parameters/zfs_bclone_enabled")
+            machine.succeed("echo 100 > /proc/sys/vm/compaction_proactiveness")
+
+            machine.succeed(
+                "systemd-run --unit=soak-readers --collect"
+                " fragload -mode hot -dir /tank/data/set"
+                " -files ${toString files} -size ${toString fileSize}"
+                " -seed ${toString seed} -slice ${toString hotFiles}"
+                f" -secs {soak}"
+            )
+            machine.succeed(
+                "systemd-run --unit=soak-cloners --collect"
+                " fragload -mode clone -dir /tank/data/set -dest /tank/clone"
+                " -files ${toString files} -size ${toString fileSize}"
+                f" -jobs 2 -secs {soak}"
+            )
+            machine.succeed(
+                "systemd-run --unit=soak-writers --collect --property=Type=simple"
+                " /bin/sh -c 'i=0; while true; do"
+                " fragload -mode write -dir /tank/clone/churn"
+                " -files 2048 -size ${toString fileSize} -seed $((1000+i)) -jobs 2;"
+                " rm -rf /tank/clone/churn; i=$((i+1)); done'"
+            )
+            machine.succeed(
+                "systemd-run --unit=soak-hogs --collect --property=Type=simple"
+                " /bin/sh -c 'while true; do"
+                " fragcheck -mode hog -mb ${toString (memoryMB / 2)} -secs 60;"
+                " /run/current-system/sw/bin/sleep 30; done'"
+            )
+
+            start = int(machine.succeed("date +%s"))
+            round = 0
+            while int(machine.succeed("date +%s")) - start < soak:
+                machine.execute("echo 512 > /proc/sys/vm/nr_hugepages")
+                machine.execute("echo 1 > /proc/sys/vm/compact_memory")
+                machine.sleep(duration=timedelta(seconds=20))
+                machine.execute("echo 0 > /proc/sys/vm/nr_hugepages")
+                machine.sleep(duration=timedelta(seconds=10))
+                round += 1
+                if round % 10 == 0:
+                    kernel_is_quiet(f"soak round {round}")
+                    said = machine.succeed(
+                        "awk '$1 ~ /^(size|lru_evict|lru_evict_skip)$/ { s = s $1 \"=\" $3 \" \" }"
+                        " END { print s }' /proc/spl/kstat/zfs/arcstats;"
+                        " awk '$1 ~ /^(lru_|page_)/ { s = s $1 \"=\" $3 \" \" } END { print s }'"
+                        " /proc/spl/kstat/zfs/abdstats;"
+                        " awk '$1 ~ /^(zswpout|pswpout|compact_success|pgmigrate_success)$/"
+                        " { s = s $1 \"=\" $2 \" \" } END { print s }' /proc/vmstat;"
+                        " for u in soak-readers soak-cloners soak-writers soak-hogs; do"
+                        " printf '%s=%s ' $u $(systemctl is-active $u); done"
+                    ).replace("\n", " ")
+                    print(f"soak round {round}, {int(machine.succeed('date +%s')) - start}s: {said}")
+
+            for unit in ("soak-readers", "soak-cloners", "soak-writers", "soak-hogs"):
+                machine.execute(f"systemctl stop {unit}")
+            for unit in ("soak-readers", "soak-cloners"):
+                status = machine.succeed(
+                    f"systemctl show -p ExecMainStatus --value {unit}"
+                ).strip()
+                print(f"{unit} exited {status}")
+                assert status in ("0", ""), f"{unit} failed with {status}"
+            machine.succeed("swapoff ${swapDev}")
+            kernel_is_quiet("the soak")
+            snapshot("soaked")
+      ''
+    )}${lib.optionalString verifyAfter (
+      "\n"
+      + ''
+    with subtest("verify"):
+        machine.succeed(
+            "fragcheck -mode verify -dir /tank/data/set"
+            " -files ${toString files} -size ${toString fileSize} -seed ${toString seed}",
+            timeout=timedelta(seconds=1800),
+        )
+        kernel_is_quiet("verifying the set")
+      ''
+    )}
 
     with subtest("squeeze"):
         machine.succeed(
@@ -613,14 +925,43 @@ in
         ${lib.optionalString (
           burstJobs > 0
         ) ''machine.succeed("${burstCmd}", timeout=timedelta(seconds=1800))''}
-        snapshot("reread")
+        snapshot("reread")${lib.optionalString l2arc (
+          "\n"
+          + ''
+            with subtest("l2arc-reread"):
+                l2_hits = int(machine.succeed(
+                    "awk '$1==\"l2_hits\"{print $3}' /proc/spl/kstat/zfs/arcstats"
+                ))
+                print(f"l2arc answered {l2_hits} reads")
+                assert l2_hits > 0, "no read came back from the cache device, so the l2arc read path did not run"
+          ''
+        )}
 
-    kernel_is_quiet("the run")
+    kernel_is_quiet("the run")${lib.optionalString (anonHogMB > 0 || soakSeconds > 0) (
+      "\n"
+      + ''
+        with subtest("unload"):
+            machine.succeed("systemctl stop zfs-zed || true")
+            machine.succeed("zpool export tank")
+            machine.succeed("modprobe -r zfs")
+            kernel_is_quiet("unloading the module")
+      ''
+    )}
 
     os.makedirs(os.environ["out"], exist_ok=True)
-    machine.copy_from_machine("/tmp/proc", "")
+    machine.copy_from_machine("/tmp/proc", "")${lib.optionalString (anonHogMB > 0) (
+      "\n"
+      + ''
+        import json
+        with open(os.path.join(os.environ["out"], "hog.json"), "w") as f:
+            json.dump(hog, f, indent=1)
+      ''
+    )}
   '';
-}).overrideTestDerivation
+}
+// lib.optionalAttrs (soakSeconds > 0) {
+  globalTimeout = 3600 + soakSeconds;
+})).overrideTestDerivation
   (_: {
     allowSubstitutes = false;
   })

@@ -11,6 +11,7 @@
   lib,
   fragview,
   fragload,
+  fragcheck,
 }:
 
 let
@@ -22,6 +23,7 @@ let
       lib
       variants
       fragload
+      fragcheck
       ;
   };
 
@@ -77,17 +79,17 @@ let
       name = "mobility";
       order = [
         "separation"
-        "mobility"
+        "arclru"
       ];
       runs = {
         separation = runsFor { } "separation";
-        mobility = runsFor { } "mobility";
+        arclru = runsFor { } "arclru";
       };
       expect = [
         {
           metric = "blocks_movable";
           from = "separation";
-          to = "mobility";
+          to = "arclru";
           atLeast = 1.5;
         }
         # A guard, not a claim. The seeds favour mobility, 155/181/211 MiB
@@ -97,7 +99,7 @@ let
         {
           metric = "pinned";
           from = "separation";
-          to = "mobility";
+          to = "arclru";
           atMost = 1.5;
         }
       ];
@@ -194,7 +196,7 @@ let
         phase = "frozen";
         order = [
           "separation"
-          "mobility"
+          "arclru"
         ];
         runs =
           let
@@ -216,7 +218,7 @@ let
           in
           {
             separation = fiveSeeds "separation";
-            mobility = fiveSeeds "mobility";
+            arclru = fiveSeeds "arclru";
           };
         expect = [
           {
@@ -224,13 +226,21 @@ let
             # at the same size in both builds: the guest has 1792 of them.
             metric = "order10";
             from = "separation";
-            to = "mobility";
+            to = "arclru";
             atLeast = 1.5;
             ceiling = 1792;
             skipNoSignal = true;
           }
         ];
       };
+
+    # Diagnostic for the folio backend: what a second pass finds after the first.
+    highorder-twice = mkRun {
+      variant = "arclru";
+      seed = 1;
+      hugeDemand = 1024;
+      compactTwice = true;
+    };
 
     # Relocation of chunks larger than one page, which is what the machine this
     # was written on allocates almost exclusively. Not a comparison: the thing
@@ -249,7 +259,7 @@ let
     # failed was of an indirect block, so the set everything else uses could
     # never have shown this however long it ran.
     bclone-eio = mkRun {
-      variant = "mobility";
+      variant = "arclru";
       seed = 2;
       cloneWhileWarm = true;
       fileSize = 4 * 1024 * 1024;
@@ -280,10 +290,97 @@ let
     # the regression to guard is that nobody registers a callback for them
     # later; for the two that do carry one, that it is still there.
     cache-mobility = mkRun {
-      variant = "mobility";
+      variant = "arclru";
       seed = 1;
       files = 4000;
       assertMobility = true;
+    };
+
+    # The folio backend under an anonymous hog with the ARC full, against stock
+    # under the same hog: the run asserts each side, this joins the two.
+    arc-lru =
+      let
+        hogged = {
+          seed = 1;
+          cores = 2;
+          anonHogMB = 3072;
+        };
+        folio = mkRun (
+          hogged
+          // {
+            variant = "arclru";
+            compactWhileWarm = true;
+            expectSwap = false;
+            verifyAfter = true;
+          }
+        );
+        stock = mkRun (
+          hogged
+          // {
+            variant = "stock";
+            expectSwap = true;
+          }
+        );
+      in
+      pkgs.runCommand "arc-lru"
+        {
+          nativeBuildInputs = [ pkgs.jq ];
+          inherit folio stock;
+        }
+        ''
+          mkdir -p $out
+          ln -s $folio $out/arclru
+          ln -s $stock $out/stock
+          swapped=$(jq '.zswpout + .pswpout' $stock/hog.json)
+          kept=$(jq '.zswpout + .pswpout' $folio/hog.json)
+          echo "stock swapped $swapped pages, the folio backend $kept" | tee $out/summary
+          test "$swapped" -gt 0
+          test "$kept" -eq 0
+        '';
+
+    # The same hog, compaction and byte for byte check under KASAN; what is
+    # asserted here is the kernel's silence, the swap thresholds live above.
+    arc-lru-kasan = mkRun {
+      variant = "kasan";
+      seed = 1;
+      cores = 4;
+      memoryMB = 12288;
+      anonHogMB = 6144;
+      compactWhileWarm = true;
+      verifyAfter = true;
+    };
+
+    # The hog and the byte check again with a cache vdev under the pool, so
+    # the l2arc writes joined buffers out and reads them back in.
+    arc-lru-l2arc = mkRun {
+      variant = "arclru";
+      seed = 2;
+      cores = 2;
+      l2arc = true;
+      anonHogMB = 3072;
+      expectSwap = false;
+      verifyAfter = true;
+    };
+
+    # The hog and the byte check on a raidz, so column ABDs and reconstruction
+    # run beside joined buffers.
+    arc-lru-raidz = mkRun {
+      variant = "arclru";
+      seed = 3;
+      cores = 2;
+      raidz = true;
+      anonHogMB = 3072;
+      expectSwap = false;
+      verifyAfter = true;
+    };
+
+    # Six hours of everything at once on the folio backend, then every byte.
+    arc-lru-soak = mkRun {
+      variant = "arclru";
+      seed = 4;
+      cores = 4;
+      soakSeconds = 6 * 3600;
+      verifyAfter = true;
     };
 
     # The same workload on a build carrying none of the relocation patches.
@@ -308,7 +405,7 @@ let
     # Cloning that returns a shortened range instead of waiting for the dirty
     # block's transaction group: the other half of zfs_clone_range.
     bclone-nowait = mkRun {
-      variant = "mobility";
+      variant = "arclru";
       seed = 3;
       cloneWhileWarm = true;
       fileSize = 4 * 1024 * 1024;

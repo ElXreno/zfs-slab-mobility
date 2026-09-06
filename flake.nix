@@ -36,6 +36,7 @@
 
           fragview = pkgs.callPackage ./packages/fragview/package.nix { };
           fragload = pkgs.callPackage ./packages/fragload/package.nix { };
+          fragcheck = pkgs.callPackage ./packages/fragcheck/package.nix { };
 
           suite = import ./tests {
             inherit
@@ -43,6 +44,7 @@
               lib
               fragview
               fragload
+              fragcheck
               ;
           };
         in
@@ -50,7 +52,7 @@
           checks = lib.optionalAttrs (system == "x86_64-linux") suite.checks;
 
           packages = {
-            inherit fragview fragload;
+            inherit fragview fragload fragcheck;
             default = fragview;
           }
           // lib.optionalAttrs (system == "x86_64-linux") {
