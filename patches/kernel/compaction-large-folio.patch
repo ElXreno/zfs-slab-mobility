@@ -1,3 +1,9 @@
+From d64e5186b1e4d981d5bbac2a842b8bee04be1649 Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Mon, 7 Sep 2026 01:19:57 +0300
+Subject: [PATCH] mm/compaction: find targets for large folios and keep the
+ pass alive
+
 Compaction gives up on a large folio too easily. compaction_alloc looks
 for a free page of the folio's order once, and isolate_freepages returns
 at once whenever any free page is already isolated, so a leftover of small
@@ -21,10 +27,16 @@ keep the single attempt. Keep the samples stride-aligned after a compound
 page or a taken free page. For MR_COMPACTION a large folio that neither
 gets a target nor splits is a permanent failure of that folio alone
 instead of the end of the pass. Research build only.
+---
+ mm/compaction.c | 80 ++++++++++++++++++++++++++++++++++++++-----------
+ mm/migrate.c    | 10 +++++++
+ 2 files changed, 72 insertions(+), 18 deletions(-)
 
+diff --git a/mm/compaction.c b/mm/compaction.c
+index f9225de..c9bd648 100644
 --- a/mm/compaction.c
 +++ b/mm/compaction.c
-@@ -566,17 +566,30 @@
+@@ -566,17 +566,30 @@ static bool compact_unlock_should_abort(spinlock_t *lock,
  	return false;
  }
  
@@ -57,7 +69,7 @@ instead of the end of the pass. Research build only.
  {
  	int nr_scanned = 0, total_isolated = 0;
  	struct page *page;
-@@ -616,11 +629,19 @@
+@@ -616,11 +629,19 @@ static unsigned long isolate_freepages_block(struct compact_control *cc,
  		if (PageCompound(page)) {
  			const unsigned int order = compound_order(page);
  
@@ -79,7 +91,7 @@ instead of the end of the pass. Research build only.
  			}
  
  			goto isolate_fail;
-@@ -651,13 +672,19 @@
+@@ -651,13 +672,19 @@ static unsigned long isolate_freepages_block(struct compact_control *cc,
  		cc->nr_freepages += isolated;
  		list_add_tail(&page->lru, &freelist[order]);
  
@@ -103,7 +115,7 @@ instead of the end of the pass. Research build only.
  		continue;
  
  isolate_fail:
-@@ -748,7 +775,7 @@
+@@ -748,7 +775,7 @@ isolate_freepages_range(struct compact_control *cc,
  			break;
  
  		isolated = isolate_freepages_block(cc, &isolate_start_pfn,
@@ -112,7 +124,7 @@ instead of the end of the pass. Research build only.
  
  		/*
  		 * In strict mode, isolate_freepages_block() returns 0 if
-@@ -1493,7 +1520,8 @@
+@@ -1493,7 +1520,8 @@ fast_isolate_around(struct compact_control *cc, unsigned long pfn)
  	if (!page)
  		return;
  
@@ -122,7 +134,7 @@ instead of the end of the pass. Research build only.
  
  	/* Skip this pageblock in the future as it's full or nearly full */
  	if (start_pfn == end_pfn && !cc->no_set_skip_hint)
-@@ -1689,9 +1717,10 @@
+@@ -1689,9 +1717,10 @@ static void fast_isolate_freepages(struct compact_control *cc)
  
  /*
   * Based on information in the current compact_control, find blocks
@@ -135,7 +147,7 @@ instead of the end of the pass. Research build only.
  {
  	struct zone *zone = cc->zone;
  	struct page *page;
-@@ -1703,7 +1732,7 @@
+@@ -1703,7 +1732,7 @@ static void isolate_freepages(struct compact_control *cc)
  
  	/* Try a small search of the free lists for a candidate */
  	fast_isolate_freepages(cc);
@@ -144,7 +156,7 @@ instead of the end of the pass. Research build only.
  		return;
  
  	/*
-@@ -1764,7 +1793,8 @@
+@@ -1764,7 +1793,8 @@ static void isolate_freepages(struct compact_control *cc)
  
  		/* Found a block suitable for isolating free pages from. */
  		nr_isolated = isolate_freepages_block(cc, &isolate_start_pfn,
@@ -154,7 +166,7 @@ instead of the end of the pass. Research build only.
  
  		/* Update the skip hint if the full pageblock was scanned */
  		if (isolate_start_pfn == block_end_pfn)
-@@ -1772,7 +1802,8 @@
+@@ -1772,7 +1802,8 @@ static void isolate_freepages(struct compact_control *cc)
  					      pageblock_nr_pages);
  
  		/* Are enough freepages isolated? */
@@ -164,7 +176,7 @@ instead of the end of the pass. Research build only.
  			if (isolate_start_pfn >= block_end_pfn) {
  				/*
  				 * Restart at previous pageblock if more
-@@ -1826,11 +1857,24 @@
+@@ -1826,11 +1857,24 @@ again:
  		if (!list_empty(&cc->freepages[start_order]))
  			break;
  
@@ -192,9 +204,11 @@ instead of the end of the pass. Research build only.
  		has_isolated_pages = true;
  		goto again;
  	}
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 8a64291..1e45a6d 100644
 --- a/mm/migrate.c
 +++ b/mm/migrate.c
-@@ -1945,6 +1945,16 @@
+@@ -1945,6 +1945,16 @@ static int migrate_pages_batch(struct list_head *from,
  						nr_failed--;
  						stats->nr_thp_failed -= is_thp;
  						break;
@@ -211,3 +225,6 @@ instead of the end of the pass. Research build only.
  					}
  				}
  
+-- 
+2.55.0
+

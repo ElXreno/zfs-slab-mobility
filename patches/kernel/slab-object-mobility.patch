@@ -1,4 +1,4 @@
-From f499a27fc6f49d4a3b3c00cee16115895233eeff Mon Sep 17 00:00:00 2001
+From 6836c4de715a4735c69214361bc27348777b3432 Mon Sep 17 00:00:00 2001
 From: ElXreno <elxreno@gmail.com>
 Date: Sat, 15 Aug 2026 18:29:24 +0300
 Subject: [PATCH] mm/slub: let caches relocate their own objects
@@ -66,11 +66,11 @@ mobility is established, which is before the cache has any slabs.
  mm/compaction.c      |  39 +++
  mm/internal.h        |  26 ++
  mm/slab.h            |  18 +-
- mm/slub.c            | 623 ++++++++++++++++++++++++++++++++++++++++++-
- 5 files changed, 768 insertions(+), 5 deletions(-)
+ mm/slub.c            | 632 ++++++++++++++++++++++++++++++++++++++++++-
+ 5 files changed, 777 insertions(+), 5 deletions(-)
 
 diff --git a/include/linux/slab.h b/include/linux/slab.h
-index 739f474..a1bbea9 100644
+index 739f474..bb09d99 100644
 --- a/include/linux/slab.h
 +++ b/include/linux/slab.h
 @@ -482,6 +482,73 @@ __kmem_cache_default_args(const char *name, unsigned int size,
@@ -299,7 +299,7 @@ index 50414bd..76e6efe 100644
  	return false;
  }
 diff --git a/mm/slub.c b/mm/slub.c
-index b2fdb10..75209c0 100644
+index b2fdb10..1ecd29a 100644
 --- a/mm/slub.c
 +++ b/mm/slub.c
 @@ -2710,9 +2710,12 @@ static void *setup_object(struct kmem_cache *s, void *object)
