@@ -1,0 +1,23 @@
+Export the two page cache entry points a cache living in a hidden mapping
+needs: filemap_add_folio is GPL-only and filemap_remove_folio is not
+exported at all. Everything else the ARC folio backend uses has a plain
+export already. Research build only.
+
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -263,6 +263,7 @@ void filemap_remove_folio(struct folio *folio)
+
+ 	filemap_free_folio(mapping, folio);
+ }
++EXPORT_SYMBOL(filemap_remove_folio);
+
+ /*
+  * page_cache_delete_batch - delete several folios from page cache
+@@ -988,7 +989,7 @@ int filemap_add_folio(struct address_space *mapping, struct folio *folio,
+ 	}
+ 	return ret;
+ }
+-EXPORT_SYMBOL_GPL(filemap_add_folio);
++EXPORT_SYMBOL(filemap_add_folio);
+
+ #ifdef CONFIG_NUMA
