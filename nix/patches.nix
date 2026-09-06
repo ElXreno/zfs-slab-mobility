@@ -18,6 +18,7 @@ let
     "no-reclaim-account"
     "mobile-cache-flag"
     "mobile-cache-flag-userspace"
+    "mobile-cache-rcu"
     "abd-page-mobility"
     "abd-reader-gate"
     "abd-relocate"
@@ -30,6 +31,28 @@ let
     "eio-diag"
     "arc-hdr-accounting"
   ];
+
+  # Header relocation on the folio backend; the abd-* series is replaced by the
+  # page cache, which pins, moves and reclaims the data pages itself.
+  arclru = [
+    "dnode-handles-on-linux"
+    "dnode-invalidate-on-construct"
+    "dnode-move-mutex-window"
+    "slab-mobility"
+    "arc-hdr-mobility"
+    "arc-move-counters"
+    "no-reclaim-account"
+    "mobile-cache-flag"
+    "mobile-cache-flag-userspace"
+    "mobile-cache-rcu"
+    "arc-move-disable"
+    "eio-diag"
+    "arc-hdr-accounting"
+    "arc-folio-lru"
+  ];
+
+  # The one probe that still applies on the folio backend.
+  arclruProbes = [ "dbuf-move-probe" ];
 
   # What only answers a question. dbuf-move-probe creates the dbuf cache
   # mobile, and that flag costs the cache its per CPU sheaves and its merging
@@ -51,7 +74,7 @@ let
     "no-kswapd-wake"
   ];
 
-  named = relocation ++ probes ++ alone;
+  named = relocation ++ probes ++ alone ++ [ "arc-folio-lru" ];
 
   byName = builtins.listToAttrs (
     map (name: {
@@ -78,14 +101,20 @@ else
       # The above plus the probes: for the stand.
       withProbes = map zfsFile (relocation ++ probes);
 
+      # The folio backend with the header relocation it keeps: for a machine.
+      arclru = map zfsFile arclru;
+      arclruWithProbes = map zfsFile (arclru ++ arclruProbes);
+
       # Reachable one at a time, for a build that wants a single change.
       each = byName;
 
-      names = { inherit relocation probes alone; };
+      names = { inherit relocation arclru probes alone; };
     };
 
     kernel = {
       slab-object-mobility = kernelFile "slab-object-mobility";
       module-movable-pages = kernelFile "module-movable-pages";
+      filemap-exports = kernelFile "filemap-exports";
+      compaction-large-folio = kernelFile "compaction-large-folio";
     };
   }

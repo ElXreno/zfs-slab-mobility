@@ -22,17 +22,23 @@ let
     {
       slabMobility ? false,
       modulePageMobility ? false,
+      filemapExports ? false,
+      largeFolioCompaction ? false,
       noReclaimAccount ? false,
       slabMobilityZfs ? false,
+      arcLru ? false,
       withProbes ? false,
       noKswapdWake ? false,
       memProfiling ? false,
       kasan ? false,
+      zfsDebug ? false,
     }:
     let
       extraPatches =
         lib.optional slabMobility (kernelPatch "slab-object-mobility")
-        ++ lib.optional modulePageMobility (kernelPatch "module-movable-pages");
+        ++ lib.optional modulePageMobility (kernelPatch "module-movable-pages")
+        ++ lib.optional filemapExports (kernelPatch "filemap-exports")
+        ++ lib.optional largeFolioCompaction (kernelPatch "compaction-large-folio");
 
       # Boot-time shuffling of object and page placement, none of it switchable at runtime.
       deterministic = {
@@ -60,6 +66,12 @@ let
             KASAN = lib.kernel.yes;
             KASAN_GENERIC = lib.kernel.yes;
             KASAN_OUTLINE = lib.kernel.yes;
+            # Folio and list invariants checked where KASAN alone sees only bytes.
+            DEBUG_VM = lib.kernel.yes;
+            DEBUG_LIST = lib.kernel.yes;
+            # Poisons a type safe object after its grace period, which the
+            # relocation callback may still read by contract; see the memory note.
+            SLUB_RCU_DEBUG = lib.kernel.no;
             # ZFS refuses to build against a kernel carrying lockdep:
             # mutex_lock becomes GPL only and configure gives up. Nothing
             # here selects it, but olddefconfig is happy to turn it back
@@ -76,7 +88,9 @@ let
 
       zfsExtra =
         (
-          if slabMobilityZfs then
+          if arcLru then
+            (if withProbes then patches.zfs.arclruWithProbes else patches.zfs.arclru)
+          else if slabMobilityZfs then
             (if withProbes then patches.zfs.withProbes else patches.zfs.relocation)
           else
             lib.optional noReclaimAccount patches.zfs.each.no-reclaim-account
@@ -91,6 +105,8 @@ let
 
         zfs_2_4 = prev.zfs_2_4.overrideAttrs (old: {
           patches = (old.patches or [ ]) ++ zfsExtra;
+          # ASSERTs on, so the read only invariant of joined buffers is checked.
+          configureFlags = (old.configureFlags or [ ]) ++ lib.optional zfsDebug "--enable-debug";
 
           # OpenZFS refuses at configure time to build against a kernel newer
           # than the one it was tested on, and 2.4.3 stops at 7.0, which is
@@ -139,15 +155,26 @@ in
     slabMobilityZfs = true;
   };
 
+  # Header relocation plus clean ARC buffers as folios in the page cache, which
+  # the kernel reclaims and moves itself, so the abd-* series is not applied.
+  arclru = mkVariant {
+    slabMobility = true;
+    filemapExports = true;
+    largeFolioCompaction = true;
+    arcLru = true;
+  };
+
   # Relocation under KASAN. A bad-page report says only that the allocator
   # found damage; KASAN says who freed the object and who touched it after.
   # Slow enough that it is a variant of its own rather than something the
   # measured runs carry.
   kasan = mkVariant {
     slabMobility = true;
-    modulePageMobility = true;
-    slabMobilityZfs = true;
+    filemapExports = true;
+    largeFolioCompaction = true;
+    arcLru = true;
     kasan = true;
+    zfsDebug = true;
   };
 
   # The same, plus the probes. Kept apart because dbuf-move-probe creates its
@@ -155,8 +182,9 @@ in
   # merging, which moves the slab footprint the comparisons above measure.
   probes = mkVariant {
     slabMobility = true;
-    modulePageMobility = true;
-    slabMobilityZfs = true;
+    filemapExports = true;
+    largeFolioCompaction = true;
+    arcLru = true;
     withProbes = true;
   };
 }
