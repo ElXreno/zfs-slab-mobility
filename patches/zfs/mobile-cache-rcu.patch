@@ -1,0 +1,191 @@
+From 6779453d5d45b74a11947242eb440edce6efb244 Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Sun, 6 Sep 2026 02:38:16 +0300
+Subject: [PATCH] spl: make mobile caches type safe by RCU and their callbacks
+ non blocking
+
+The relocation callback is handed an object the allocator believes to be
+live, but nothing stops its owner from freeing it between that decision
+and the callback's first read. KASAN reported exactly this from both
+dnode_move and arc_hdr_move. Validation inside the callback cannot help,
+because the read that validates is the read that is in question.
+
+So the caches that relocate are created SLAB_TYPESAFE_BY_RCU: an object
+freed under the callback keeps its type until the read side ends, the
+free pointer lives outside the object, so the zeroed identity the
+callbacks test for survives the free, and KASAN knows such reads are
+allowed. The allocator wraps the call in rcu_read_lock(), which the
+callbacks have to respect: dnode_move takes os_lock and os->os_lock with
+try variants and answers KMEM_CBRC_LATER when either is held, and
+arc_hdr_move does the same for the multilist sublist through the new
+multilist_sublist_trylock_obj(). A new dnode_move_oslock counter says how
+often that happens.
+---
+ include/sys/dnode.h                  |  2 ++
+ include/sys/multilist.h              |  1 +
+ module/os/linux/spl/spl-kmem-cache.c |  2 ++
+ module/zfs/arc.c                     |  8 +++++++-
+ module/zfs/dnode.c                   | 19 ++++++++++++++++---
+ module/zfs/multilist.c               | 15 +++++++++++++++
+ 6 files changed, 43 insertions(+), 4 deletions(-)
+
+diff --git a/include/sys/dnode.h b/include/sys/dnode.h
+index b9ded73..e63efae 100644
+--- a/include/sys/dnode.h
++++ b/include/sys/dnode.h
+@@ -583,6 +583,7 @@ typedef struct dnode_stats {
+ 	kstat_named_t dnode_move_special;
+ 	kstat_named_t dnode_move_handle;
+ 	kstat_named_t dnode_move_rwlock;
++	kstat_named_t dnode_move_oslock;
+ 	kstat_named_t dnode_move_active;
+ } dnode_stats_t;
+ 
+@@ -614,6 +615,7 @@ typedef struct dnode_sums {
+ 	wmsum_t dnode_move_special;
+ 	wmsum_t dnode_move_handle;
+ 	wmsum_t dnode_move_rwlock;
++	wmsum_t dnode_move_oslock;
+ 	wmsum_t dnode_move_active;
+ } dnode_sums_t;
+ 
+diff --git a/include/sys/multilist.h b/include/sys/multilist.h
+index 2ffdcf8..c859a87 100644
+--- a/include/sys/multilist.h
++++ b/include/sys/multilist.h
+@@ -86,6 +86,7 @@ unsigned int multilist_get_random_index(multilist_t *);
+ void multilist_sublist_lock(multilist_sublist_t *);
+ multilist_sublist_t *multilist_sublist_lock_idx(multilist_t *, unsigned int);
+ multilist_sublist_t *multilist_sublist_lock_obj(multilist_t *, void *);
++multilist_sublist_t *multilist_sublist_trylock_obj(multilist_t *, void *);
+ void multilist_sublist_unlock(multilist_sublist_t *);
+ 
+ void multilist_sublist_insert_head(multilist_sublist_t *, void *);
+diff --git a/module/os/linux/spl/spl-kmem-cache.c b/module/os/linux/spl/spl-kmem-cache.c
+index 493f3cb..5f8ebaf 100644
+--- a/module/os/linux/spl/spl-kmem-cache.c
++++ b/module/os/linux/spl/spl-kmem-cache.c
+@@ -804,6 +804,8 @@ spl_kmem_cache_create(const char *name, size_t size, size_t align,
+ #ifdef SLAB_NO_MERGE
+ 			slabflags |= SLAB_NO_MERGE;
+ #endif
++			/* The move callback may read an object freed under it. */
++			slabflags |= SLAB_TYPESAFE_BY_RCU;
+ 		}
+ 
+ 		skc->skc_linux_cache = kmem_cache_create_usercopy(
+diff --git a/module/zfs/arc.c b/module/zfs/arc.c
+index 3cbb67b..1443d1e 100644
+--- a/module/zfs/arc.c
++++ b/module/zfs/arc.c
+@@ -3562,8 +3562,14 @@ arc_hdr_move(void *buf, void *newbuf, size_t size, void *arg)
+ 	mls = NULL;
+ 	if (multilist_link_active(&hdr->b_l1hdr.b_arc_node)) {
+ 		ASSERT3P(state, !=, arc_anon);
+-		mls = multilist_sublist_lock_obj(
++		/* Never blocks: the allocator calls under an RCU read side. */
++		mls = multilist_sublist_trylock_obj(
+ 		    &state->arcs_list[arc_buf_type(hdr)], hdr);
++		if (mls == NULL) {
++			ARCSTAT_BUMP(arcstat_move_lock_miss);
++			mutex_exit(hash_lock);
++			return (KMEM_CBRC_LATER);
++		}
+ 	}
+ 
+ 	buf_hash_remove(hdr);
+diff --git a/module/zfs/dnode.c b/module/zfs/dnode.c
+index 50477a0..8ac0a36 100644
+--- a/module/zfs/dnode.c
++++ b/module/zfs/dnode.c
+@@ -69,6 +69,7 @@ dnode_stats_t dnode_stats = {
+ 	{ "dnode_move_special",			KSTAT_DATA_UINT64 },
+ 	{ "dnode_move_handle",			KSTAT_DATA_UINT64 },
+ 	{ "dnode_move_rwlock",			KSTAT_DATA_UINT64 },
++	{ "dnode_move_oslock",			KSTAT_DATA_UINT64 },
+ 	{ "dnode_move_active",			KSTAT_DATA_UINT64 },
+ };
+ 
+@@ -316,6 +317,8 @@ dnode_kstats_update(kstat_t *ksp, int rw)
+ 	    wmsum_value(&dnode_sums.dnode_move_handle);
+ 	ds->dnode_move_rwlock.value.ui64 =
+ 	    wmsum_value(&dnode_sums.dnode_move_rwlock);
++	ds->dnode_move_oslock.value.ui64 =
++	    wmsum_value(&dnode_sums.dnode_move_oslock);
+ 	ds->dnode_move_active.value.ui64 =
+ 	    wmsum_value(&dnode_sums.dnode_move_active);
+ 	return (0);
+@@ -357,6 +360,7 @@ dnode_init(void)
+ 	wmsum_init(&dnode_sums.dnode_move_special, 0);
+ 	wmsum_init(&dnode_sums.dnode_move_handle, 0);
+ 	wmsum_init(&dnode_sums.dnode_move_rwlock, 0);
++	wmsum_init(&dnode_sums.dnode_move_oslock, 0);
+ 	wmsum_init(&dnode_sums.dnode_move_active, 0);
+ 
+ 	dnode_ksp = kstat_create("zfs", 0, "dnodestats", "misc",
+@@ -404,6 +408,7 @@ dnode_fini(void)
+ 	wmsum_fini(&dnode_sums.dnode_move_special);
+ 	wmsum_fini(&dnode_sums.dnode_move_handle);
+ 	wmsum_fini(&dnode_sums.dnode_move_rwlock);
++	wmsum_fini(&dnode_sums.dnode_move_oslock);
+ 	wmsum_fini(&dnode_sums.dnode_move_active);
+ 
+ 	kmem_cache_destroy(dnode_cache);
+@@ -1079,9 +1084,13 @@ dnode_move(void *buf, void *newbuf, size_t size, void *arg)
+ 	}
+ 
+ 	/*
+-	 * Ensure that the objset does not go away during the move.
++	 * Ensure that the objset does not go away during the move. Never
++	 * blocks: the caller holds an RCU read side around this call.
+ 	 */
+-	rw_enter(&os_lock, RW_WRITER);
++	if (!rw_tryenter(&os_lock, RW_WRITER)) {
++		DNODE_STAT_BUMP(dnode_move_oslock);
++		return (KMEM_CBRC_LATER);
++	}
+ 	if (os != odn->dn_objset) {
+ 		rw_exit(&os_lock);
+ 		DNODE_STAT_BUMP(dnode_move_recheck1);
+@@ -1093,7 +1102,11 @@ dnode_move(void *buf, void *newbuf, size_t size, void *arg)
+ 	 * valid objset can be freed while we hold os_lock, so we can safely
+ 	 * ensure that the objset remains in use.
+ 	 */
+-	mutex_enter(&os->os_lock);
++	if (!mutex_tryenter(&os->os_lock)) {
++		rw_exit(&os_lock);
++		DNODE_STAT_BUMP(dnode_move_oslock);
++		return (KMEM_CBRC_LATER);
++	}
+ 
+ 	/*
+ 	 * Recheck the objset pointer in case the dnode was removed just before
+diff --git a/module/zfs/multilist.c b/module/zfs/multilist.c
+index 46fb792..337b6cf 100644
+--- a/module/zfs/multilist.c
++++ b/module/zfs/multilist.c
+@@ -304,6 +304,21 @@ multilist_sublist_lock_obj(multilist_t *ml, void *obj)
+ 	return (multilist_sublist_lock_idx(ml, ml->ml_index_func(ml, obj)));
+ }
+ 
++/* Same, without waiting: NULL when the sublist is held by somebody else */
++multilist_sublist_t *
++multilist_sublist_trylock_obj(multilist_t *ml, void *obj)
++{
++	unsigned int sublist_idx = ml->ml_index_func(ml, obj);
++	multilist_sublist_t *mls;
++
++	ASSERT3U(sublist_idx, <, ml->ml_num_sublists);
++	mls = &ml->ml_sublists[sublist_idx];
++	if (!mutex_tryenter(&mls->mls_lock))
++		return (NULL);
++
++	return (mls);
++}
++
+ void
+ multilist_sublist_unlock(multilist_sublist_t *mls)
+ {
+-- 
+2.55.0
+
