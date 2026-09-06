@@ -29,11 +29,15 @@ be handed back to the buddy allocator while the callback is looking at
 it. A slab without a single free object offers no such hold and is left
 alone, which costs nothing: it is also the one that would gain the least.
 
-The callback runs without allocator locks and has to tolerate the object
-having been freed in the meantime, which is what lets the subsystem take
-its own locks and validate what it was given. The signature deliberately
-matches the move callback subsystems already implement for the illumos
-allocator, so existing implementations can be wired up as is.
+The callback runs under an RCU read side and has to tolerate the object
+having been freed in the meantime. Only SLAB_TYPESAFE_BY_RCU caches may
+register: a freed object then keeps its type until the read side ends,
+the free pointer stays outside it, so whatever the destructor left in it
+is what the callback reads, and KASAN knows the read is legitimate. The
+subsystem takes its own locks with their try variants and validates what
+it was given. The signature deliberately matches the move callback
+subsystems already implement for the illumos allocator, so existing
+implementations can be wired up as is.
 
 Accounted caches are refused: the replacement is charged to whoever runs
 the relocation rather than to the owner of the object being moved, and
@@ -95,19 +99,19 @@ index 739f474..a1bbea9 100644
 + * @size: object size, for callbacks shared with other allocators
 + * @private: cookie passed to kmem_cache_setup_mobility()
 + *
-+ * Called without any allocator lock held, so it may sleep and take whatever
-+ * locks the subsystem needs. It must cope with @old having been freed and
-+ * possibly handed out again in the meantime; validating that is the whole
-+ * reason the callback lives in the subsystem and not here. Such an @old is
-+ * still a valid object slot of this cache on a page that cannot go away while
-+ * the callback runs, but its contents are whatever a free left behind, so the
-+ * check has to be one that dead memory cannot pass by accident. Note that
-+ * reading such an object is exactly what KASAN is there to catch, and it will
-+ * report it, as a use after free or as an out of bounds access depending on
-+ * what has happened to the object by the time the report is printed. On
-+ * success the subsystem has repointed everything at @new and must not free
-+ * @old itself, that is done by the allocator. On failure the allocator frees
-+ * @new instead.
++ * Called under an RCU read side, so it must not sleep: locks are taken with
++ * their try variants and a busy one is answered with KMEM_MOVE_LATER, and an
++ * allocation, if there has to be one, is GFP_NOWAIT. It must cope with @old
++ * having been freed and possibly handed out again in the meantime; validating
++ * that is the whole reason the callback lives in the subsystem and not here.
++ * The cache is SLAB_TYPESAFE_BY_RCU, so such an @old is still an object slot
++ * of this cache for as long as the read side lasts, with the free pointer
++ * kept outside it, and its contents are whatever a free left behind: the
++ * check has to be one that dead memory cannot pass by accident. KASAN accepts
++ * these reads as it does from any other RCU type safe cache. On success the
++ * subsystem has repointed everything at @new and must not free @old itself,
++ * that is done by the allocator. On failure the allocator frees @new
++ * instead.
 + *
 + * The signature matches the move callback subsystems already implement for
 + * the illumos allocator, so existing implementations can be wired up as is.
@@ -332,7 +336,7 @@ index b2fdb10..75209c0 100644
  	flush_all_cpus_locked(s);
  
  	/* we might have rcu sheaves in flight */
-@@ -8165,6 +8173,617 @@ void __check_heap_object(const void *ptr, unsigned long n,
+@@ -8165,6 +8173,626 @@ void __check_heap_object(const void *ptr, unsigned long n,
  }
  #endif /* CONFIG_HARDENED_USERCOPY */
  
@@ -458,6 +462,7 @@ index b2fdb10..75209c0 100644
 +	unsigned int claimed = 0, live = 0, moved = 0, i;
 +	void *head, *tail = NULL;
 +	void *p;
++	int rc;
 +
 +	/*
 +	 * Claim what is free on this slab in one atomic step, the same way the
@@ -522,8 +527,10 @@ index b2fdb10..75209c0 100644
 +		 * Account for what the owners have freed since the list was
 +		 * made, as late as possible, so that an object already known
 +		 * to be dead is never handed to the callback. What is left is
-+		 * the window of the call itself, which nothing but blocking
-+		 * every free in the system could close.
++		 * the window of the call itself: an object freed under the
++		 * callback stays typed until the read side ends, because the
++		 * cache is type safe by RCU, and the callback tells such an
++		 * object from a live one on its own. The callback may not block.
 +		 */
 +		if (READ_ONCE(slab->freelist))
 +			claimed += slab_claim_free(s, slab, scratch->map,
@@ -534,8 +541,10 @@ index b2fdb10..75209c0 100644
 +			continue;
 +		}
 +
-+		if (s->move(s, old, new, s->object_size, s->move_private) !=
-+		    KMEM_MOVE_DONE) {
++		rcu_read_lock();
++		rc = s->move(s, old, new, s->object_size, s->move_private);
++		rcu_read_unlock();
++		if (rc != KMEM_MOVE_DONE) {
 +			kmem_cache_free(s, new);
 +			continue;
 +		}
@@ -770,10 +779,14 @@ index b2fdb10..75209c0 100644
 +		return -EINVAL;
 +
 +	/*
-+	 * Objects of such a cache stay valid past their free and may be
-+	 * examined by a lockless reader, so nothing may relocate them.
++	 * The callback can be handed an object its owner freed a moment ago:
++	 * liveness is read off the slab before the call and nothing stops a
++	 * free during it. Type safety by RCU is what makes that read defined,
++	 * keeps the free pointer out of the object and tells KASAN the object
++	 * is still accessible. Such a cache must in turn have no lockless
++	 * readers of its own, since relocation would move objects under them.
 +	 */
-+	if (s->flags & SLAB_TYPESAFE_BY_RCU)
++	if (!(s->flags & SLAB_TYPESAFE_BY_RCU))
 +		return -EINVAL;
 +
 +	/*
