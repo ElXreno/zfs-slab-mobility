@@ -59,6 +59,7 @@ let
   # series as well, which is why it is not repeated here.
   alone = [
     "no-kswapd-wake"
+    "arc-lru-deadlock-inject"
   ];
 
   named = relocation ++ probes ++ alone ++ [ "arc-folio-lru" ];

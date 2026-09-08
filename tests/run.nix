@@ -68,6 +68,16 @@
   compactTwice ? false,
   compactRounds ? 12,
   compactSeconds ? 90,
+  # Anonymous memory held for the whole compact phase, so a folio that has to
+  # move finds no free block of its order and the kernel splits it instead.
+  hogWhileCompacting ? 0,
+  # A floor the ARC may not give way below while that hog runs.
+  arcPinMB ? 0,
+  # Readers during the compact phase, in threads rather than one at a time.
+  readerJobs ? 0,
+  # Reclaim meets a chunk of the header's other buffer already locked, which
+  # is what a migration batch does on its own only rarely.
+  holdOtherInject ? false,
   files ? 50000,
   fileSize ? 131072,
   memoryMB ? 6144,
@@ -156,7 +166,9 @@ in
     environment.systemPackages = [
       fragload
     ]
-    ++ lib.optional (anonHogMB > 0 || soakSeconds > 0 || verifyAfter) fragcheck;
+    ++ lib.optional (
+      anonHogMB > 0 || soakSeconds > 0 || verifyAfter || hogWhileCompacting > 0
+    ) fragcheck;
 
     documentation.enable = false;
     services.udisks2.enable = false;
@@ -185,6 +197,8 @@ in
     machine.wait_for_unit("multi-user.target")
 
     machine.succeed("modprobe zfs")
+    if ${if holdOtherInject then "True" else "False"}:
+        machine.succeed("echo 1 > /sys/module/zfs/parameters/zfs_abd_lru_hold_other")
     if ${if arcMoveDisable then "True" else "False"}:
         machine.succeed("echo 1 > /sys/module/zfs/parameters/zfs_arc_move_disable")
     machine.succeed("modprobe slabwho")
@@ -287,7 +301,10 @@ in
     def kernel_is_quiet(where):
         said = machine.succeed(
             "dmesg | grep -E 'BUG:|Oops:|kernel BUG at|list_del corruption"
-            "|list_add corruption|refcount_t' || true"
+            "|list_add corruption|refcount_t"
+            "${lib.optionalString (hungTaskSeconds > 0)
+              "|blocked for more than|blocked in I/O wait|blocked on a mutex"
+            }' || true"
         )
         assert not said.strip(), f"the kernel complained during {where}:\n{said}"
 
@@ -534,8 +551,23 @@ in
                 " fragload -mode hot -dir /tank/data/set"
                 " -files ${toString files} -size ${toString fileSize}"
                 " -seed ${toString seed} -slice ${toString hotFiles}"
+                "${lib.optionalString (readerJobs > 0) " -jobs ${toString readerJobs}"}"
                 " -secs ${toString compactSeconds}"
             )
+
+            if ${toString arcPinMB} > 0:
+                machine.succeed(
+                    "echo ${toString (arcPinMB * 1024 * 1024)} >"
+                    " /sys/module/zfs/parameters/zfs_arc_min"
+                )
+
+            if ${toString hogWhileCompacting} > 0:
+                machine.succeed(
+                    "systemd-run --unit=compact-hog --collect"
+                    " fragcheck -mode hog -mb ${toString hogWhileCompacting}"
+                    " -secs ${toString compactSeconds}"
+                )
+                load_is_running("compact-hog")
 
             # Deliberately not succeed(). Writing here runs compaction in the
             # caller's own context, so the corruption being looked for kills
@@ -553,6 +585,10 @@ in
                 kernel_is_quiet(f"compaction round {round} against a busy ARC")
 
             machine.succeed("systemctl stop abd-readers || true")
+            if ${toString hogWhileCompacting} > 0:
+                machine.succeed("systemctl stop compact-hog || true")
+            if ${toString arcPinMB} > 0:
+                machine.succeed("echo 0 > /sys/module/zfs/parameters/zfs_arc_min")
             kernel_is_quiet("compaction with a full ARC")
 
             dbuf_delta = {r: dbufstat(r) - dbuf_before[r] for r in dbuf_reasons}
@@ -941,15 +977,15 @@ in
           ''
         )}
 
-    kernel_is_quiet("the run")${lib.optionalString (hungTaskSeconds > 0) (
+    kernel_is_quiet("the run")${lib.optionalString holdOtherInject (
       "\n"
       + ''
-        # A task that stops instead of failing is only visible here.
-        stuck = machine.succeed(
-            "dmesg | grep -E 'blocked for more than|blocked on a mutex"
-            "|hung_task' || true"
+        busy = arcstat("lru_evict_busy")
+        print(f"reclaim refused {busy} times with the other buffer held")
+        assert busy > 0, (
+            "no eviction met the held chunk, so the guard was never asked and"
+            " a run that passes here proves nothing"
         )
-        assert not stuck.strip(), f"a task hung during the run:\n{stuck}"
       ''
     )}${lib.optionalString (anonHogMB > 0 || soakSeconds > 0) (
       "\n"

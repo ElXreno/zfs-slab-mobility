@@ -28,6 +28,7 @@ let
       arcLru ? false,
       withProbes ? false,
       noKswapdWake ? false,
+      deadlockInject ? false,
       memProfiling ? false,
       kasan ? false,
       zfsDebug ? false,
@@ -93,7 +94,8 @@ let
           else
             lib.optional noReclaimAccount patches.zfs.each.no-reclaim-account
         )
-        ++ lib.optional noKswapdWake patches.zfs.each.no-kswapd-wake;
+        ++ lib.optional noKswapdWake patches.zfs.each.no-kswapd-wake
+        ++ lib.optional deadlockInject patches.zfs.each.arc-lru-deadlock-inject;
 
       packages = pkgs.linuxPackagesFor kernel;
     in
@@ -161,6 +163,17 @@ in
     largeFolioCompaction = true;
     arcLru = true;
     kasan = true;
+    zfsDebug = true;
+  };
+
+  # The backend plus the knob that makes a reclaimer meet a chunk of the other
+  # buffer already locked. Debug build: the knob exists only there.
+  inject = mkVariant {
+    slabMobility = true;
+    filemapExports = true;
+    largeFolioCompaction = true;
+    arcLru = true;
+    deadlockInject = true;
     zfsDebug = true;
   };
 

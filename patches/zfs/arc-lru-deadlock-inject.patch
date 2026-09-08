@@ -1,0 +1,133 @@
+From e4d2e364328196ade6802c6b1ef9445dab0ea0f4 Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Tue, 8 Sep 2026 08:21:08 +0300
+Subject: [PATCH] abd: hold a chunk of the other buffer across reclaim, for
+ tests
+
+---
+ include/os/linux/zfs/sys/abd_os.h |  4 ++++
+ module/os/linux/zfs/abd_os.c      | 35 +++++++++++++++++++++++++++
+ module/zfs/arc.c                  | 39 +++++++++++++++++++++++++++++++
+ 3 files changed, 78 insertions(+)
+
+diff --git a/include/os/linux/zfs/sys/abd_os.h b/include/os/linux/zfs/sys/abd_os.h
+index 4ad6782..06e89ce 100644
+--- a/include/os/linux/zfs/sys/abd_os.h
++++ b/include/os/linux/zfs/sys/abd_os.h
+@@ -66,6 +66,10 @@ struct abd *abd_alloc_from_pages(struct page **, unsigned long, uint64_t);
+ struct abd_iter;
+ void abd_lru_hold_page(struct page *);
+ void abd_lru_drop_page(struct page *);
++#ifdef ZFS_DEBUG
++struct folio *abd_lru_test_hold(struct abd *);
++void abd_lru_test_drop(struct folio *);
++#endif
+ void abd_iter_page_release(struct abd_iter *);
+ 
+ #ifdef __cplusplus
+diff --git a/module/os/linux/zfs/abd_os.c b/module/os/linux/zfs/abd_os.c
+index 59fbfe0..60c7dd5 100644
+--- a/module/os/linux/zfs/abd_os.c
++++ b/module/os/linux/zfs/abd_os.c
+@@ -670,6 +670,41 @@ abd_lru_drop_page(struct page *page)
+ 		folio_put(page_folio(page));
+ }
+ 
++#ifdef ZFS_DEBUG
++/*
++ * Holds one chunk the way a migration batch holds it, so that a free path
++ * waiting for a folio lock is caught by a test rather than by a machine.
++ */
++struct folio *
++abd_lru_test_hold(abd_t *abd)
++{
++	struct scatterlist *sg;
++	struct folio *folio;
++
++	if (abd == NULL || !abd_is_lru(abd) || ABD_SCATTER(abd).abd_nents == 0)
++		return (NULL);
++
++	sg = ABD_SCATTER(abd).abd_sgl;
++	folio = abd_sg_grab(sg);
++	if (folio_trylock(folio)) {
++		if (likely(sg_page(sg) == &folio->page))
++			return (folio);
++		folio_unlock(folio);
++	}
++	folio_put(folio);
++	return (NULL);
++}
++
++void
++abd_lru_test_drop(struct folio *folio)
++{
++	if (folio == NULL)
++		return;
++	folio_unlock(folio);
++	folio_put(folio);
++}
++#endif
++
+ static pgoff_t
+ abd_lru_index(unsigned int order)
+ {
+diff --git a/module/zfs/arc.c b/module/zfs/arc.c
+index 9f82b3a..2208050 100644
+--- a/module/zfs/arc.c
++++ b/module/zfs/arc.c
+@@ -4190,9 +4190,43 @@ arc_lru_evict(void *arg, abd_t *abd)
+ 	return (B_TRUE);
+ }
+ 
++#if defined(_KERNEL) && defined(__linux__) && defined(ZFS_DEBUG)
++/*
++ * Takes a chunk of the header's other buffer the way a migration batch holds
++ * one, which is the shape of the hang a reclaimer that waits for a folio lock
++ * ends in. Off unless a test asks for it.
++ */
++static int zfs_abd_lru_hold_other = 0;
++
++static boolean_t
++arc_lru_evict_inject(void *arg, abd_t *abd)
++{
++	arc_buf_hdr_t *hdr = arg;
++	struct folio *held = NULL;
++	boolean_t rv;
++
++	if (zfs_abd_lru_hold_other && HDR_HAS_L1HDR(hdr)) {
++		abd_t *inj = (hdr->b_l1hdr.b_pabd != NULL &&
++		    hdr->b_l1hdr.b_pabd != abd) ? hdr->b_l1hdr.b_pabd :
++		    (HDR_HAS_RABD(hdr) && hdr->b_crypt_hdr.b_rabd != abd) ?
++		    hdr->b_crypt_hdr.b_rabd : NULL;
++
++		held = abd_lru_test_hold(inj);
++	}
++
++	rv = arc_lru_evict(arg, abd);
++	abd_lru_test_drop(held);
++	return (rv);
++}
++#endif
++
+ static const abd_lru_ops_t arc_lru_ops = {
+ 	.lru_lock = arc_lru_lock,
++#if defined(_KERNEL) && defined(__linux__) && defined(ZFS_DEBUG)
++	.lru_evict = arc_lru_evict_inject,
++#else
+ 	.lru_evict = arc_lru_evict,
++#endif
+ };
+ 
+ /*
+@@ -11713,3 +11747,8 @@ ZFS_MODULE_PARAM(zfs_arc, zfs_arc_, evict_threads, UINT, ZMOD_RD,
+ 
+ ZFS_MODULE_PARAM(zfs_arc, zfs_arc_, move_disable, INT, ZMOD_RW,
+ 	"Refuse every header relocation without inspecting the header.");
++
++#if defined(_KERNEL) && defined(__linux__) && defined(ZFS_DEBUG)
++ZFS_MODULE_PARAM(zfs_arc, zfs_abd_, lru_hold_other, INT, ZMOD_RW,
++	"Hold a chunk of the header's other buffer across reclaim, for tests.");
++#endif
+-- 
+2.55.0
+

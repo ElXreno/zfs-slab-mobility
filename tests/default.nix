@@ -371,10 +371,29 @@ let
       encrypted = true;
       compactWhileWarm = true;
       compactRounds = 30;
+      compactSeconds = 300;
+      readerJobs = 4;
+      # No free block of the order left for a folio that has to move, so the
+      # kernel splits it instead.
+      hogWhileCompacting = 2048;
+      arcPinMB = 3072;
       anonHogMB = 3072;
       expectSwap = false;
       hungTaskSeconds = 20;
       verifyAfter = true;
+    };
+
+    # The same collision made deterministic: a chunk of the header's other
+    # buffer is held while reclaim frees it.
+    arc-lru-deadlock = mkRun {
+      variant = "inject";
+      seed = 1;
+      cores = 2;
+      encrypted = true;
+      holdOtherInject = true;
+      anonHogMB = 3072;
+      expectSwap = false;
+      hungTaskSeconds = 20;
     };
 
     # The hog and the byte check on a raidz, so column ABDs and reconstruction
