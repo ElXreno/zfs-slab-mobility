@@ -362,6 +362,21 @@ let
       verifyAfter = true;
     };
 
+    # An encrypted header carries two buffers and eviction frees both, so the
+    # reclaimer has to hold the chunks of both before it decides.
+    arc-lru-crypt = mkRun {
+      variant = "arclru";
+      seed = 1;
+      cores = 4;
+      encrypted = true;
+      compactWhileWarm = true;
+      compactRounds = 30;
+      anonHogMB = 3072;
+      expectSwap = false;
+      hungTaskSeconds = 20;
+      verifyAfter = true;
+    };
+
     # The hog and the byte check on a raidz, so column ABDs and reconstruction
     # run beside joined buffers.
     arc-lru-raidz = mkRun {

@@ -74,6 +74,9 @@
   # One vCPU unless a run needs contention: per-CPU allocator lists on four
   # cost separation eleven percent of spread between two runs, one costs two.
   cores ? 1,
+  # A deadlock leaves the counters and every phase below untouched, so the run
+  # has to be told to look for tasks that stopped rather than failed.
+  hungTaskSeconds ? 0,
   diskMB ? 24000,
   arcFloorMB ? 512,
   quietSeconds ? 60,
@@ -142,6 +145,10 @@ in
       # The test driver panics the guest on OOM; a hog run wants the counters instead.
       // lib.optionalAttrs (anonHogMB > 0 || soakSeconds > 0) {
         "vm.panic_on_oom" = lib.mkForce 0;
+      }
+      // lib.optionalAttrs (hungTaskSeconds > 0) {
+        "kernel.hung_task_timeout_secs" = lib.mkForce hungTaskSeconds;
+        "kernel.hung_task_warnings" = 1000;
       };
     };
 
@@ -934,7 +941,17 @@ in
           ''
         )}
 
-    kernel_is_quiet("the run")${lib.optionalString (anonHogMB > 0 || soakSeconds > 0) (
+    kernel_is_quiet("the run")${lib.optionalString (hungTaskSeconds > 0) (
+      "\n"
+      + ''
+        # A task that stops instead of failing is only visible here.
+        stuck = machine.succeed(
+            "dmesg | grep -E 'blocked for more than|blocked on a mutex"
+            "|hung_task' || true"
+        )
+        assert not stuck.strip(), f"a task hung during the run:\n{stuck}"
+      ''
+    )}${lib.optionalString (anonHogMB > 0 || soakSeconds > 0) (
       "\n"
       + ''
         with subtest("unload"):
@@ -958,6 +975,11 @@ in
 }
 // lib.optionalAttrs (soakSeconds > 0) {
   globalTimeout = 3600 + soakSeconds;
+}
+# A run watching for a deadlock reports one by not finishing, so it may not
+# take the default hour to say so.
+// lib.optionalAttrs (hungTaskSeconds > 0 && soakSeconds == 0) {
+  globalTimeout = 1200;
 })).overrideTestDerivation
   (_: {
     allowSubstitutes = false;
