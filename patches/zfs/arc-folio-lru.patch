@@ -1,4 +1,4 @@
-From b7fe46f375bfe2b8c1bd46521ad8207fdac575cb Mon Sep 17 00:00:00 2001
+From 047fc3e29a926787e21ac2bf245859a2cf3ed186 Mon Sep 17 00:00:00 2001
 From: ElXreno <elxreno@gmail.com>
 Date: Sun, 6 Sep 2026 01:56:17 +0300
 Subject: [PATCH] abd: keep clean ARC buffers as folios in the page cache
@@ -30,22 +30,22 @@ because a cached address would go stale when the folio moved.
 Needs filemap_add_folio and filemap_remove_folio exported to a CDDL module;
 configure falls back to the stock backend where they are not.
 ---
- config/kernel-arc-lru.m4          |  89 ++++
+ config/kernel-arc-lru.m4          |  89 +++
  config/kernel.m4                  |   2 +
  include/os/linux/zfs/sys/abd_os.h |   9 +
- include/sys/abd.h                 |  18 +
+ include/sys/abd.h                 |  21 +
  include/sys/abd_impl.h            |   4 +
- include/sys/arc_impl.h            |  12 +
+ include/sys/arc_impl.h            |  14 +
  include/sys/multilist.h           |   1 +
- lib/libzpool/abd_os.c             |  24 +
- module/os/freebsd/zfs/abd_os.c    |  24 +
- module/os/linux/zfs/abd_os.c      | 765 +++++++++++++++++++++++++++++-
+ lib/libzpool/abd_os.c             |  37 ++
+ module/os/freebsd/zfs/abd_os.c    |  37 ++
+ module/os/linux/zfs/abd_os.c      | 913 +++++++++++++++++++++++++++++-
  module/os/linux/zfs/arc_os.c      |   8 +
  module/os/linux/zfs/vdev_disk.c   |  23 +
  module/zfs/abd.c                  |  12 +-
- module/zfs/arc.c                  | 136 +++++-
+ module/zfs/arc.c                  | 159 +++++-
  module/zfs/multilist.c            |  10 +
- 15 files changed, 1134 insertions(+), 3 deletions(-)
+ 15 files changed, 1336 insertions(+), 3 deletions(-)
  create mode 100644 config/kernel-arc-lru.m4
 
 diff --git a/config/kernel-arc-lru.m4 b/config/kernel-arc-lru.m4
@@ -196,7 +196,7 @@ index 8c4d5b7..4ad6782 100644
  }
  #endif
 diff --git a/include/sys/abd.h b/include/sys/abd.h
-index 41cdb26..d565e27 100644
+index 41cdb26..db2ac46 100644
 --- a/include/sys/abd.h
 +++ b/include/sys/abd.h
 @@ -31,6 +31,19 @@
@@ -219,15 +219,16 @@ index 41cdb26..d565e27 100644
  #include <sys/abd_os.h>
  
  #ifdef __cplusplus
-@@ -48,6 +61,7 @@ typedef enum abd_flags {
+@@ -48,6 +61,8 @@ typedef enum abd_flags {
  	ABD_FLAG_GANG_FREE	= 1 << 7, /* gang ABD is responsible for mem */
  	ABD_FLAG_ALLOCD		= 1 << 8, /* we allocated the abd_t */
  	ABD_FLAG_FROM_PAGES	= 1 << 9, /* does not own pages */
 +	ABD_FLAG_LRU		= 1 << 10, /* pages sit in the kernel page cache */
++	ABD_FLAG_PRELOCKED	= 1 << 11, /* every chunk locked by this task */
  } abd_flags_t;
  
  typedef struct abd {
-@@ -97,6 +111,10 @@ abd_t *abd_get_zeros(size_t);
+@@ -97,6 +112,12 @@ abd_t *abd_get_zeros(size_t);
  abd_t *abd_get_from_buf(void *, size_t);
  abd_t *abd_get_from_buf_struct(abd_t *, void *, size_t);
  void abd_cache_reap_now(void);
@@ -235,6 +236,8 @@ index 41cdb26..d565e27 100644
 +void abd_lru_rebind(abd_t *, void *);
 +void abd_lru_touch(abd_t *);
 +uint64_t abd_lru_bytes(void);
++boolean_t abd_lru_try_prelock(abd_t *);
++void abd_lru_prelock_release(abd_t *);
  
  /*
   * Conversion to and from a normal buffer
@@ -261,10 +264,10 @@ index 6cf0984..999a849 100644
  
  extern abd_t *abd_zero_scatter;
 diff --git a/include/sys/arc_impl.h b/include/sys/arc_impl.h
-index bbc67b2..cedec70 100644
+index bbc67b2..7c1c9a1 100644
 --- a/include/sys/arc_impl.h
 +++ b/include/sys/arc_impl.h
-@@ -585,6 +585,14 @@ typedef struct arc_stats {
+@@ -585,6 +585,15 @@ typedef struct arc_stats {
  	 * rather than as a first-match, because a header commonly hits more
  	 * than one at once and the overlap is the interesting part.
  	 */
@@ -276,10 +279,11 @@ index bbc67b2..cedec70 100644
 +	kstat_named_t arcstat_lru_evict_bytes;
 +	kstat_named_t arcstat_lru_evict_skip;
 +	kstat_named_t arcstat_lru_evict_held;
++	kstat_named_t arcstat_lru_evict_busy;
  	kstat_named_t arcstat_move_relocated;
  	kstat_named_t arcstat_move_not_live;
  	kstat_named_t arcstat_move_raced;
-@@ -964,6 +972,10 @@ typedef struct arc_sums {
+@@ -964,6 +973,11 @@ typedef struct arc_sums {
  	wmsum_t arcstat_evict_l2_eligible_mru;
  	wmsum_t arcstat_evict_l2_ineligible;
  	wmsum_t arcstat_evict_l2_skip;
@@ -287,6 +291,7 @@ index bbc67b2..cedec70 100644
 +	wmsum_t arcstat_lru_evict_bytes;
 +	wmsum_t arcstat_lru_evict_skip;
 +	wmsum_t arcstat_lru_evict_held;
++	wmsum_t arcstat_lru_evict_busy;
  	wmsum_t arcstat_move_relocated;
  	wmsum_t arcstat_move_not_live;
  	wmsum_t arcstat_move_raced;
@@ -303,10 +308,10 @@ index c859a87..24f7e79 100644
  
  void multilist_sublist_insert_head(multilist_sublist_t *, void *);
 diff --git a/lib/libzpool/abd_os.c b/lib/libzpool/abd_os.c
-index 8bd7a64..3d0af0a 100644
+index 8bd7a64..e17cbb4 100644
 --- a/lib/libzpool/abd_os.c
 +++ b/lib/libzpool/abd_os.c
-@@ -365,6 +365,30 @@ abd_cache_reap_now(void)
+@@ -365,6 +365,43 @@ abd_cache_reap_now(void)
  {
  }
  
@@ -334,14 +339,27 @@ index 8bd7a64..3d0af0a 100644
 +	return (0);
 +}
 +
++boolean_t
++abd_lru_try_prelock(abd_t *abd)
++{
++	(void) abd;
++	return (B_TRUE);
++}
++
++void
++abd_lru_prelock_release(abd_t *abd)
++{
++	(void) abd;
++}
++
  /*
   * Borrow a raw buffer from an ABD without copying the contents of the ABD
   * into the buffer. If the ABD is scattered, this will alloate a raw buffer
 diff --git a/module/os/freebsd/zfs/abd_os.c b/module/os/freebsd/zfs/abd_os.c
-index 4bf487c..4b15fa4 100644
+index 4bf487c..12333d4 100644
 --- a/module/os/freebsd/zfs/abd_os.c
 +++ b/module/os/freebsd/zfs/abd_os.c
-@@ -586,6 +586,30 @@ abd_cache_reap_now(void)
+@@ -586,6 +586,43 @@ abd_cache_reap_now(void)
  	kmem_cache_reap_soon(abd_chunk_cache);
  }
  
@@ -369,11 +387,24 @@ index 4bf487c..4b15fa4 100644
 +	return (0);
 +}
 +
++boolean_t
++abd_lru_try_prelock(abd_t *abd)
++{
++	(void) abd;
++	return (B_TRUE);
++}
++
++void
++abd_lru_prelock_release(abd_t *abd)
++{
++	(void) abd;
++}
++
  /*
   * Borrow a raw buffer from an ABD without copying the contents of the ABD
   * into the buffer. If the ABD is scattered, this will alloate a raw buffer
 diff --git a/module/os/linux/zfs/abd_os.c b/module/os/linux/zfs/abd_os.c
-index 2fd3c3f..bd921b8 100644
+index 2fd3c3f..59fbfe0 100644
 --- a/module/os/linux/zfs/abd_os.c
 +++ b/module/os/linux/zfs/abd_os.c
 @@ -64,6 +64,14 @@
@@ -406,7 +437,7 @@ index 2fd3c3f..bd921b8 100644
  typedef struct abd_stats {
  	kstat_named_t abdstat_struct_size;
  	kstat_named_t abdstat_linear_cnt;
-@@ -83,6 +99,18 @@ typedef struct abd_stats {
+@@ -83,6 +99,19 @@ typedef struct abd_stats {
  	kstat_named_t abdstat_scatter_page_multi_zone;
  	kstat_named_t abdstat_scatter_page_alloc_retry;
  	kstat_named_t abdstat_scatter_sg_table_retry;
@@ -418,6 +449,7 @@ index 2fd3c3f..bd921b8 100644
 +	kstat_named_t abdstat_lru_release_busy;
 +	kstat_named_t abdstat_lru_release_lock_miss;
 +	kstat_named_t abdstat_lru_release_refused;
++	kstat_named_t abdstat_lru_prelock_busy;
 +	kstat_named_t abdstat_page_isolate_asked;
 +	kstat_named_t abdstat_page_migrated;
 +	kstat_named_t abdstat_page_migrate_busy;
@@ -425,7 +457,7 @@ index 2fd3c3f..bd921b8 100644
  } abd_stats_t;
  
  static abd_stats_t abd_stats = {
-@@ -137,6 +165,21 @@ static abd_stats_t abd_stats = {
+@@ -137,6 +166,23 @@ static abd_stats_t abd_stats = {
  	 *  allocate the sg table for an ABD.
  	 */
  	{ "scatter_sg_table_retry",		KSTAT_DATA_UINT64 },
@@ -439,6 +471,8 @@ index 2fd3c3f..bd921b8 100644
 +	{ "lru_release_busy",			KSTAT_DATA_UINT64 },
 +	{ "lru_release_lock_miss",		KSTAT_DATA_UINT64 },
 +	{ "lru_release_refused",		KSTAT_DATA_UINT64 },
++	/* A second buffer of the same owner could not be taken along. */
++	{ "lru_prelock_busy",			KSTAT_DATA_UINT64 },
 +	/* Compaction asked to move a chunk: moved, or refused for its references. */
 +	{ "page_isolate_asked",			KSTAT_DATA_UINT64 },
 +	{ "page_migrated",			KSTAT_DATA_UINT64 },
@@ -447,7 +481,7 @@ index 2fd3c3f..bd921b8 100644
  };
  
  static struct {
-@@ -151,6 +194,18 @@ static struct {
+@@ -151,6 +197,19 @@ static struct {
  	wmsum_t abdstat_scatter_page_multi_zone;
  	wmsum_t abdstat_scatter_page_alloc_retry;
  	wmsum_t abdstat_scatter_sg_table_retry;
@@ -459,6 +493,7 @@ index 2fd3c3f..bd921b8 100644
 +	wmsum_t abdstat_lru_release_busy;
 +	wmsum_t abdstat_lru_release_lock_miss;
 +	wmsum_t abdstat_lru_release_refused;
++	wmsum_t abdstat_lru_prelock_busy;
 +	wmsum_t abdstat_page_isolate_asked;
 +	wmsum_t abdstat_page_migrated;
 +	wmsum_t abdstat_page_migrate_busy;
@@ -466,7 +501,7 @@ index 2fd3c3f..bd921b8 100644
  } abd_sums;
  
  #define	abd_for_each_sg(abd, sg, n, i)	\
-@@ -255,7 +310,105 @@ abd_unmark_zfs_page(struct page *page)
+@@ -255,7 +314,105 @@ abd_unmark_zfs_page(struct page *page)
  #define	abd_unmark_zfs_page(page)
  #endif /* _LP64 */
  
@@ -573,7 +608,7 @@ index 2fd3c3f..bd921b8 100644
  
  /*
   * The goal is to minimize fragmentation by preferentially populating ABDs
-@@ -424,6 +577,515 @@ abd_alloc_chunks(abd_t *abd, size_t size)
+@@ -424,6 +581,655 @@ abd_alloc_chunks(abd_t *abd, size_t size)
  }
  #endif /* !CONFIG_HIGHMEM */
  
@@ -697,6 +732,126 @@ index 2fd3c3f..bd921b8 100644
 +	}
 +}
 +
++/*
++ * Whoever frees a buffer from inside reclaim may not wait for a folio lock:
++ * the folios the caller already holds are unknown here, and one of them may
++ * well be the next chunk. Debug builds keep the reclaiming tasks on a list so
++ * that any path reaching the waiting branch is caught in the stand instead of
++ * on a machine.
++ */
++#ifdef ZFS_DEBUG
++#define	ABD_LRU_RECLAIMERS	64
++static struct task_struct *abd_lru_reclaimers[ABD_LRU_RECLAIMERS];
++static DEFINE_SPINLOCK(abd_lru_reclaimers_lock);
++
++static void
++abd_lru_reclaim_enter(void)
++{
++	unsigned long flags;
++	int i;
++
++	spin_lock_irqsave(&abd_lru_reclaimers_lock, flags);
++	for (i = 0; i < ABD_LRU_RECLAIMERS; i++) {
++		if (abd_lru_reclaimers[i] == NULL) {
++			abd_lru_reclaimers[i] = current;
++			break;
++		}
++	}
++	spin_unlock_irqrestore(&abd_lru_reclaimers_lock, flags);
++}
++
++static void
++abd_lru_reclaim_exit(void)
++{
++	unsigned long flags;
++	int i;
++
++	spin_lock_irqsave(&abd_lru_reclaimers_lock, flags);
++	for (i = 0; i < ABD_LRU_RECLAIMERS; i++) {
++		if (abd_lru_reclaimers[i] == current) {
++			abd_lru_reclaimers[i] = NULL;
++			break;
++		}
++	}
++	spin_unlock_irqrestore(&abd_lru_reclaimers_lock, flags);
++}
++
++static boolean_t
++abd_lru_in_reclaim(void)
++{
++	unsigned long flags;
++	boolean_t found = B_FALSE;
++	int i;
++
++	spin_lock_irqsave(&abd_lru_reclaimers_lock, flags);
++	for (i = 0; i < ABD_LRU_RECLAIMERS; i++) {
++		if (abd_lru_reclaimers[i] == current) {
++			found = B_TRUE;
++			break;
++		}
++	}
++	spin_unlock_irqrestore(&abd_lru_reclaimers_lock, flags);
++	return (found);
++}
++#else
++#define	abd_lru_reclaim_enter()
++#define	abd_lru_reclaim_exit()
++#define	abd_lru_in_reclaim()	(B_FALSE)
++#endif
++
++/*
++ * Takes every chunk of a buffer the reclaimer is about to free along with the
++ * one it was called on: an owner frees all of its buffers in one go, and by
++ * then nothing may block. Refusing costs only the folio staying where it is.
++ */
++boolean_t
++abd_lru_try_prelock(abd_t *abd)
++{
++	struct scatterlist *sg = NULL;
++	int i = 0;
++
++	if (abd == NULL || !abd_is_lru(abd))
++		return (B_TRUE);
++
++	ASSERT(!abd_is_linear(abd));
++
++	if (!mutex_tryenter(&abd->abd_mtx)) {
++		ABDSTAT_BUMP(abdstat_lru_prelock_busy);
++		return (B_FALSE);
++	}
++
++	abd_for_each_sg(abd, sg, ABD_SCATTER(abd).abd_nents, i) {
++		struct folio *sib = abd_sg_grab(sg);
++
++		if (folio_trylock(sib)) {
++			if (likely(sg_page(sg) == &sib->page))
++				continue;
++			folio_unlock(sib);
++		}
++		folio_put(sib);
++		abd_lru_unlock_siblings(abd, NULL, i);
++		mutex_exit(&abd->abd_mtx);
++		ABDSTAT_BUMP(abdstat_lru_prelock_busy);
++		return (B_FALSE);
++	}
++
++	abd->abd_flags |= ABD_FLAG_PRELOCKED;
++	return (B_TRUE);
++}
++
++/* Undoes a prelock the owner ended up not freeing. */
++void
++abd_lru_prelock_release(abd_t *abd)
++{
++	if (abd == NULL || !(abd->abd_flags & ABD_FLAG_PRELOCKED))
++		return;
++
++	ASSERT(MUTEX_HELD(&abd->abd_mtx));
++	abd->abd_flags &= ~ABD_FLAG_PRELOCKED;
++	abd_lru_unlock_siblings(abd, NULL, ABD_SCATTER(abd).abd_nents);
++	mutex_exit(&abd->abd_mtx);
++}
++
 +static bool
 +abd_lru_release_folio(struct folio *folio, gfp_t gfp)
 +{
@@ -770,8 +925,12 @@ index 2fd3c3f..bd921b8 100644
 +	 * still there.
 +	 */
 +	ABD_SCATTER(abd).abd_reclaiming = folio;
++	abd->abd_flags |= ABD_FLAG_PRELOCKED;
++	abd_lru_reclaim_enter();
 +	(void) ops->lru_evict(arg, abd);
++	abd_lru_reclaim_exit();
 +	if (folio_test_private(folio)) {
++		abd->abd_flags &= ~ABD_FLAG_PRELOCKED;
 +		ABD_SCATTER(abd).abd_reclaiming = NULL;
 +		abd_lru_unlock_siblings(abd, folio, ABD_SCATTER(abd).abd_nents);
 +		mutex_exit(&abd->abd_mtx);
@@ -903,16 +1062,17 @@ index 2fd3c3f..bd921b8 100644
 +}
 +
 +/*
-+ * Called with abd_mtx held when the reclaimer is the one freeing, in which
-+ * case abd_reclaiming names the folio it holds locked and every other chunk
-+ * is already referenced and locked by it: the named one is only detached,
-+ * the kernel takes it out of the mapping and frees it itself.
++ * Called with abd_mtx held and every chunk already referenced and locked when
++ * the reclaimer is the one freeing. abd_reclaiming, if set, names the folio it
++ * was called on: that one is only detached, the kernel takes it out of the
++ * mapping and frees it itself.
 + */
 +static void
 +abd_lru_free_chunks(abd_t *abd)
 +{
 +	struct scatterlist *sg = NULL;
 +	struct folio *reclaiming;
++	boolean_t prelocked = (abd->abd_flags & ABD_FLAG_PRELOCKED) != 0;
 +	boolean_t need_lock = !MUTEX_HELD(&abd->abd_mtx);
 +	int nr_pages = ABD_SCATTER(abd).abd_nents;
 +	int64_t bytes = 0, folios = 0;
@@ -923,7 +1083,9 @@ index 2fd3c3f..bd921b8 100644
 +	if (need_lock)
 +		mutex_enter(&abd->abd_mtx);
 +	reclaiming = ABD_SCATTER(abd).abd_reclaiming;
-+	IMPLY(!need_lock, reclaiming != NULL);
++	IMPLY(!need_lock, prelocked);
++	IMPLY(reclaiming != NULL, prelocked);
++	ASSERT(prelocked || !abd_lru_in_reclaim());
 +
 +	abd_for_each_sg(abd, sg, nr_pages, i) {
 +		struct folio *folio;
@@ -942,7 +1104,7 @@ index 2fd3c3f..bd921b8 100644
 +			continue;
 +		}
 +
-+		if (reclaiming != NULL) {
++		if (prelocked) {
 +			folio = page_folio(sg_page(sg));
 +			ASSERT(folio_test_locked(folio));
 +		} else {
@@ -1054,6 +1216,19 @@ index 2fd3c3f..bd921b8 100644
 +	(void) abd, (void) ops, (void) arg;
 +}
 +
++boolean_t
++abd_lru_try_prelock(abd_t *abd)
++{
++	(void) abd;
++	return (B_TRUE);
++}
++
++void
++abd_lru_prelock_release(abd_t *abd)
++{
++	(void) abd;
++}
++
 +void
 +abd_lru_rebind(abd_t *abd, void *arg)
 +{
@@ -1089,7 +1264,7 @@ index 2fd3c3f..bd921b8 100644
  /*
   * This must be called if any of the sg_table allocation functions
   * are called.
-@@ -456,6 +1118,11 @@ abd_free_chunks(abd_t *abd)
+@@ -456,6 +1262,11 @@ abd_free_chunks(abd_t *abd)
  	 * Scatter ABDs may be constructed by abd_alloc_from_pages() from
  	 * an array of pages. In which case they should not be freed.
  	 */
@@ -1101,7 +1276,7 @@ index 2fd3c3f..bd921b8 100644
  	if (!abd_is_from_pages(abd)) {
  		abd_for_each_sg(abd, sg, nr_pages, i) {
  			page = sg_page(sg);
-@@ -620,6 +1287,30 @@ abd_kstats_update(kstat_t *ksp, int rw)
+@@ -620,6 +1431,32 @@ abd_kstats_update(kstat_t *ksp, int rw)
  	    wmsum_value(&abd_sums.abdstat_scatter_page_alloc_retry);
  	as->abdstat_scatter_sg_table_retry.value.ui64 =
  	    wmsum_value(&abd_sums.abdstat_scatter_sg_table_retry);
@@ -1121,6 +1296,8 @@ index 2fd3c3f..bd921b8 100644
 +	    wmsum_value(&abd_sums.abdstat_lru_release_lock_miss);
 +	as->abdstat_lru_release_refused.value.ui64 =
 +	    wmsum_value(&abd_sums.abdstat_lru_release_refused);
++	as->abdstat_lru_prelock_busy.value.ui64 =
++	    wmsum_value(&abd_sums.abdstat_lru_prelock_busy);
 +	as->abdstat_page_isolate_asked.value.ui64 =
 +	    wmsum_value(&abd_sums.abdstat_page_isolate_asked);
 +	as->abdstat_page_migrated.value.ui64 =
@@ -1132,7 +1309,7 @@ index 2fd3c3f..bd921b8 100644
  	return (0);
  }
  
-@@ -643,6 +1334,18 @@ abd_init(void)
+@@ -643,6 +1480,19 @@ abd_init(void)
  	wmsum_init(&abd_sums.abdstat_scatter_page_multi_zone, 0);
  	wmsum_init(&abd_sums.abdstat_scatter_page_alloc_retry, 0);
  	wmsum_init(&abd_sums.abdstat_scatter_sg_table_retry, 0);
@@ -1144,6 +1321,7 @@ index 2fd3c3f..bd921b8 100644
 +	wmsum_init(&abd_sums.abdstat_lru_release_busy, 0);
 +	wmsum_init(&abd_sums.abdstat_lru_release_lock_miss, 0);
 +	wmsum_init(&abd_sums.abdstat_lru_release_refused, 0);
++	wmsum_init(&abd_sums.abdstat_lru_prelock_busy, 0);
 +	wmsum_init(&abd_sums.abdstat_page_isolate_asked, 0);
 +	wmsum_init(&abd_sums.abdstat_page_migrated, 0);
 +	wmsum_init(&abd_sums.abdstat_page_migrate_busy, 0);
@@ -1151,7 +1329,7 @@ index 2fd3c3f..bd921b8 100644
  
  	abd_ksp = kstat_create("zfs", 0, "abdstats", "misc", KSTAT_TYPE_NAMED,
  	    sizeof (abd_stats) / sizeof (kstat_named_t), KSTAT_FLAG_VIRTUAL);
-@@ -659,11 +1362,17 @@ abd_init(void)
+@@ -659,11 +1509,17 @@ abd_init(void)
  	}
  
  	abd_alloc_zero_scatter();
@@ -1169,7 +1347,7 @@ index 2fd3c3f..bd921b8 100644
  	abd_free_zero_scatter();
  
  	if (abd_ksp != NULL) {
-@@ -683,6 +1392,18 @@ abd_fini(void)
+@@ -683,6 +1539,19 @@ abd_fini(void)
  	wmsum_fini(&abd_sums.abdstat_scatter_page_multi_zone);
  	wmsum_fini(&abd_sums.abdstat_scatter_page_alloc_retry);
  	wmsum_fini(&abd_sums.abdstat_scatter_sg_table_retry);
@@ -1181,6 +1359,7 @@ index 2fd3c3f..bd921b8 100644
 +	wmsum_fini(&abd_sums.abdstat_lru_release_busy);
 +	wmsum_fini(&abd_sums.abdstat_lru_release_lock_miss);
 +	wmsum_fini(&abd_sums.abdstat_lru_release_refused);
++	wmsum_fini(&abd_sums.abdstat_lru_prelock_busy);
 +	wmsum_fini(&abd_sums.abdstat_page_isolate_asked);
 +	wmsum_fini(&abd_sums.abdstat_page_migrated);
 +	wmsum_fini(&abd_sums.abdstat_page_migrate_busy);
@@ -1188,7 +1367,7 @@ index 2fd3c3f..bd921b8 100644
  
  	if (abd_cache) {
  		kmem_cache_destroy(abd_cache);
-@@ -818,6 +1539,9 @@ abd_get_offset_scatter(abd_t *abd, abd_t *sabd, size_t off,
+@@ -818,6 +1687,9 @@ abd_get_offset_scatter(abd_t *abd, abd_t *sabd, size_t off,
  	ABD_SCATTER(abd).abd_sgl = sg;
  	ABD_SCATTER(abd).abd_offset = new_offset;
  	ABD_SCATTER(abd).abd_nents = ABD_SCATTER(sabd).abd_nents - i;
@@ -1198,7 +1377,7 @@ index 2fd3c3f..bd921b8 100644
  
  	if (abd_is_from_pages(sabd))
  		abd->abd_flags |= ABD_FLAG_FROM_PAGES;
-@@ -923,7 +1647,12 @@ abd_iter_map(struct abd_iter *aiter)
+@@ -923,7 +1795,12 @@ abd_iter_map(struct abd_iter *aiter)
  		aiter->iter_mapsize = MIN(aiter->iter_sg->length - offset,
  		    aiter->iter_abd->abd_size - aiter->iter_pos);
  
@@ -1211,7 +1390,7 @@ index 2fd3c3f..bd921b8 100644
  		if (PageHighMem(page)) {
  			page = nth_page(page, offset / PAGE_SIZE);
  			offset &= PAGE_SIZE - 1;
-@@ -950,12 +1679,20 @@ abd_iter_unmap(struct abd_iter *aiter)
+@@ -950,12 +1827,20 @@ abd_iter_unmap(struct abd_iter *aiter)
  	if (!abd_is_linear(aiter->iter_abd)) {
  		size_t offset = aiter->iter_offset;
  
@@ -1232,7 +1411,7 @@ index 2fd3c3f..bd921b8 100644
  	}
  
  	ASSERT3P(aiter->iter_mapaddr, !=, NULL);
-@@ -1131,9 +1868,29 @@ abd_return_buf_copy(abd_t *abd, void *buf, size_t n)
+@@ -1131,9 +2016,29 @@ abd_return_buf_copy(abd_t *abd, void *buf, size_t n)
  #define	ABD_ITER_PAGE_SIZE(page)	(PAGESIZE)
  #endif
  
@@ -1262,7 +1441,7 @@ index 2fd3c3f..bd921b8 100644
  	if (abd_iter_at_end(aiter)) {
  		aiter->iter_page = NULL;
  		aiter->iter_page_doff = 0;
-@@ -1166,8 +1923,14 @@ abd_iter_page(struct abd_iter *aiter)
+@@ -1166,8 +2071,14 @@ abd_iter_page(struct abd_iter *aiter)
  		ASSERT(!abd_is_gang(aiter->iter_abd));
  
  		/* current scatter page */
@@ -1414,10 +1593,10 @@ index 7ea07c4..3d622b8 100644
  	    abd_copy_off_cb, NULL);
  }
 diff --git a/module/zfs/arc.c b/module/zfs/arc.c
-index 1443d1e..4cd83b9 100644
+index 1443d1e..9f82b3a 100644
 --- a/module/zfs/arc.c
 +++ b/module/zfs/arc.c
-@@ -540,6 +540,10 @@ arc_stats_t arc_stats = {
+@@ -540,6 +540,11 @@ arc_stats_t arc_stats = {
  	{ "evict_l2_eligible_mru",	KSTAT_DATA_UINT64 },
  	{ "evict_l2_ineligible",	KSTAT_DATA_UINT64 },
  	{ "evict_l2_skip",		KSTAT_DATA_UINT64 },
@@ -1425,10 +1604,11 @@ index 1443d1e..4cd83b9 100644
 +	{ "lru_evict_bytes",		KSTAT_DATA_UINT64 },
 +	{ "lru_evict_skip",		KSTAT_DATA_UINT64 },
 +	{ "lru_evict_held",		KSTAT_DATA_UINT64 },
++	{ "lru_evict_busy",		KSTAT_DATA_UINT64 },
  	{ "move_relocated",		KSTAT_DATA_UINT64 },
  	{ "move_not_live",		KSTAT_DATA_UINT64 },
  	{ "move_raced",			KSTAT_DATA_UINT64 },
-@@ -2995,8 +2999,10 @@ arc_hdr_free_on_write(arc_buf_hdr_t *hdr, boolean_t free_rdata)
+@@ -2995,8 +3000,10 @@ arc_hdr_free_on_write(arc_buf_hdr_t *hdr, boolean_t free_rdata)
  	}
  
  	if (free_rdata) {
@@ -1439,7 +1619,7 @@ index 1443d1e..4cd83b9 100644
  		l2arc_free_abd_on_write(hdr->b_l1hdr.b_pabd, size, type);
  	}
  }
-@@ -3587,6 +3593,9 @@ arc_hdr_move(void *buf, void *newbuf, size_t size, void *arg)
+@@ -3587,6 +3594,9 @@ arc_hdr_move(void *buf, void *newbuf, size_t size, void *arg)
  #ifdef ZFS_DEBUG
  	mutex_init(&nhdr->b_l1hdr.b_freeze_lock, NULL, MUTEX_DEFAULT, NULL);
  #endif
@@ -1449,7 +1629,7 @@ index 1443d1e..4cd83b9 100644
  
  	if (mls != NULL) {
  		/*
-@@ -4086,6 +4095,106 @@ arc_evict_hdr(arc_buf_hdr_t *hdr, uint64_t *real_evicted)
+@@ -4086,6 +4096,124 @@ arc_evict_hdr(arc_buf_hdr_t *hdr, uint64_t *real_evicted)
  	return (bytes_evicted);
  }
  
@@ -1486,6 +1666,7 @@ index 1443d1e..4cd83b9 100644
 +{
 +	arc_buf_hdr_t *hdr = arg;
 +	arc_state_t *state;
++	abd_t *other;
 +	uint64_t evicted, real_evicted;
 +
 +	ASSERT(MUTEX_HELD(HDR_LOCK(hdr)));
@@ -1518,8 +1699,25 @@ index 1443d1e..4cd83b9 100644
 +		return (B_FALSE);
 +	}
 +
++	/*
++	 * Eviction frees every buffer of the header, not just the one the page
++	 * belongs to, and an encrypted header carries two. The reclaimer holds
++	 * the chunks of the one it was called on; the other is taken here or
++	 * the folio is left alone, because by the time it is freed no lock may
++	 * be waited for.
++	 */
++	other = (hdr->b_l1hdr.b_pabd != NULL && hdr->b_l1hdr.b_pabd != abd) ?
++	    hdr->b_l1hdr.b_pabd :
++	    (HDR_HAS_RABD(hdr) && hdr->b_crypt_hdr.b_rabd != abd) ?
++	    hdr->b_crypt_hdr.b_rabd : NULL;
++	if (!abd_lru_try_prelock(other)) {
++		ARCSTAT_BUMP(arcstat_lru_evict_busy);
++		return (B_FALSE);
++	}
++
 +	evicted = arc_evict_hdr(hdr, &real_evicted);
 +	if (evicted == 0) {
++		abd_lru_prelock_release(other);
 +		ARCSTAT_BUMP(arcstat_lru_evict_skip);
 +		return (B_FALSE);
 +	}
@@ -1556,7 +1754,7 @@ index 1443d1e..4cd83b9 100644
  static void
  arc_set_need_free(void)
  {
-@@ -5541,6 +5650,11 @@ arc_access(arc_buf_hdr_t *hdr, arc_flags_t arc_flags, boolean_t hit)
+@@ -5541,6 +5669,11 @@ arc_access(arc_buf_hdr_t *hdr, arc_flags_t arc_flags, boolean_t hit)
  	ASSERT(MUTEX_HELD(HDR_LOCK(hdr)));
  	ASSERT(HDR_HAS_L1HDR(hdr));
  
@@ -1568,7 +1766,7 @@ index 1443d1e..4cd83b9 100644
  	/*
  	 * Update buffer prefetch status.
  	 */
-@@ -5948,8 +6062,11 @@ arc_read_done(zio_t *zio)
+@@ -5948,8 +6081,11 @@ arc_read_done(zio_t *zio)
  	arc_hdr_clear_flags(hdr, ARC_FLAG_IO_IN_PROGRESS);
  	(void) remove_reference(hdr, hdr);
  
@@ -1581,7 +1779,7 @@ index 1443d1e..4cd83b9 100644
  
  	/* execute each callback and free its structure */
  	while ((acb = callback_list) != NULL) {
-@@ -7225,6 +7342,7 @@ arc_write_done(zio_t *zio)
+@@ -7225,6 +7361,7 @@ arc_write_done(zio_t *zio)
  		/* if it's not anon, we are doing a scrub */
  		if (exists == NULL && hdr->b_l1hdr.b_state == arc_anon)
  			arc_access(hdr, 0, B_FALSE);
@@ -1589,7 +1787,7 @@ index 1443d1e..4cd83b9 100644
  		mutex_exit(hash_lock);
  	} else {
  		arc_hdr_clear_flags(hdr, ARC_FLAG_IO_IN_PROGRESS);
-@@ -7512,6 +7630,14 @@ arc_kstat_update(kstat_t *ksp, int rw)
+@@ -7512,6 +7649,16 @@ arc_kstat_update(kstat_t *ksp, int rw)
  	    wmsum_value(&arc_sums.arcstat_evict_l2_ineligible);
  	as->arcstat_evict_l2_skip.value.ui64 =
  	    wmsum_value(&arc_sums.arcstat_evict_l2_skip);
@@ -1601,10 +1799,12 @@ index 1443d1e..4cd83b9 100644
 +	    wmsum_value(&arc_sums.arcstat_lru_evict_skip);
 +	as->arcstat_lru_evict_held.value.ui64 =
 +	    wmsum_value(&arc_sums.arcstat_lru_evict_held);
++	as->arcstat_lru_evict_busy.value.ui64 =
++	    wmsum_value(&arc_sums.arcstat_lru_evict_busy);
  	as->arcstat_move_relocated.value.ui64 =
  	    wmsum_value(&arc_sums.arcstat_move_relocated);
  	as->arcstat_move_not_live.value.ui64 =
-@@ -7962,6 +8088,10 @@ arc_state_init(void)
+@@ -7962,6 +8109,11 @@ arc_state_init(void)
  	wmsum_init(&arc_sums.arcstat_evict_l2_eligible_mru, 0);
  	wmsum_init(&arc_sums.arcstat_evict_l2_ineligible, 0);
  	wmsum_init(&arc_sums.arcstat_evict_l2_skip, 0);
@@ -1612,10 +1812,11 @@ index 1443d1e..4cd83b9 100644
 +	wmsum_init(&arc_sums.arcstat_lru_evict_bytes, 0);
 +	wmsum_init(&arc_sums.arcstat_lru_evict_skip, 0);
 +	wmsum_init(&arc_sums.arcstat_lru_evict_held, 0);
++	wmsum_init(&arc_sums.arcstat_lru_evict_busy, 0);
  	wmsum_init(&arc_sums.arcstat_move_relocated, 0);
  	wmsum_init(&arc_sums.arcstat_move_not_live, 0);
  	wmsum_init(&arc_sums.arcstat_move_raced, 0);
-@@ -8132,6 +8262,10 @@ arc_state_fini(void)
+@@ -8132,6 +8284,11 @@ arc_state_fini(void)
  	wmsum_fini(&arc_sums.arcstat_evict_l2_eligible_mru);
  	wmsum_fini(&arc_sums.arcstat_evict_l2_ineligible);
  	wmsum_fini(&arc_sums.arcstat_evict_l2_skip);
@@ -1623,6 +1824,7 @@ index 1443d1e..4cd83b9 100644
 +	wmsum_fini(&arc_sums.arcstat_lru_evict_bytes);
 +	wmsum_fini(&arc_sums.arcstat_lru_evict_skip);
 +	wmsum_fini(&arc_sums.arcstat_lru_evict_held);
++	wmsum_fini(&arc_sums.arcstat_lru_evict_busy);
  	wmsum_fini(&arc_sums.arcstat_move_relocated);
  	wmsum_fini(&arc_sums.arcstat_move_not_live);
  	wmsum_fini(&arc_sums.arcstat_move_raced);
