@@ -159,6 +159,21 @@ in
     import os
     from datetime import timedelta
 
+    # A transient unit inherits none of the login shell's PATH.
+    UNIT_PATH = "/run/current-system/sw/bin:/run/wrappers/bin"
+
+    # A load whose commands are missing leaves its unit active and its shell
+    # loop spinning, so every phase below passes while nothing runs.
+    def load_is_running(unit):
+        machine.succeed("sleep 1")
+        said = machine.succeed(
+            f"journalctl -u {unit} --no-pager"
+            " | grep -E 'command not found|No such file' || true"
+        )
+        assert not said.strip(), f"{unit} could not run what it was given:\n{said}"
+        state = machine.succeed(f"systemctl is-active {unit} || true").strip()
+        assert state == "active", f"{unit} is {state} right after it was started"
+
     machine.start()
     machine.wait_for_unit("multi-user.target")
 
@@ -419,18 +434,17 @@ in
             # one landed seven minutes before the failure. A snapshot ends a
             # transaction group, which is the boundary cloning cares about.
             if ${if snapshotWhileCloning then "True" else "False"}:
-                # Absolute paths throughout: a systemd-run unit gets none of
-                # the login shell's PATH, and a missing sleep turns a paced
-                # loop into a spin that starves the load it was meant to
-                # accompany.
+                # A systemd-run unit gets none of the login shell's PATH.
                 machine.succeed(
                     "systemd-run --unit=snap-load --property=Type=simple"
+                    f" --setenv=PATH={UNIT_PATH}"
                     " /bin/sh -c 'i=0; while true; do"
                     " zfs snapshot tank/data@s$i 2>/dev/null;"
                     " zfs destroy tank/data@s$((i-8)) 2>/dev/null;"
                     " i=$((i+1));"
-                    " /run/current-system/sw/bin/sleep 2; done'"
+                    " sleep 2; done'"
                 )
+                load_is_running("snap-load")
 
             # Same three levers that made the last relocation bug show itself:
             # a real high order request rather than the sysctl alone, repeated
@@ -808,17 +822,21 @@ in
             )
             machine.succeed(
                 "systemd-run --unit=soak-writers --collect --property=Type=simple"
+                f" --setenv=PATH={UNIT_PATH}"
                 " /bin/sh -c 'i=0; while true; do"
                 " fragload -mode write -dir /tank/clone/churn"
                 " -files 2048 -size ${toString fileSize} -seed $((1000+i)) -jobs 2;"
                 " rm -rf /tank/clone/churn; i=$((i+1)); done'"
             )
+            load_is_running("soak-writers")
             machine.succeed(
                 "systemd-run --unit=soak-hogs --collect --property=Type=simple"
+                f" --setenv=PATH={UNIT_PATH}"
                 " /bin/sh -c 'while true; do"
                 " fragcheck -mode hog -mb ${toString (memoryMB / 2)} -secs 60;"
-                " /run/current-system/sw/bin/sleep 30; done'"
+                " sleep 30; done'"
             )
+            load_is_running("soak-hogs")
 
             start = int(machine.succeed("date +%s"))
             round = 0
