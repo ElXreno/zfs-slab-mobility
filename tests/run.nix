@@ -904,6 +904,23 @@ in
                     ).replace("\n", " ")
                     print(f"soak round {round}, {int(machine.succeed('date +%s')) - start}s: {said}")
 
+            # What each load actually did, because a unit that ran without
+            # running anything is exactly the failure this soak once hid.
+            for unit in ("soak-readers", "soak-cloners", "soak-writers", "soak-hogs"):
+                said = machine.succeed(
+                    f"journalctl -u {unit} --no-pager -o cat | tail -3 || true"
+                ).strip().replace("\n", " | ")
+                cpu = machine.succeed(
+                    f"systemctl show -p CPUUsageNSec --value {unit} || true"
+                ).strip()
+                print(f"{unit} cpu {cpu} ns, last said: {said}")
+                # A unit that finished on its own leaves no accounting behind,
+                # so what it said is the evidence for that one.
+                assert (cpu.isdigit() and int(cpu) > 10**9) or said, (
+                    f"{unit} left neither cpu time ({cpu}) nor a word in its"
+                    " journal, so it was not doing the work it was started for"
+                )
+
             for unit in ("soak-readers", "soak-cloners", "soak-writers", "soak-hogs"):
                 machine.execute(f"systemctl stop {unit}")
             for unit in ("soak-readers", "soak-cloners"):
