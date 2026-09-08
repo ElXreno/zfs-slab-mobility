@@ -1,4 +1,4 @@
-From 047fc3e29a926787e21ac2bf245859a2cf3ed186 Mon Sep 17 00:00:00 2001
+From 4cfcd511b083f0e603b04336aadfb94db45ec11f Mon Sep 17 00:00:00 2001
 From: ElXreno <elxreno@gmail.com>
 Date: Sun, 6 Sep 2026 01:56:17 +0300
 Subject: [PATCH] abd: keep clean ARC buffers as folios in the page cache
@@ -1541,7 +1541,7 @@ index ab7457b..fd67af1 100644
  		 * If we copied the ABD before issuing it, clean up and return
  		 * the copy to the ADB, with changes if appropriate.
 diff --git a/module/zfs/abd.c b/module/zfs/abd.c
-index 7ea07c4..3d622b8 100644
+index 7ea07c4..c06a799 100644
 --- a/module/zfs/abd.c
 +++ b/module/zfs/abd.c
 @@ -118,8 +118,10 @@ abd_verify(abd_t *abd)
@@ -1550,7 +1550,7 @@ index 7ea07c4..3d622b8 100644
  	    ABD_FLAG_MULTI_CHUNK | ABD_FLAG_LINEAR_PAGE | ABD_FLAG_GANG |
 -	    ABD_FLAG_GANG_FREE | ABD_FLAG_ALLOCD | ABD_FLAG_FROM_PAGES));
 +	    ABD_FLAG_GANG_FREE | ABD_FLAG_ALLOCD | ABD_FLAG_FROM_PAGES |
-+	    ABD_FLAG_LRU));
++	    ABD_FLAG_LRU | ABD_FLAG_PRELOCKED));
  	IMPLY(abd->abd_parent != NULL, !(abd->abd_flags & ABD_FLAG_OWNER));
 +	IMPLY(abd->abd_flags & ABD_FLAG_LRU, abd->abd_flags & ABD_FLAG_OWNER);
  	IMPLY(abd->abd_flags & ABD_FLAG_META, abd->abd_flags & ABD_FLAG_OWNER);
