@@ -17,6 +17,7 @@
   variants,
   fragload,
   fragcheck,
+  fragspike,
 }:
 
 {
@@ -87,11 +88,33 @@
   # A deadlock leaves the counters and every phase below untouched, so the run
   # has to be told to look for tasks that stopped rather than failed.
   hungTaskSeconds ? 0,
+  # Shared memory taken in one burst while the next model is loaded through
+  # mmap, over a page cache still holding the previous one.
+  spikeMB ? 0,
+  spikeOldFiles ? 5,
+  spikeNewFiles ? 3,
+  spikeFileMB ? 1024,
+  spikeJobs ? 8,
+  spikeSeconds ? 600,
+  spikePrimaryCache ? "metadata",
+  spikeArcMaxMB ? 0,
+  spikeReaderJobs ? 0,
+  spikeRounds ? 1,
+  spikeNewCachedFrac ? "0.33",
+  spikeSwapMB ? 2048,
+  spikeDirect ? false,
+  spikeWriters ? false,
+  spikePin ? false,
+  spikeExpectShrink ? false,
+  spikeToleratesStall ? false,
+  thp ? "never",
+  preempt ? null,
   diskMB ? 24000,
   arcFloorMB ? 512,
   quietSeconds ? 60,
   hotFiles ? 2048,
   defragMode ? null,
+  workingsetProtection ? null,
 }:
 
 let
@@ -129,7 +152,7 @@ in
       diskSize = 4096;
       emptyDiskImages =
         (if raidz then lib.replicate 3 (diskMB / 2) else [ diskMB ])
-        ++ lib.optional (anonHogMB > 0 || soakSeconds > 0 || l2arc) 2048
+        ++ lib.optional (anonHogMB > 0 || soakSeconds > 0 || l2arc || spikeMB > 0) spikeSwapMB
         ++ lib.optional l2arc 2048;
     };
 
@@ -140,9 +163,10 @@ in
       # The guest's own dice: kernel placement and khugepaged. The allocator's are in nix/variants.nix.
       kernelParams = [
         "nokaslr"
-        "transparent_hugepage=never"
+        "transparent_hugepage=${thp}"
       ]
-      ++ lib.optionals (anonHogMB > 0 || soakSeconds > 0) [
+      ++ lib.optional (preempt != null) "preempt=${preempt}"
+      ++ lib.optionals (anonHogMB > 0 || soakSeconds > 0 || spikeMB > 0) [
         "zswap.enabled=1"
         "psi=1"
       ];
@@ -152,9 +176,18 @@ in
       // lib.optionalAttrs (defragMode != null) {
         "vm.defrag_mode" = defragMode;
       }
+      // lib.optionalAttrs (workingsetProtection != null) {
+        "vm.workingset_protection" = workingsetProtection;
+      }
       # The test driver panics the guest on OOM; a hog run wants the counters instead.
-      // lib.optionalAttrs (anonHogMB > 0 || soakSeconds > 0) {
+      // lib.optionalAttrs (anonHogMB > 0 || soakSeconds > 0 || spikeMB > 0) {
         "vm.panic_on_oom" = lib.mkForce 0;
+      }
+      # What the machine that hung runs with.
+      // lib.optionalAttrs (spikeMB > 0) {
+        "vm.vfs_cache_pressure" = 3000;
+        "vm.swappiness" = 100;
+        "vm.compaction_proactiveness" = 40;
       }
       // lib.optionalAttrs (hungTaskSeconds > 0) {
         "kernel.hung_task_timeout_secs" = lib.mkForce hungTaskSeconds;
@@ -168,7 +201,8 @@ in
     ]
     ++ lib.optional (
       anonHogMB > 0 || soakSeconds > 0 || verifyAfter || hogWhileCompacting > 0
-    ) fragcheck;
+    ) fragcheck
+    ++ lib.optional (spikeMB > 0) fragspike;
 
     documentation.enable = false;
     services.udisks2.enable = false;
@@ -302,7 +336,7 @@ in
         said = machine.succeed(
             "dmesg | grep -E 'BUG:|Oops:|kernel BUG at|list_del corruption"
             "|list_add corruption|refcount_t"
-            "${lib.optionalString (hungTaskSeconds > 0)
+            "${lib.optionalString (hungTaskSeconds > 0 && !spikeToleratesStall)
               "|blocked for more than|blocked in I/O wait|blocked on a mutex"
             }' || true"
         )
@@ -933,6 +967,217 @@ in
             kernel_is_quiet("the soak")
             snapshot("soaked")
       ''
+    )}${lib.optionalString (spikeMB > 0) (
+      "\n"
+      + ''
+    if True:
+        with subtest("spike"):
+            def vmstat(name):
+                return int(machine.succeed(
+                    f"awk '$1 == \"{name}\" {{ print $2 }}' /proc/vmstat"
+                ).strip() or 0)
+
+            def meminfo(name):
+                return int(machine.succeed(
+                    f"awk '$1 == \"{name}:\" {{ print $2 }}' /proc/meminfo"
+                ).strip()) * 1024
+
+            def arcstat(name):
+                return int(machine.succeed(
+                    f"awk '$1 == \"{name}\" {{ n = $3 }} END {{ print n+0 }}'"
+                    " /proc/spl/kstat/zfs/arcstats"
+                ).strip())
+
+            machine.succeed("mkswap ${swapDev} && swapon ${swapDev}")
+            machine.succeed("echo 1 > /sys/module/zswap/parameters/enabled")
+            machine.succeed(
+                "zfs create -o recordsize=1M -o compression=lz4"
+                " -o primarycache=${spikePrimaryCache} -o atime=off tank/models"
+            )
+            for d, n, s in (("old", ${toString spikeOldFiles}, 1), ("new", ${toString spikeNewFiles}, 2)):
+                machine.succeed(
+                    f"fragspike -mode write -dir /tank/models/{d} -files {n}"
+                    f" -mb ${toString spikeFileMB} -seed {s} -jobs 4",
+                    timeout=timedelta(seconds=1800),
+                )
+            machine.succeed("sync; zpool sync tank; echo 3 > /proc/sys/vm/drop_caches")
+            if ${toString spikeArcMaxMB} > 0:
+                machine.succeed(
+                    "echo ${toString (spikeArcMaxMB * 1024 * 1024)} >"
+                    " /sys/module/zfs/parameters/zfs_arc_max"
+                )
+
+            # Into the kernel log every two seconds, so the numbers outlive a guest that stops.
+            spikestat = "\n".join([
+                "#!/bin/sh",
+                "PATH=/run/current-system/sw/bin",
+                "d=0",
+                "while true; do",
+                "  m=$(awk '$1 ~ /^(MemFree|Cached|Mapped|Shmem|SwapFree|Dirty|Active[(]file[)]|Inactive[(]file[)]|Active[(]anon[)]|Inactive[(]anon[)]):$/ { printf \"%s%d \", $1, $2/1024 }' /proc/meminfo)",
+                "  a=$(awk '$1 ~ /^(size|c|lru_evict|lru_evict_skip|lru_evict_busy|lru_evict_held|evict_skip|mutex_miss|arc_prune|memory_direct_count|memory_throttle_count)$/ { printf \"%s=%s \", $1, $3 }' /proc/spl/kstat/zfs/arcstats)",
+                "  b=$(awk '$1 ~ /^(lru_folios|lru_release|lru_release_busy|lru_release_lock_miss|lru_release_refused|lru_prelock_busy|page_migrated|page_migrate_busy|lru_grab_retry)$/ { printf \"%s=%s \", $1, $3 }' /proc/spl/kstat/zfs/abdstats)",
+                "  v=$(awk '$1 ~ /^(pgscan_kswapd|pgscan_direct|pgsteal_kswapd|pgsteal_direct|allocstall_normal|compact_stall|pgmigrate_success|pgmigrate_fail|zswpout|pswpout)$/ { printf \"%s=%s \", $1, $2 }' /proc/vmstat)",
+                "  nd=$(grep -l '^State:.D' /proc/[0-9]*/task/[0-9]*/status 2>/dev/null | wc -l)",
+                "  echo \"spikestat $(date +%s) $m$a$b$v dstate=$nd txg=$t\" > /dev/kmsg",
+                # Every blocked task's stack once the sync thread has stood still for ten seconds.
+                "  cc=$(awk '$1 == \"c\" { print $3 }' /proc/spl/kstat/zfs/arcstats)",
+                "  if [ -z \"$cmin\" ] || [ \"$cc\" -lt \"$cmin\" ]; then cmin=$cc; echo $cmin > /run/spike-cmin; fi",
+                "  t=$(awk '{ print $3 }' /proc/$(pgrep -x txg_sync | head -1)/stat 2>/dev/null)",
+                "  if [ \"$t\" = D ]; then d=$((d+1)); else d=0; fi",
+                "  if [ $d -eq 5 ]; then echo w > /proc/sysrq-trigger; fi",
+                "  sleep 2",
+                "done",
+            ])
+            machine.succeed(f"cat > /run/spikestat.sh <<'EOF'\n{spikestat}\nEOF\nchmod +x /run/spikestat.sh")
+            machine.succeed(
+                "systemd-run --unit=spike-sampler --collect --property=Type=simple"
+                " /run/spikestat.sh"
+            )
+
+            # Readers keeping the ARC's own folios churning under the cap while the burst runs.
+            if ${toString spikeReaderJobs} > 0:
+                machine.succeed(
+                    "systemd-run --unit=spike-readers --collect"
+                    " fragload -mode read -dir /tank/data/set"
+                    " -files ${toString files} -size ${toString fileSize}"
+                    " -seed ${toString seed} -jobs ${toString spikeReaderJobs} -passes 1000000"
+                )
+
+            # Everything on the machine that hung lives on the pool, the journal included,
+            # so writes and their transaction groups never stop while the burst runs.
+            if ${if spikeWriters then "True" else "False"}:
+                machine.succeed(
+                    "systemd-run --unit=spike-journal --collect --property=Type=simple"
+                    f" --setenv=PATH={UNIT_PATH}"
+                    " /bin/sh -c 'while true; do"
+                    " dd if=/dev/urandom of=/tank/data/journal bs=64k count=4"
+                    " oflag=append conv=notrunc,fsync 2>/dev/null;"
+                    " sleep 0.2; done'",
+                    "systemd-run --unit=spike-writer --collect --property=Type=simple"
+                    f" --setenv=PATH={UNIT_PATH}"
+                    " /bin/sh -c 'i=0; while true; do"
+                    " fragload -mode write -dir /tank/data/churn"
+                    " -files 2048 -size ${toString fileSize} -seed $((2000+i)) -jobs 2;"
+                    " rm -rf /tank/data/churn; i=$((i+1)); done'",
+                )
+                load_is_running("spike-journal")
+                load_is_running("spike-writer")
+
+            counters = ("pgsteal_kswapd", "pgsteal_direct", "allocstall_normal",
+                        "compact_stall", "pgmigrate_success", "zswpout")
+            scans_before = arcstat("memory_direct_count") + arcstat("memory_indirect_count")
+            for round in range(${toString spikeRounds}):
+                # The previous model streamed and let go: its pages stay cached with nothing mapping them.
+                machine.succeed(
+                    "fragspike -mode map -dir /tank/models/old -files ${toString spikeOldFiles}"
+                    " -jobs ${toString spikeJobs}",
+                    "fragspike -mode map -dir /tank/models/new -files ${toString spikeNewFiles}"
+                    " -jobs ${toString spikeJobs} -frac ${spikeNewCachedFrac}",
+                    timeout=timedelta(seconds=1800),
+                )
+                cached, mapped = meminfo("Cached"), meminfo("Mapped")
+                print(f"round {round}: previous model streamed and let go: Cached {cached}, Mapped {mapped}")
+                assert cached > ${toString (memoryMB * 1024 * 1024 / 2)}, (
+                    f"only {cached} bytes cached after the stream, so the burst"
+                    " would not meet a full page cache and passing proves nothing"
+                )
+
+                before = {k: vmstat(k) for k in counters}
+                before["lru_evict"] = arcstat("lru_evict")
+                before["lru_evict_busy"] = arcstat("lru_evict_busy")
+
+                # The next model read by many threads straight into a host arena taken
+                # at the same moment, and mapped by as many more.
+                burst = [
+                    ("spike-map", "fragspike -mode map -dir /tank/models/new"
+                                  " -files ${toString spikeNewFiles} -jobs ${toString spikeJobs} -secs 5"),
+                ]
+                if ${if spikeDirect then "True" else "False"}:
+                    # The loader's own reader: O_DIRECT in 8 MiB chunks into a lazy huge page
+                    # bank, beside host memory taken for the rest of the burst.
+                    burst += [
+                        ("spike-load", "fragspike -mode load -direct -dir /tank/models/new"
+                                       " -files ${toString spikeNewFiles} -mb ${toString (spikeNewFiles * spikeFileMB)}"
+                                       " -jobs 8 -secs 5${lib.optionalString spikePin " -pin"}"),
+                        ("spike-shm", "fragspike -mode shm -mb ${toString (spikeMB - spikeNewFiles * spikeFileMB)}"
+                                      " -jobs ${toString spikeJobs} -secs 5${lib.optionalString spikePin " -pin"}"),
+                    ]
+                else:
+                    burst += [
+                        ("spike-load", "fragspike -mode load -dir /tank/models/new"
+                                       " -files ${toString spikeNewFiles} -mb ${toString spikeMB}"
+                                       " -jobs ${toString spikeJobs} -secs 5"),
+                    ]
+                units = [u for u, _ in burst]
+                for unit, cmd in burst:
+                    machine.succeed(f"rm -f /run/{unit}.rc")
+                    machine.succeed(
+                        f"systemd-run --unit={unit} --property=Type=simple"
+                        f" --setenv=PATH={UNIT_PATH}"
+                        f" /bin/sh -c '{cmd}; echo $? > /run/{unit}.rc'"
+                    )
+                try:
+                    machine.wait_until_fails(
+                        "systemctl is-active " + " ".join(units),
+                        timeout=timedelta(seconds=${toString spikeSeconds}),
+                    )
+                except Exception:
+                    machine.execute("echo w > /proc/sysrq-trigger", timeout=60)
+                    _, stacks = machine.execute(
+                        "for t in /proc/[0-9]*/task/[0-9]*; do"
+                        " grep -q '^State:.D' $t/status 2>/dev/null || continue;"
+                        " echo \"== $(cat $t/comm) $t\"; cat $t/stack; done",
+                        timeout=120,
+                    )
+                    print(f"tasks in D state:\n{stacks}")
+                    raise Exception(
+                        f"round {round}: the load and the burst did not finish in ${toString spikeSeconds} s"
+                    )
+
+                for unit in units:
+                    said = machine.succeed(f"journalctl -u {unit} --no-pager -o cat | tail -1").strip()
+                    rc = machine.succeed(f"cat /run/{unit}.rc 2>/dev/null || true").strip()
+                    # Pinning most of memory may end in the OOM killer, which is the machine
+                    # recovering; what this check is after is the pool standing still before it.
+                    result = machine.succeed(f"systemctl show -p Result --value {unit} || true").strip()
+                    if not rc and result == "oom-kill":
+                        rc = "oom-kill"
+                        machine.succeed(f"systemctl reset-failed {unit} || true")
+                    print(f"round {round}: {unit} exited {rc}: {said}")
+                    assert rc in ("0", "oom-kill"), f"{unit} failed with {rc or 'nothing'}: {said}"
+
+                delta = {k: vmstat(k) - before[k] for k in counters}
+                delta["lru_evict"] = arcstat("lru_evict") - before["lru_evict"]
+                delta["lru_evict_busy"] = arcstat("lru_evict_busy") - before["lru_evict_busy"]
+                print(f"round {round}, across the burst: {delta}, Cached {cached} -> {meminfo('Cached')}")
+                assert delta["pgsteal_kswapd"] + delta["pgsteal_direct"] > 0, (
+                    "nothing was reclaimed during the burst, so it did not press"
+                    " on memory and passing proves nothing"
+                )
+                kernel_is_quiet(f"spike round {round}")
+
+            # Stalls here happen on stock ZFS as well, so they are reported rather than failed on.
+            stall = machine.succeed(
+                "dmesg | grep -oE 'blocked (in I/O wait )?for more than [0-9]+ seconds'"
+                " | grep -oE '[0-9]+' | sort -n | tail -1 || true"
+            ).strip() or "0"
+            print(f"longest hung task report across the spike: {stall} s")
+
+            if ${if spikeExpectShrink then "True" else "False"}:
+                # What the ARC owns: with its folios kept out of reclaim, it has to lower its own target.
+                cmin = int(machine.succeed("cat /run/spike-cmin").strip())
+                scans = arcstat("memory_direct_count") + arcstat("memory_indirect_count") - scans_before
+                cap = ${toString (spikeArcMaxMB * 1024 * 1024)}
+                print(f"ARC target lowest during the spike {cmin} of {cap}, shrinker scans {scans}")
+                assert cmin < cap and scans > 0, (
+                    f"the ARC kept its target at {cmin} of {cap} with {scans} shrinker scans"
+                    " while memory ran out, so nothing gave its page cache folios back"
+                )
+
+            machine.succeed("systemctl stop spike-sampler spike-readers spike-journal spike-writer || true")
+            kernel_is_quiet("the spike")
+            machine.succeed("swapoff ${swapDev}")
+      ''
     )}${lib.optionalString verifyAfter (
       "\n"
       + ''
@@ -1033,6 +1278,9 @@ in
 # take the default hour to say so.
 // lib.optionalAttrs (hungTaskSeconds > 0 && soakSeconds == 0) {
   globalTimeout = 1200;
+}
+// lib.optionalAttrs (spikeMB > 0) {
+  globalTimeout = 1200 + spikeRounds * spikeSeconds;
 })).overrideTestDerivation
   (_: {
     allowSubstitutes = false;

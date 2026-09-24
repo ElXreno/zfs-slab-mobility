@@ -12,6 +12,7 @@
   fragview,
   fragload,
   fragcheck,
+  fragspike,
 }:
 
 let
@@ -24,6 +25,7 @@ let
       variants
       fragload
       fragcheck
+      fragspike
       ;
   };
 
@@ -34,6 +36,33 @@ let
     2
     3
   ];
+
+  # The machine that hung: primarycache=metadata models on a 1M dataset, the
+  # ARC capped, readers churning it, many threads loading, and a host arena
+  # plus expert banks taking most of memory at once, with swap to fall back on.
+  spikeScene = {
+    seed = 1;
+    cores = 12;
+    memoryMB = 8192;
+    files = 16384;
+    encrypted = true;
+    thp = "madvise";
+    preempt = "full";
+    spikeMB = 6963;
+    spikeSwapMB = 1024;
+    spikeDirect = true;
+    spikeWriters = true;
+    spikePin = true;
+    # The pool stalls in this scene on stock ZFS too, on the xanmod kernel; what
+    # the backend owns is whether the ARC still gives memory back.
+    spikeExpectShrink = true;
+    spikeToleratesStall = true;
+    spikeJobs = 24;
+    spikeArcMaxMB = 512;
+    spikeReaderJobs = 4;
+    spikeRounds = 5;
+    hungTaskSeconds = 20;
+  };
 
   runsForSeeds =
     theseSeeds: args: variant:
@@ -395,6 +424,49 @@ let
       expectSwap = false;
       hungTaskSeconds = 20;
     };
+
+    # A model loaded by many threads through mmap while its host buffers are
+    # taken in one burst, over a page cache full of the previous model.
+    arc-lru-reclaim-spike = mkRun (spikeScene // { variant = "arclru"; });
+
+    # The same burst on a build without the folio backend.
+    reclaim-spike-stock = mkRun (spikeScene // { variant = "stock"; });
+
+    # Both again on the kernel the machine runs, whose working set protection
+    # keeps clean file pages, the ARC's folios among them, out of reclaim.
+    arc-lru-reclaim-spike-xanmod = mkRun (spikeScene // { variant = "arclruXanmod"; defragMode = 1; });
+    reclaim-spike-stock-xanmod = mkRun (spikeScene // { variant = "stockXanmod"; defragMode = 1; });
+
+    # Both with xanmod's working set protection off, and a hung task fails the run.
+    reclaim-spike-stock-xanmod-nowsp = mkRun (
+      spikeScene
+      // {
+        variant = "stockXanmod";
+        defragMode = 1;
+        workingsetProtection = 0;
+        spikeToleratesStall = false;
+      }
+    );
+    arc-lru-reclaim-spike-xanmod-nowsp = mkRun (
+      spikeScene
+      // {
+        variant = "arclruXanmod";
+        defragMode = 1;
+        workingsetProtection = 0;
+        spikeToleratesStall = false;
+      }
+    );
+
+    # The burst under KASAN, with the ARC shrinker now evicting joined buffers.
+    # KASAN takes an eighth of memory for its shadow and runs everything slower.
+    arc-lru-reclaim-spike-kasan = mkRun (
+      spikeScene
+      // {
+        variant = "kasan";
+        memoryMB = 10240;
+        spikeSeconds = 900;
+      }
+    );
 
     # The hog and the byte check on a raidz, so column ABDs and reconstruction
     # run beside joined buffers.
