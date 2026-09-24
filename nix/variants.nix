@@ -32,6 +32,8 @@ let
       memProfiling ? false,
       kasan ? false,
       zfsDebug ? false,
+      # The kernel the hung desktop runs, working set protection included.
+      xanmod ? false,
     }:
     let
       extraPatches =
@@ -42,16 +44,14 @@ let
       # Boot-time shuffling of object and page placement, none of it switchable at runtime.
       deterministic = {
         SLAB_FREELIST_RANDOM = lib.mkForce lib.kernel.no;
-        RANDOM_KMALLOC_CACHES = lib.mkForce lib.kernel.no;
+        KMALLOC_PARTITION_CACHES = lib.mkForce lib.kernel.no;
+        KMALLOC_PARTITION_RANDOM = lib.mkForce lib.kernel.unset;
         SHUFFLE_PAGE_ALLOCATOR = lib.mkForce lib.kernel.no;
       };
 
-      kernel = pkgs.linux_latest.override {
-        stdenv = ccache.wrapStdenv pkgs.stdenv;
-        kernelPatches = pkgs.linux_latest.kernelPatches ++ extraPatches;
-        # KASAN removes the Rust support the shared nixpkgs config asks for.
-        ignoreConfigErrors = kasan;
-        structuredExtraConfig =
+      base = if xanmod then pkgs.linux_xanmod_latest else pkgs.linux_latest;
+
+      standConfig =
           deterministic
           // lib.optionalAttrs memProfiling {
                 MEM_ALLOC_PROFILING = lib.kernel.yes;
@@ -83,7 +83,25 @@ let
             DEBUG_RWSEMS = lib.kernel.no;
             DEBUG_SPINLOCK = lib.kernel.no;
           };
-      };
+
+      # xanmod's own config wins over an overridden structuredExtraConfig, so
+      # there the stand's settings ride along as a patch without a diff.
+      kernel = base.override (
+        {
+          stdenv = ccache.wrapStdenv pkgs.stdenv;
+          kernelPatches =
+            base.kernelPatches
+            ++ extraPatches
+            ++ lib.optional xanmod {
+              name = "stand-config";
+              patch = null;
+              structuredExtraConfig = standConfig;
+            };
+          # KASAN removes the Rust support the shared nixpkgs config asks for.
+          ignoreConfigErrors = kasan;
+        }
+        // lib.optionalAttrs (!xanmod) { structuredExtraConfig = standConfig; }
+      );
 
       zfsExtra =
         (
@@ -107,15 +125,6 @@ let
           patches = (old.patches or [ ]) ++ zfsExtra;
           # ASSERTs on, so the read only invariant of joined buffers is checked.
           configureFlags = (old.configureFlags or [ ]) ++ lib.optional zfsDebug "--enable-debug";
-
-          # OpenZFS refuses at configure time to build against a kernel newer
-          # than the one it was tested on, and 2.4.3 stops at 7.0, which is
-          # already end of life and gone from nixpkgs. The behaviour under study
-          # needs a kernel with per CPU sheaves in SLUB, so the ceiling is lifted
-          # deliberately rather than the kernel moved back below the feature.
-          postPatch = (old.postPatch or "") + ''
-            substituteInPlace META --replace-fail "Linux-Maximum: 7.0" "Linux-Maximum: 7.1"
-          '';
         });
       }
     );
@@ -187,4 +196,15 @@ in
     arcLru = true;
     withProbes = true;
   };
+
+  # The backend and stock on the kernel of the machine that hung.
+  arclruXanmod = mkVariant {
+    slabMobility = true;
+    filemapExports = true;
+    largeFolioCompaction = true;
+    arcLru = true;
+    xanmod = true;
+  };
+
+  stockXanmod = mkVariant { xanmod = true; };
 }
