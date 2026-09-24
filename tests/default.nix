@@ -420,6 +420,7 @@ let
       cores = 2;
       encrypted = true;
       holdOtherInject = true;
+      arcFloorPinned = true;
       anonHogMB = 3072;
       expectSwap = false;
       hungTaskSeconds = 20;

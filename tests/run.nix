@@ -79,6 +79,8 @@
   # Reclaim meets a chunk of the header's other buffer already locked, which
   # is what a migration batch does on its own only rarely.
   holdOtherInject ? false,
+  # ARC floor held at its size from the page cache drop until the hog is over.
+  arcFloorPinned ? false,
   files ? 50000,
   fileSize ? 131072,
   memoryMB ? 6144,
@@ -276,7 +278,23 @@ in
     # Holes or clones here would make every number after this point worthless.
     alloc = int(machine.succeed("zpool list -Hp -o alloc tank"))
     want = ${toString setBytes}
-    assert alloc > want - want // 8, f"only {alloc} bytes on disk for a {want} byte set"
+    assert alloc > want - want // 8, f"only {alloc} bytes on disk for a {want} byte set"${lib.optionalString arcFloorPinned (
+      "\n"
+      + lib.removeSuffix "\n" ''
+        def arc_floor_to_size():
+            size, c_max = (
+                int(machine.succeed(f"awk '$1==\"{k}\"{{print $3}}' /proc/spl/kstat/zfs/arcstats"))
+                for k in ("size", "c_max")
+            )
+            pin = min(size, c_max)
+            machine.succeed(f"echo {pin} > /sys/module/zfs/parameters/zfs_arc_min")
+            got = int(machine.succeed("awk '$1==\"c_min\"{print $3}' /proc/spl/kstat/zfs/arcstats"))
+            assert got == pin, f"the ARC floor stayed at {got} instead of {pin}"
+
+        c_min_before = int(machine.succeed("awk '$1==\"c_min\"{print $3}' /proc/spl/kstat/zfs/arcstats"))
+        arc_floor_to_size()
+      ''
+    )}
 
     machine.succeed("echo 3 > /proc/sys/vm/drop_caches")
 
@@ -811,7 +829,21 @@ in
                 "pswpout": vmstat("pswpout"),
                 "psi_full": psi_full(),
                 "lru_evict": arcstat("lru_evict"),
-            }
+            }${lib.optionalString arcFloorPinned (
+              lib.replaceStrings [ "\n" ] [ "\n        " ] (
+                "\n"
+                + lib.removeSuffix "\n" ''
+                  def arcline(when):
+                      keys = ("size", "c", "arc_raw_size", "memory_direct_count",
+                              "memory_indirect_count", "lru_evict", "lru_evict_skip",
+                              "lru_evict_busy", "lru_evict_held")
+                      print(f"{when}: " + ", ".join(f"{k} {arcstat(k)}" for k in keys))
+
+                  arcline("before the hog")
+                  arc_floor_to_size()
+                ''
+              )
+            )}
 
             machine.succeed(
                 "systemd-run --unit=anon-hog --collect"
@@ -821,7 +853,15 @@ in
             machine.wait_until_fails(
                 "systemctl is-active anon-hog",
                 timeout=timedelta(seconds=${toString (hogSeconds + 600)}),
-            )
+            )${lib.optionalString arcFloorPinned (
+              lib.replaceStrings [ "\n" ] [ "\n        " ] (
+                "\n"
+                + lib.removeSuffix "\n" ''
+                  arcline("after the hog")
+                  machine.succeed(f"echo {c_min_before} > /sys/module/zfs/parameters/zfs_arc_min")
+                ''
+              )
+            )}
             machine.succeed("systemctl stop hog-sampler || true")
             status = machine.succeed(
                 "systemctl show -p ExecMainStatus --value anon-hog"

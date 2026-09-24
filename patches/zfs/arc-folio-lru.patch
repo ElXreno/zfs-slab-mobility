@@ -1,4 +1,4 @@
-From 4cfcd511b083f0e603b04336aadfb94db45ec11f Mon Sep 17 00:00:00 2001
+From 411303c39ead47f943fcedf153a5c5c64a55f9e3 Mon Sep 17 00:00:00 2001
 From: ElXreno <elxreno@gmail.com>
 Date: Sun, 6 Sep 2026 01:56:17 +0300
 Subject: [PATCH] abd: keep clean ARC buffers as folios in the page cache
@@ -23,9 +23,12 @@ migration arrive holding the folio lock and only ever try the other two.
 
 Joined buffers are read only until freed, which is what makes the copy in
 migration trivially consistent; the writers in abd.c assert it. Clean bytes
-held this way are no longer offered to the ARC shrinker, since the LRU
-already has them. The single chunk linear shortcut is gone on this backend
-because a cached address would go stale when the folio moved.
+held this way stay offered to the ARC shrinker as well: a kernel may keep
+clean file pages out of reclaim altogether, as xanmod's working set
+protection does below its floor, and an ARC that relied on the LRU alone
+would then keep its whole target while the machine starved around it. The
+single chunk linear shortcut is gone on this backend because a cached
+address would go stale when the folio moved.
 
 Needs filemap_add_folio and filemap_remove_folio exported to a CDDL module;
 configure falls back to the stock backend where they are not.
@@ -33,19 +36,18 @@ configure falls back to the stock backend where they are not.
  config/kernel-arc-lru.m4          |  89 +++
  config/kernel.m4                  |   2 +
  include/os/linux/zfs/sys/abd_os.h |   9 +
- include/sys/abd.h                 |  21 +
+ include/sys/abd.h                 |  20 +
  include/sys/abd_impl.h            |   4 +
  include/sys/arc_impl.h            |  14 +
  include/sys/multilist.h           |   1 +
- lib/libzpool/abd_os.c             |  37 ++
- module/os/freebsd/zfs/abd_os.c    |  37 ++
- module/os/linux/zfs/abd_os.c      | 913 +++++++++++++++++++++++++++++-
- module/os/linux/zfs/arc_os.c      |   8 +
+ lib/libzpool/abd_os.c             |  31 +
+ module/os/freebsd/zfs/abd_os.c    |  31 +
+ module/os/linux/zfs/abd_os.c      | 901 +++++++++++++++++++++++++++++-
  module/os/linux/zfs/vdev_disk.c   |  23 +
  module/zfs/abd.c                  |  12 +-
  module/zfs/arc.c                  | 159 +++++-
  module/zfs/multilist.c            |  10 +
- 15 files changed, 1336 insertions(+), 3 deletions(-)
+ 14 files changed, 1303 insertions(+), 3 deletions(-)
  create mode 100644 config/kernel-arc-lru.m4
 
 diff --git a/config/kernel-arc-lru.m4 b/config/kernel-arc-lru.m4
@@ -144,10 +146,10 @@ index 0000000..25d96ae
 +	])
 +])
 diff --git a/config/kernel.m4 b/config/kernel.m4
-index 280f04e..46fa4f5 100644
+index 69b07ae..9c6a2e8 100644
 --- a/config/kernel.m4
 +++ b/config/kernel.m4
-@@ -121,6 +121,7 @@ AC_DEFUN([ZFS_AC_KERNEL_TEST_SRC], [
+@@ -122,6 +122,7 @@ AC_DEFUN([ZFS_AC_KERNEL_TEST_SRC], [
  	ZFS_AC_KERNEL_SRC_ADD_DISK
  	ZFS_AC_KERNEL_SRC_KTHREAD
  	ZFS_AC_KERNEL_SRC_ZERO_PAGE
@@ -155,7 +157,7 @@ index 280f04e..46fa4f5 100644
  	ZFS_AC_KERNEL_SRC_IDMAP_MNT_API
  	ZFS_AC_KERNEL_SRC_IDMAP_NO_USERNS
  	ZFS_AC_KERNEL_SRC_IATTR_VFSID
-@@ -244,6 +245,7 @@ AC_DEFUN([ZFS_AC_KERNEL_TEST_RESULT], [
+@@ -247,6 +248,7 @@ AC_DEFUN([ZFS_AC_KERNEL_TEST_RESULT], [
  	ZFS_AC_KERNEL_ADD_DISK
  	ZFS_AC_KERNEL_KTHREAD
  	ZFS_AC_KERNEL_ZERO_PAGE
@@ -164,7 +166,7 @@ index 280f04e..46fa4f5 100644
  	ZFS_AC_KERNEL_IDMAP_NO_USERNS
  	ZFS_AC_KERNEL_IATTR_VFSID
 diff --git a/include/os/linux/zfs/sys/abd_os.h b/include/os/linux/zfs/sys/abd_os.h
-index 8c4d5b7..4ad6782 100644
+index e214012..2def082 100644
 --- a/include/os/linux/zfs/sys/abd_os.h
 +++ b/include/os/linux/zfs/sys/abd_os.h
 @@ -32,11 +32,15 @@ extern "C" {
@@ -183,7 +185,7 @@ index 8c4d5b7..4ad6782 100644
  };
  
  struct abd_linear {
-@@ -59,6 +63,11 @@ unsigned long abd_nr_pages_off(struct abd *, unsigned int, size_t);
+@@ -51,6 +55,11 @@ int abd_iterate_page_func(struct abd *, size_t, size_t, abd_iter_page_func_t *,
  __attribute__((malloc))
  struct abd *abd_alloc_from_pages(struct page **, unsigned long, uint64_t);
  
@@ -196,7 +198,7 @@ index 8c4d5b7..4ad6782 100644
  }
  #endif
 diff --git a/include/sys/abd.h b/include/sys/abd.h
-index 41cdb26..db2ac46 100644
+index 41cdb26..5fa02ae 100644
 --- a/include/sys/abd.h
 +++ b/include/sys/abd.h
 @@ -31,6 +31,19 @@
@@ -228,14 +230,13 @@ index 41cdb26..db2ac46 100644
  } abd_flags_t;
  
  typedef struct abd {
-@@ -97,6 +112,12 @@ abd_t *abd_get_zeros(size_t);
+@@ -97,6 +112,11 @@ abd_t *abd_get_zeros(size_t);
  abd_t *abd_get_from_buf(void *, size_t);
  abd_t *abd_get_from_buf_struct(abd_t *, void *, size_t);
  void abd_cache_reap_now(void);
 +void abd_lru_join(abd_t *, const abd_lru_ops_t *, void *);
 +void abd_lru_rebind(abd_t *, void *);
 +void abd_lru_touch(abd_t *);
-+uint64_t abd_lru_bytes(void);
 +boolean_t abd_lru_try_prelock(abd_t *);
 +void abd_lru_prelock_release(abd_t *);
  
@@ -308,10 +309,10 @@ index c859a87..24f7e79 100644
  
  void multilist_sublist_insert_head(multilist_sublist_t *, void *);
 diff --git a/lib/libzpool/abd_os.c b/lib/libzpool/abd_os.c
-index 8bd7a64..e17cbb4 100644
+index 8bd7a64..83ebae9 100644
 --- a/lib/libzpool/abd_os.c
 +++ b/lib/libzpool/abd_os.c
-@@ -365,6 +365,43 @@ abd_cache_reap_now(void)
+@@ -365,6 +365,37 @@ abd_cache_reap_now(void)
  {
  }
  
@@ -333,12 +334,6 @@ index 8bd7a64..e17cbb4 100644
 +	(void) abd;
 +}
 +
-+uint64_t
-+abd_lru_bytes(void)
-+{
-+	return (0);
-+}
-+
 +boolean_t
 +abd_lru_try_prelock(abd_t *abd)
 +{
@@ -356,10 +351,10 @@ index 8bd7a64..e17cbb4 100644
   * Borrow a raw buffer from an ABD without copying the contents of the ABD
   * into the buffer. If the ABD is scattered, this will alloate a raw buffer
 diff --git a/module/os/freebsd/zfs/abd_os.c b/module/os/freebsd/zfs/abd_os.c
-index 4bf487c..12333d4 100644
+index 4bf487c..afbbefe 100644
 --- a/module/os/freebsd/zfs/abd_os.c
 +++ b/module/os/freebsd/zfs/abd_os.c
-@@ -586,6 +586,43 @@ abd_cache_reap_now(void)
+@@ -586,6 +586,37 @@ abd_cache_reap_now(void)
  	kmem_cache_reap_soon(abd_chunk_cache);
  }
  
@@ -381,12 +376,6 @@ index 4bf487c..12333d4 100644
 +	(void) abd;
 +}
 +
-+uint64_t
-+abd_lru_bytes(void)
-+{
-+	return (0);
-+}
-+
 +boolean_t
 +abd_lru_try_prelock(abd_t *abd)
 +{
@@ -404,7 +393,7 @@ index 4bf487c..12333d4 100644
   * Borrow a raw buffer from an ABD without copying the contents of the ABD
   * into the buffer. If the ABD is scattered, this will alloate a raw buffer
 diff --git a/module/os/linux/zfs/abd_os.c b/module/os/linux/zfs/abd_os.c
-index 2fd3c3f..59fbfe0 100644
+index 8ecdb25..a215256 100644
 --- a/module/os/linux/zfs/abd_os.c
 +++ b/module/os/linux/zfs/abd_os.c
 @@ -64,6 +64,14 @@
@@ -608,7 +597,7 @@ index 2fd3c3f..59fbfe0 100644
  
  /*
   * The goal is to minimize fragmentation by preferentially populating ABDs
-@@ -424,6 +581,655 @@ abd_alloc_chunks(abd_t *abd, size_t size)
+@@ -424,6 +581,643 @@ abd_alloc_chunks(abd_t *abd, size_t size)
  }
  #endif /* !CONFIG_HIGHMEM */
  
@@ -1055,12 +1044,6 @@ index 2fd3c3f..59fbfe0 100644
 +	}
 +}
 +
-+uint64_t
-+abd_lru_bytes(void)
-+{
-+	return (wmsum_value(&abd_sums.abdstat_lru_bytes));
-+}
-+
 +/*
 + * Called with abd_mtx held and every chunk already referenced and locked when
 + * the reclaimer is the one freeing. abd_reclaiming, if set, names the folio it
@@ -1241,12 +1224,6 @@ index 2fd3c3f..59fbfe0 100644
 +	(void) abd;
 +}
 +
-+uint64_t
-+abd_lru_bytes(void)
-+{
-+	return (0);
-+}
-+
 +void
 +abd_lru_hold_page(struct page *page)
 +{
@@ -1264,7 +1241,7 @@ index 2fd3c3f..59fbfe0 100644
  /*
   * This must be called if any of the sg_table allocation functions
   * are called.
-@@ -456,6 +1262,11 @@ abd_free_chunks(abd_t *abd)
+@@ -456,6 +1250,11 @@ abd_free_chunks(abd_t *abd)
  	 * Scatter ABDs may be constructed by abd_alloc_from_pages() from
  	 * an array of pages. In which case they should not be freed.
  	 */
@@ -1276,7 +1253,7 @@ index 2fd3c3f..59fbfe0 100644
  	if (!abd_is_from_pages(abd)) {
  		abd_for_each_sg(abd, sg, nr_pages, i) {
  			page = sg_page(sg);
-@@ -620,6 +1431,32 @@ abd_kstats_update(kstat_t *ksp, int rw)
+@@ -620,6 +1419,32 @@ abd_kstats_update(kstat_t *ksp, int rw)
  	    wmsum_value(&abd_sums.abdstat_scatter_page_alloc_retry);
  	as->abdstat_scatter_sg_table_retry.value.ui64 =
  	    wmsum_value(&abd_sums.abdstat_scatter_sg_table_retry);
@@ -1309,7 +1286,7 @@ index 2fd3c3f..59fbfe0 100644
  	return (0);
  }
  
-@@ -643,6 +1480,19 @@ abd_init(void)
+@@ -643,6 +1468,19 @@ abd_init(void)
  	wmsum_init(&abd_sums.abdstat_scatter_page_multi_zone, 0);
  	wmsum_init(&abd_sums.abdstat_scatter_page_alloc_retry, 0);
  	wmsum_init(&abd_sums.abdstat_scatter_sg_table_retry, 0);
@@ -1329,7 +1306,7 @@ index 2fd3c3f..59fbfe0 100644
  
  	abd_ksp = kstat_create("zfs", 0, "abdstats", "misc", KSTAT_TYPE_NAMED,
  	    sizeof (abd_stats) / sizeof (kstat_named_t), KSTAT_FLAG_VIRTUAL);
-@@ -659,11 +1509,17 @@ abd_init(void)
+@@ -659,11 +1497,17 @@ abd_init(void)
  	}
  
  	abd_alloc_zero_scatter();
@@ -1347,7 +1324,7 @@ index 2fd3c3f..59fbfe0 100644
  	abd_free_zero_scatter();
  
  	if (abd_ksp != NULL) {
-@@ -683,6 +1539,19 @@ abd_fini(void)
+@@ -683,6 +1527,19 @@ abd_fini(void)
  	wmsum_fini(&abd_sums.abdstat_scatter_page_multi_zone);
  	wmsum_fini(&abd_sums.abdstat_scatter_page_alloc_retry);
  	wmsum_fini(&abd_sums.abdstat_scatter_sg_table_retry);
@@ -1367,7 +1344,7 @@ index 2fd3c3f..59fbfe0 100644
  
  	if (abd_cache) {
  		kmem_cache_destroy(abd_cache);
-@@ -818,6 +1687,9 @@ abd_get_offset_scatter(abd_t *abd, abd_t *sabd, size_t off,
+@@ -818,6 +1675,9 @@ abd_get_offset_scatter(abd_t *abd, abd_t *sabd, size_t off,
  	ABD_SCATTER(abd).abd_sgl = sg;
  	ABD_SCATTER(abd).abd_offset = new_offset;
  	ABD_SCATTER(abd).abd_nents = ABD_SCATTER(sabd).abd_nents - i;
@@ -1377,7 +1354,7 @@ index 2fd3c3f..59fbfe0 100644
  
  	if (abd_is_from_pages(sabd))
  		abd->abd_flags |= ABD_FLAG_FROM_PAGES;
-@@ -923,7 +1795,12 @@ abd_iter_map(struct abd_iter *aiter)
+@@ -923,7 +1783,12 @@ abd_iter_map(struct abd_iter *aiter)
  		aiter->iter_mapsize = MIN(aiter->iter_sg->length - offset,
  		    aiter->iter_abd->abd_size - aiter->iter_pos);
  
@@ -1390,7 +1367,7 @@ index 2fd3c3f..59fbfe0 100644
  		if (PageHighMem(page)) {
  			page = nth_page(page, offset / PAGE_SIZE);
  			offset &= PAGE_SIZE - 1;
-@@ -950,12 +1827,20 @@ abd_iter_unmap(struct abd_iter *aiter)
+@@ -950,12 +1815,20 @@ abd_iter_unmap(struct abd_iter *aiter)
  	if (!abd_is_linear(aiter->iter_abd)) {
  		size_t offset = aiter->iter_offset;
  
@@ -1411,7 +1388,7 @@ index 2fd3c3f..59fbfe0 100644
  	}
  
  	ASSERT3P(aiter->iter_mapaddr, !=, NULL);
-@@ -1131,9 +2016,29 @@ abd_return_buf_copy(abd_t *abd, void *buf, size_t n)
+@@ -1131,9 +2004,29 @@ abd_return_buf_copy(abd_t *abd, void *buf, size_t n)
  #define	ABD_ITER_PAGE_SIZE(page)	(PAGESIZE)
  #endif
  
@@ -1441,7 +1418,7 @@ index 2fd3c3f..59fbfe0 100644
  	if (abd_iter_at_end(aiter)) {
  		aiter->iter_page = NULL;
  		aiter->iter_page_doff = 0;
-@@ -1166,8 +2071,14 @@ abd_iter_page(struct abd_iter *aiter)
+@@ -1166,8 +2059,14 @@ abd_iter_page(struct abd_iter *aiter)
  		ASSERT(!abd_is_gang(aiter->iter_abd));
  
  		/* current scatter page */
@@ -1456,30 +1433,11 @@ index 2fd3c3f..59fbfe0 100644
  
  		/* position within page */
  		doff = aiter->iter_offset & (PAGESIZE - 1);
-diff --git a/module/os/linux/zfs/arc_os.c b/module/os/linux/zfs/arc_os.c
-index 6478c83..358825f 100644
---- a/module/os/linux/zfs/arc_os.c
-+++ b/module/os/linux/zfs/arc_os.c
-@@ -156,6 +156,14 @@ arc_evictable_memory(void)
- 	    zfs_refcount_count(&arc_mfu->arcs_esize[ARC_BUFC_METADATA]);
- 	uint64_t arc_dirty = MAX((int64_t)asize - (int64_t)arc_clean, 0);
- 
-+	/*
-+	 * What sits in the page cache is already the kernel's to take
-+	 * through its LRU, so it is not offered a second time here.
-+	 */
-+	uint64_t lru = abd_lru_bytes();
-+	arc_clean = (arc_clean > lru) ? arc_clean - lru : 0;
-+	asize = (asize > (int64_t)lru) ? asize - (int64_t)lru : 0;
-+
- 	/*
- 	 * Scale reported evictable memory in proportion to page cache, cap
- 	 * at specified min/max.
 diff --git a/module/os/linux/zfs/vdev_disk.c b/module/os/linux/zfs/vdev_disk.c
-index ab7457b..fd67af1 100644
+index b00e74b..77c3d2a 100644
 --- a/module/os/linux/zfs/vdev_disk.c
 +++ b/module/os/linux/zfs/vdev_disk.c
-@@ -666,6 +666,9 @@ typedef struct {
+@@ -718,6 +718,9 @@ typedef struct {
  
  	abd_t		*vbio_abd;	/* abd carrying borrowed linear buf */
  
@@ -1489,7 +1447,7 @@ index ab7457b..fd67af1 100644
  	uint_t		vbio_max_segs;	/* max segs per bio */
  
  	uint_t		vbio_max_bytes;	/* max bytes per bio */
-@@ -685,6 +688,8 @@ vbio_alloc(zio_t *zio, struct block_device *bdev, int flags)
+@@ -737,6 +740,8 @@ vbio_alloc(zio_t *zio, struct block_device *bdev, int flags)
  	vbio->vbio_zio = zio;
  	vbio->vbio_bdev = bdev;
  	vbio->vbio_abd = NULL;
@@ -1498,7 +1456,7 @@ index ab7457b..fd67af1 100644
  	vbio->vbio_max_segs = vdev_bio_max_segs(bdev);
  	vbio->vbio_max_bytes = vdev_bio_max_bytes(bdev);
  	vbio->vbio_lbs_mask = ~(bdev_logical_block_size(bdev)-1);
-@@ -755,9 +760,19 @@ static int
+@@ -807,9 +812,19 @@ static int
  vbio_fill_cb(struct page *page, size_t off, size_t len, void *priv)
  {
  	vbio_t *vbio = priv;
@@ -1518,7 +1476,7 @@ index ab7457b..fd67af1 100644
  /* Create some BIOs, fill them with data and submit them */
  static void
  vbio_submit(vbio_t *vbio, abd_t *abd, uint64_t size)
-@@ -773,6 +788,8 @@ vbio_submit(vbio_t *vbio, abd_t *abd, uint64_t size)
+@@ -825,6 +840,8 @@ vbio_submit(vbio_t *vbio, abd_t *abd, uint64_t size)
  	struct blk_plug plug;
  	blk_start_plug(&plug);
  
@@ -1527,7 +1485,7 @@ index ab7457b..fd67af1 100644
  	(void) abd_iterate_page_func(abd, 0, size, vbio_fill_cb, vbio);
  	ASSERT(vbio->vbio_bio);
  
-@@ -1226,6 +1243,12 @@ vdev_disk_io_done(zio_t *zio)
+@@ -1278,6 +1295,12 @@ vdev_disk_io_done(zio_t *zio)
  		vbio_t *vbio = zio->io_bio;
  		zio->io_bio = NULL;
  
@@ -1593,7 +1551,7 @@ index 7ea07c4..c06a799 100644
  	    abd_copy_off_cb, NULL);
  }
 diff --git a/module/zfs/arc.c b/module/zfs/arc.c
-index 1443d1e..9f82b3a 100644
+index c102ddf..99d9442 100644
 --- a/module/zfs/arc.c
 +++ b/module/zfs/arc.c
 @@ -540,6 +540,11 @@ arc_stats_t arc_stats = {
@@ -1608,7 +1566,7 @@ index 1443d1e..9f82b3a 100644
  	{ "move_relocated",		KSTAT_DATA_UINT64 },
  	{ "move_not_live",		KSTAT_DATA_UINT64 },
  	{ "move_raced",			KSTAT_DATA_UINT64 },
-@@ -2995,8 +3000,10 @@ arc_hdr_free_on_write(arc_buf_hdr_t *hdr, boolean_t free_rdata)
+@@ -2996,8 +3001,10 @@ arc_hdr_free_on_write(arc_buf_hdr_t *hdr, boolean_t free_rdata)
  	}
  
  	if (free_rdata) {
@@ -1619,7 +1577,7 @@ index 1443d1e..9f82b3a 100644
  		l2arc_free_abd_on_write(hdr->b_l1hdr.b_pabd, size, type);
  	}
  }
-@@ -3587,6 +3594,9 @@ arc_hdr_move(void *buf, void *newbuf, size_t size, void *arg)
+@@ -3588,6 +3595,9 @@ arc_hdr_move(void *buf, void *newbuf, size_t size, void *arg)
  #ifdef ZFS_DEBUG
  	mutex_init(&nhdr->b_l1hdr.b_freeze_lock, NULL, MUTEX_DEFAULT, NULL);
  #endif
@@ -1629,7 +1587,7 @@ index 1443d1e..9f82b3a 100644
  
  	if (mls != NULL) {
  		/*
-@@ -4086,6 +4096,124 @@ arc_evict_hdr(arc_buf_hdr_t *hdr, uint64_t *real_evicted)
+@@ -4087,6 +4097,124 @@ arc_evict_hdr(arc_buf_hdr_t *hdr, uint64_t *real_evicted)
  	return (bytes_evicted);
  }
  
@@ -1754,7 +1712,7 @@ index 1443d1e..9f82b3a 100644
  static void
  arc_set_need_free(void)
  {
-@@ -5541,6 +5669,11 @@ arc_access(arc_buf_hdr_t *hdr, arc_flags_t arc_flags, boolean_t hit)
+@@ -5542,6 +5670,11 @@ arc_access(arc_buf_hdr_t *hdr, arc_flags_t arc_flags, boolean_t hit)
  	ASSERT(MUTEX_HELD(HDR_LOCK(hdr)));
  	ASSERT(HDR_HAS_L1HDR(hdr));
  
@@ -1766,7 +1724,7 @@ index 1443d1e..9f82b3a 100644
  	/*
  	 * Update buffer prefetch status.
  	 */
-@@ -5948,8 +6081,11 @@ arc_read_done(zio_t *zio)
+@@ -5949,8 +6082,11 @@ arc_read_done(zio_t *zio)
  	arc_hdr_clear_flags(hdr, ARC_FLAG_IO_IN_PROGRESS);
  	(void) remove_reference(hdr, hdr);
  
@@ -1779,7 +1737,7 @@ index 1443d1e..9f82b3a 100644
  
  	/* execute each callback and free its structure */
  	while ((acb = callback_list) != NULL) {
-@@ -7225,6 +7361,7 @@ arc_write_done(zio_t *zio)
+@@ -7226,6 +7362,7 @@ arc_write_done(zio_t *zio)
  		/* if it's not anon, we are doing a scrub */
  		if (exists == NULL && hdr->b_l1hdr.b_state == arc_anon)
  			arc_access(hdr, 0, B_FALSE);
@@ -1787,7 +1745,7 @@ index 1443d1e..9f82b3a 100644
  		mutex_exit(hash_lock);
  	} else {
  		arc_hdr_clear_flags(hdr, ARC_FLAG_IO_IN_PROGRESS);
-@@ -7512,6 +7649,16 @@ arc_kstat_update(kstat_t *ksp, int rw)
+@@ -7513,6 +7650,16 @@ arc_kstat_update(kstat_t *ksp, int rw)
  	    wmsum_value(&arc_sums.arcstat_evict_l2_ineligible);
  	as->arcstat_evict_l2_skip.value.ui64 =
  	    wmsum_value(&arc_sums.arcstat_evict_l2_skip);
@@ -1804,7 +1762,7 @@ index 1443d1e..9f82b3a 100644
  	as->arcstat_move_relocated.value.ui64 =
  	    wmsum_value(&arc_sums.arcstat_move_relocated);
  	as->arcstat_move_not_live.value.ui64 =
-@@ -7962,6 +8109,11 @@ arc_state_init(void)
+@@ -7963,6 +8110,11 @@ arc_state_init(void)
  	wmsum_init(&arc_sums.arcstat_evict_l2_eligible_mru, 0);
  	wmsum_init(&arc_sums.arcstat_evict_l2_ineligible, 0);
  	wmsum_init(&arc_sums.arcstat_evict_l2_skip, 0);
@@ -1816,7 +1774,7 @@ index 1443d1e..9f82b3a 100644
  	wmsum_init(&arc_sums.arcstat_move_relocated, 0);
  	wmsum_init(&arc_sums.arcstat_move_not_live, 0);
  	wmsum_init(&arc_sums.arcstat_move_raced, 0);
-@@ -8132,6 +8284,11 @@ arc_state_fini(void)
+@@ -8133,6 +8285,11 @@ arc_state_fini(void)
  	wmsum_fini(&arc_sums.arcstat_evict_l2_eligible_mru);
  	wmsum_fini(&arc_sums.arcstat_evict_l2_ineligible);
  	wmsum_fini(&arc_sums.arcstat_evict_l2_skip);
