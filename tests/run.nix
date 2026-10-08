@@ -893,9 +893,11 @@ in
                     f"MemAvailable counts {hog['mem_available'] - hog['mem_free']} bytes"
                     f" beyond MemFree, the ARC holds {hog['lru_bytes']} in the page cache"
                 )
-                assert hog["zswpout"] == 0 and hog["pswpout"] == 0, (
-                    f"{hog['zswpout']} pages went to zswap and {hog['pswpout']} to"
-                    " the swap device while the ARC held reclaimable memory"
+                # with the floor pinned, round robin over cgroups may take a little from the hog
+                zswap_allowed = ${toString (if arcFloorPinned then anonHogMB * 256 / 100 else 0)}
+                assert hog["zswpout"] <= zswap_allowed and hog["pswpout"] == 0, (
+                    f"{hog['zswpout']} pages went to zswap (allowed {zswap_allowed}) and"
+                    f" {hog['pswpout']} to the swap device while the ARC held reclaimable memory"
                 )
                 assert hog["psi_full_us"] <= 3000000, (
                     f"everything stood still for memory {hog['psi_full_us']} us"
