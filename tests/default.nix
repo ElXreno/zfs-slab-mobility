@@ -31,6 +31,15 @@ let
 
   mkCompare = import ./compare.nix { inherit pkgs lib fragview; };
 
+  mkMemcg = import ./memcg-lru.nix {
+    inherit
+      pkgs
+      lib
+      variants
+      fragcheck
+      ;
+  };
+
   seeds = [
     1
     2
@@ -63,6 +72,19 @@ let
     spikeRounds = 5;
     hungTaskSeconds = 20;
   };
+
+  memcgRuns =
+    variant:
+    pkgs.runCommand "memcg-lru-${variant}"
+      {
+        runs = map (seed: mkMemcg { inherit variant seed; }) seeds;
+      }
+      ''
+        mkdir -p $out
+        for r in $runs; do
+          ln -s $r $out/$(basename $r)
+        done
+      '';
 
   runsForSeeds =
     theseSeeds: args: variant:
@@ -468,6 +490,11 @@ let
         spikeSeconds = 900;
       }
     );
+
+    # A stale cache in a young cgroup has to stay reachable while the ARC keeps reading.
+    arc-lru-memcg = memcgRuns "arclru";
+    arc-lru-memcg-xanmod = memcgRuns "arclruXanmod";
+    memcg-stock = memcgRuns "stock";
 
     # The hog and the byte check on a raidz, so column ABDs and reconstruction
     # run beside joined buffers.
