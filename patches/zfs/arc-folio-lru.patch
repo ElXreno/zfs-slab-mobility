@@ -1,4 +1,4 @@
-From 09d397d47f14a202dd965821ded8810062a0c8c9 Mon Sep 17 00:00:00 2001
+From 005b80b8c7840b00c7014d1a0ba9a4a1c3836e05 Mon Sep 17 00:00:00 2001
 From: ElXreno <elxreno@gmail.com>
 Date: Sun, 6 Sep 2026 01:56:17 +0300
 Subject: [PATCH] abd: keep clean ARC buffers as folios in the page cache
@@ -39,8 +39,8 @@ would take from the ARC every time and never reach a stale cache in any other
 cgroup. A hit touches both buffers of an encrypted header: evicting either
 frees the pair, so a raw copy left cold would take the hot one with it.
 
-Needs filemap_add_folio and filemap_remove_folio exported to a CDDL module;
-configure falls back to the stock backend where they are not.
+Needs filemap_add_folio_active and filemap_remove_folio exported to a CDDL
+module; configure falls back to the stock backend where they are not.
 ---
  config/kernel-arc-lru.m4          |  89 +++
  config/kernel.m4                  |   2 +
@@ -51,17 +51,17 @@ configure falls back to the stock backend where they are not.
  include/sys/multilist.h           |   1 +
  lib/libzpool/abd_os.c             |  31 +
  module/os/freebsd/zfs/abd_os.c    |  31 +
- module/os/linux/zfs/abd_os.c      | 904 +++++++++++++++++++++++++++++-
+ module/os/linux/zfs/abd_os.c      | 902 +++++++++++++++++++++++++++++-
  module/os/linux/zfs/vdev_disk.c   |  23 +
  module/zfs/abd.c                  |  12 +-
  module/zfs/arc.c                  | 161 +++++-
  module/zfs/multilist.c            |  10 +
- 14 files changed, 1308 insertions(+), 3 deletions(-)
+ 14 files changed, 1306 insertions(+), 3 deletions(-)
  create mode 100644 config/kernel-arc-lru.m4
 
 diff --git a/config/kernel-arc-lru.m4 b/config/kernel-arc-lru.m4
 new file mode 100644
-index 0000000..25d96ae
+index 0000000..a71f794
 --- /dev/null
 +++ b/config/kernel-arc-lru.m4
 @@ -0,0 +1,89 @@
@@ -70,8 +70,8 @@ index 0000000..25d96ae
 +dnl # The folio backed scatter ABD keeps clean ARC buffers in the page cache
 +dnl # of an anonymous inode, reclaimed through release_folio and moved through
 +dnl # migrate_folio. Everything it calls has to be exported to a CDDL module,
-+dnl # which for filemap_add_folio and filemap_remove_folio means a kernel
-+dnl # carrying the export patch.
++dnl # which for filemap_add_folio_active and filemap_remove_folio means a
++dnl # kernel carrying the export patch.
 +dnl #
 +m4_pattern_allow([AS_KERNEL_FILE])
 +
@@ -134,7 +134,7 @@ index 0000000..25d96ae
 +		mapping_set_exiting(inode->i_mapping);
 +		set_bit(AS_KERNEL_FILE, &inode->i_mapping->flags);
 +		folio_change_private(folio, inode);
-+		(void) filemap_add_folio(inode->i_mapping, folio,
++		(void) filemap_add_folio_active(inode->i_mapping, folio,
 +		    (pgoff_t)MAX_PAGECACHE_ORDER, GFP_NOIO);
 +		folio_mark_accessed(folio);
 +		filemap_remove_folio(folio);
@@ -402,7 +402,7 @@ index 4bf487c..afbbefe 100644
   * Borrow a raw buffer from an ABD without copying the contents of the ABD
   * into the buffer. If the ABD is scattered, this will alloate a raw buffer
 diff --git a/module/os/linux/zfs/abd_os.c b/module/os/linux/zfs/abd_os.c
-index 8ecdb25..cdfc468 100644
+index 8ecdb25..4471211 100644
 --- a/module/os/linux/zfs/abd_os.c
 +++ b/module/os/linux/zfs/abd_os.c
 @@ -64,6 +64,14 @@
@@ -606,7 +606,7 @@ index 8ecdb25..cdfc468 100644
  
  /*
   * The goal is to minimize fragmentation by preferentially populating ABDs
-@@ -424,6 +581,646 @@ abd_alloc_chunks(abd_t *abd, size_t size)
+@@ -424,6 +581,644 @@ abd_alloc_chunks(abd_t *abd, size_t size)
  }
  #endif /* !CONFIG_HIGHMEM */
  
@@ -1002,11 +1002,9 @@ index 8ecdb25..cdfc468 100644
 +		ASSERT(folio_test_private(folio));
 +		folio_change_private(folio, abd);
 +		/* Not the oldest generation, or the root memcg never ages. */
-+		folio_set_active(folio);
-+		if (filemap_add_folio(abd_lru_mapping, folio,
++		if (filemap_add_folio_active(abd_lru_mapping, folio,
 +		    abd_lru_index(folio_order(folio)),
 +		    GFP_NOIO | __GFP_NOWARN) != 0) {
-+			folio_clear_active(folio);
 +			folio_change_private(folio,
 +			    (void *)ABD_FILE_CACHE_PAGE);
 +			ABDSTAT_BUMP(abdstat_lru_join_fail);
@@ -1253,7 +1251,7 @@ index 8ecdb25..cdfc468 100644
  /*
   * This must be called if any of the sg_table allocation functions
   * are called.
-@@ -456,6 +1253,11 @@ abd_free_chunks(abd_t *abd)
+@@ -456,6 +1251,11 @@ abd_free_chunks(abd_t *abd)
  	 * Scatter ABDs may be constructed by abd_alloc_from_pages() from
  	 * an array of pages. In which case they should not be freed.
  	 */
@@ -1265,7 +1263,7 @@ index 8ecdb25..cdfc468 100644
  	if (!abd_is_from_pages(abd)) {
  		abd_for_each_sg(abd, sg, nr_pages, i) {
  			page = sg_page(sg);
-@@ -620,6 +1422,32 @@ abd_kstats_update(kstat_t *ksp, int rw)
+@@ -620,6 +1420,32 @@ abd_kstats_update(kstat_t *ksp, int rw)
  	    wmsum_value(&abd_sums.abdstat_scatter_page_alloc_retry);
  	as->abdstat_scatter_sg_table_retry.value.ui64 =
  	    wmsum_value(&abd_sums.abdstat_scatter_sg_table_retry);
@@ -1298,7 +1296,7 @@ index 8ecdb25..cdfc468 100644
  	return (0);
  }
  
-@@ -643,6 +1471,19 @@ abd_init(void)
+@@ -643,6 +1469,19 @@ abd_init(void)
  	wmsum_init(&abd_sums.abdstat_scatter_page_multi_zone, 0);
  	wmsum_init(&abd_sums.abdstat_scatter_page_alloc_retry, 0);
  	wmsum_init(&abd_sums.abdstat_scatter_sg_table_retry, 0);
@@ -1318,7 +1316,7 @@ index 8ecdb25..cdfc468 100644
  
  	abd_ksp = kstat_create("zfs", 0, "abdstats", "misc", KSTAT_TYPE_NAMED,
  	    sizeof (abd_stats) / sizeof (kstat_named_t), KSTAT_FLAG_VIRTUAL);
-@@ -659,11 +1500,17 @@ abd_init(void)
+@@ -659,11 +1498,17 @@ abd_init(void)
  	}
  
  	abd_alloc_zero_scatter();
@@ -1336,7 +1334,7 @@ index 8ecdb25..cdfc468 100644
  	abd_free_zero_scatter();
  
  	if (abd_ksp != NULL) {
-@@ -683,6 +1530,19 @@ abd_fini(void)
+@@ -683,6 +1528,19 @@ abd_fini(void)
  	wmsum_fini(&abd_sums.abdstat_scatter_page_multi_zone);
  	wmsum_fini(&abd_sums.abdstat_scatter_page_alloc_retry);
  	wmsum_fini(&abd_sums.abdstat_scatter_sg_table_retry);
@@ -1356,7 +1354,7 @@ index 8ecdb25..cdfc468 100644
  
  	if (abd_cache) {
  		kmem_cache_destroy(abd_cache);
-@@ -818,6 +1678,9 @@ abd_get_offset_scatter(abd_t *abd, abd_t *sabd, size_t off,
+@@ -818,6 +1676,9 @@ abd_get_offset_scatter(abd_t *abd, abd_t *sabd, size_t off,
  	ABD_SCATTER(abd).abd_sgl = sg;
  	ABD_SCATTER(abd).abd_offset = new_offset;
  	ABD_SCATTER(abd).abd_nents = ABD_SCATTER(sabd).abd_nents - i;
@@ -1366,7 +1364,7 @@ index 8ecdb25..cdfc468 100644
  
  	if (abd_is_from_pages(sabd))
  		abd->abd_flags |= ABD_FLAG_FROM_PAGES;
-@@ -923,7 +1786,12 @@ abd_iter_map(struct abd_iter *aiter)
+@@ -923,7 +1784,12 @@ abd_iter_map(struct abd_iter *aiter)
  		aiter->iter_mapsize = MIN(aiter->iter_sg->length - offset,
  		    aiter->iter_abd->abd_size - aiter->iter_pos);
  
@@ -1379,7 +1377,7 @@ index 8ecdb25..cdfc468 100644
  		if (PageHighMem(page)) {
  			page = nth_page(page, offset / PAGE_SIZE);
  			offset &= PAGE_SIZE - 1;
-@@ -950,12 +1818,20 @@ abd_iter_unmap(struct abd_iter *aiter)
+@@ -950,12 +1816,20 @@ abd_iter_unmap(struct abd_iter *aiter)
  	if (!abd_is_linear(aiter->iter_abd)) {
  		size_t offset = aiter->iter_offset;
  
@@ -1400,7 +1398,7 @@ index 8ecdb25..cdfc468 100644
  	}
  
  	ASSERT3P(aiter->iter_mapaddr, !=, NULL);
-@@ -1131,9 +2007,29 @@ abd_return_buf_copy(abd_t *abd, void *buf, size_t n)
+@@ -1131,9 +2005,29 @@ abd_return_buf_copy(abd_t *abd, void *buf, size_t n)
  #define	ABD_ITER_PAGE_SIZE(page)	(PAGESIZE)
  #endif
  
@@ -1430,7 +1428,7 @@ index 8ecdb25..cdfc468 100644
  	if (abd_iter_at_end(aiter)) {
  		aiter->iter_page = NULL;
  		aiter->iter_page_doff = 0;
-@@ -1166,8 +2062,14 @@ abd_iter_page(struct abd_iter *aiter)
+@@ -1166,8 +2060,14 @@ abd_iter_page(struct abd_iter *aiter)
  		ASSERT(!abd_is_gang(aiter->iter_abd));
  
  		/* current scatter page */

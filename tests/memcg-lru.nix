@@ -135,6 +135,9 @@
     assert status in ("", "0"), f"the hog exited {status}"
     after = stale_file()
     machine.succeed("systemctl stop reader")
+    folio_warned = machine.execute(
+        "journalctl -k -b -o cat | grep -E 'WARNING: .*filemap_add_folio'"
+    )[0] == 0
 
     result = {
         "variant": "${variant}",
@@ -146,12 +149,14 @@
         "arc_mean": sum(arc_seen) // len(arc_seen),
         "arc_samples": len(arc_seen),
         "lru_bytes_after": abdstat("lru_bytes"),
+        "filemap_add_folio_warned": folio_warned,
     }
     print(json.dumps(result))
     os.makedirs(os.environ["out"], exist_ok=True)
     with open(os.path.join(os.environ["out"], "fair.json"), "w") as f:
         json.dump(result, f, indent=1)
 
+    assert not folio_warned, "the page cache warned about a folio the ARC joined"
     assert result["stale_kept_permille"] <= 500, (
         f"reclaim left {after} of {before} bytes of a cache nobody touched,"
         f" while the ARC went down to {result['arc_min']}"
