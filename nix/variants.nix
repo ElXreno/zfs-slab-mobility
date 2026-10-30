@@ -213,14 +213,6 @@ in
 
   stockXanmod = mkVariant { xanmod = true; };
 
-  # Readahead filled per block instead of per page, on stock and on the backend.
+  # Readahead filled per block instead of per page, on stock; the backend carries it in its series.
   stockRa = mkVariant { zplReadahead = true; };
-
-  arclruRa = mkVariant {
-    slabMobility = true;
-    filemapExports = true;
-    largeFolioCompaction = true;
-    arcLru = true;
-    zplReadahead = true;
-  };
 }

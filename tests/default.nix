@@ -93,10 +93,6 @@ let
       variant = "stockRa";
       readAheadKB = 128;
     };
-    zfs-arclruRa-ra1024 = mkMmapSparse {
-      variant = "arclruRa";
-      readAheadKB = 1024;
-    };
     xfs-stock-dense = mkMmapSparse (dense // {
       variant = "stock";
       fs = "xfs";
@@ -144,8 +140,8 @@ let
       ]
     )
     // {
-      arclruRa-seed1 = mkZplReadahead {
-        variant = "arclruRa";
+      arclru-seed1 = mkZplReadahead {
+        variant = "arclru";
         scene = "deadlock";
       };
     };
@@ -166,8 +162,8 @@ let
       scene = "bytes";
       readAheadKB = 128;
     };
-    arclruRa-ra1024 = mkZplReadahead {
-      variant = "arclruRa";
+    arclru-ra1024 = mkZplReadahead {
+      variant = "arclru";
       scene = "bytes";
       readAheadKB = 1024;
     };

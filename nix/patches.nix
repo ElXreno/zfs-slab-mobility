@@ -41,6 +41,7 @@ let
     "eio-diag"
     "arc-hdr-accounting"
     "arc-folio-lru"
+    "zpl-readahead-batch"
   ];
 
   # The one probe that still applies on the folio backend.
@@ -60,10 +61,16 @@ let
   alone = [
     "no-kswapd-wake"
     "arc-lru-deadlock-inject"
-    "zpl-readahead-batch"
   ];
 
-  named = relocation ++ probes ++ alone ++ [ "arc-folio-lru" ];
+  named =
+    relocation
+    ++ probes
+    ++ alone
+    ++ [
+      "arc-folio-lru"
+      "zpl-readahead-batch"
+    ];
 
   byName = builtins.listToAttrs (
     map (name: {
