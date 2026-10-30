@@ -40,6 +40,48 @@ let
       ;
   };
 
+  mkMmapSparse = import ./mmap-sparse.nix { inherit pkgs lib variants; };
+
+  mkCompactionIsolate = import ./compaction-isolate.nix { inherit pkgs lib variants; };
+
+  compactionIsolateRuns = lib.listToAttrs (
+    lib.concatMap (
+      variant:
+      map (seed: {
+        name = "${variant}-seed${toString seed}";
+        value = mkCompactionIsolate { inherit variant seed; };
+      }) seeds
+    ) [
+      "stock"
+      "arclru"
+    ]
+  );
+
+  mmapSparseRuns = {
+    xfs-stock = mkMmapSparse {
+      variant = "stock";
+      fs = "xfs";
+    };
+    zfs-stock = mkMmapSparse { variant = "stock"; };
+    zfs-arclru = mkMmapSparse { variant = "arclru"; };
+    zfs-arclru-nommap = mkMmapSparse {
+      variant = "arclru";
+      mmap = false;
+    };
+    zfs-arclru-nomglru = mkMmapSparse {
+      variant = "arclru";
+      mglru = false;
+    };
+    zfs-arclru-ra128 = mkMmapSparse {
+      variant = "arclru";
+      readAheadKB = 128;
+    };
+    zfs-arclru-ra1024 = mkMmapSparse {
+      variant = "arclru";
+      readAheadKB = 1024;
+    };
+  };
+
   seeds = [
     1
     2
@@ -495,6 +537,44 @@ let
     arc-lru-memcg = memcgRuns "arclru";
     arc-lru-memcg-xanmod = memcgRuns "arclruXanmod";
     memcg-stock = memcgRuns "stock";
+
+    # Free memory one compaction pass holds isolated for a large folio without a target.
+    compaction-isolate =
+      pkgs.runCommand "compaction-isolate"
+        {
+          nativeBuildInputs = [ pkgs.jq ];
+          passthru = compactionIsolateRuns;
+        }
+        ''
+          mkdir -p $out
+          ${lib.concatStrings (lib.mapAttrsToList (n: r: "ln -s ${r} $out/${n}\n") compactionIsolateRuns)}
+          jq -r -s '
+            ["run", "free_unused", "free_taken", "pgmigrate_success", "dip_mib", "free_before_mib",
+             "compaction_s", "pgmigrate_fail", "mthp_split"],
+            (.[] | [.name, .free_unused, .free_taken, .pgmigrate_success, .dip_mib, .free_before_mib,
+              .compaction_s, .pgmigrate_fail, .mthp_split])
+            | @tsv' $out/*/result.json | tee $out/report.tsv
+        '';
+
+    # A use-once mmap stream against idle anonymous memory and a warm cache, ZFS beside XFS.
+    mmap-sparse =
+      pkgs.runCommand "mmap-sparse"
+        {
+          nativeBuildInputs = [ pkgs.jq ];
+          passthru = mmapSparseRuns;
+        }
+        ''
+          mkdir -p $out
+          ${lib.concatStrings (lib.mapAttrsToList (n: r: "ln -s ${r} $out/${n}\n") mmapSparseRuns)}
+          jq -r -s '
+            ["run", "cold_swap_MiB", "permille", "warm_reread_MiB", "arc_min_MiB", "mapped_peak_MiB",
+             "wall_s", "sys_s", "majfault", "steal_anon", "steal_file", "psi_full_ms"],
+            (.[] | [.name, (.cold_swap_peak / 1048576 | floor), .cold_swapped_permille,
+              (.warm_reread_disk / 1048576 | floor), (.arc_min / 1048576 | floor),
+              (.mapped_peak / 1048576 | floor), .stream_wall_s, .stream_sys_s, .pgmajfault,
+              .pgsteal_anon, .pgsteal_file, .psi_full_ms])
+            | @tsv' $out/*/result.json | tee $out/report.tsv
+        '';
 
     # The hog and the byte check on a raidz, so column ABDs and reconstruction
     # run beside joined buffers.
