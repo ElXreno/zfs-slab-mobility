@@ -169,6 +169,82 @@ let
     };
   };
 
+  mkExecStart = import ./exec-start.nix { inherit pkgs variants; };
+
+  execStartRuns = lib.listToAttrs (
+    map
+      (
+        {
+          variant,
+          ra,
+          seed ? 1,
+        }:
+        {
+          name =
+            "${variant}-ra${if ra == null then "default" else toString ra}"
+            + lib.optionalString (seed != 1) "-seed${toString seed}";
+          value = mkExecStart {
+            inherit variant seed;
+            readAheadKB = ra;
+          };
+        }
+      )
+      (
+        lib.concatMap
+          (
+            seed:
+            map (r: r // { inherit seed; }) [
+              {
+                variant = "stock";
+                ra = null;
+              }
+              {
+                variant = "stockRa";
+                ra = null;
+              }
+              {
+                variant = "stock";
+                ra = 128;
+              }
+            ]
+          )
+          [
+            2
+            3
+          ]
+        ++ [
+          {
+            variant = "stock";
+            ra = null;
+          }
+          {
+            variant = "stockRa";
+            ra = null;
+          }
+          {
+            variant = "stock";
+            ra = 0;
+          }
+          {
+            variant = "stock";
+            ra = 128;
+          }
+          {
+            variant = "stockRa";
+            ra = 0;
+          }
+          {
+            variant = "stockRa";
+            ra = 128;
+          }
+          {
+            variant = "stockRa";
+            ra = 1024;
+          }
+        ]
+      )
+  );
+
   collect =
     name: runs: columns:
     pkgs.runCommand name
@@ -655,6 +731,11 @@ let
               .compaction_s, .pgmigrate_fail, .mthp_split])
             | @tsv' $out/*/result.json | tee $out/report.tsv
         '';
+
+    # A cold compiler start from ZFS for each readahead window, to choose the default.
+    exec-start = collect "exec-start" execStartRuns ''
+      ["run", "read_ahead_kb", "median_wall_s", "median_disk_mib", "median_majflt", "walls"],
+      (.[] | [.name, .read_ahead_kb, .median_wall, (.median_disk_mib | floor), .median_majflt, (.walls | tostring)]) | @tsv'';
 
     # A readahead batch against writers to the same file, openzfs/zfs#19447.
     zpl-readahead-deadlock = collect "zpl-readahead-deadlock" zplDeadlockRuns ''
