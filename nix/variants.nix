@@ -118,7 +118,10 @@ let
         )
         ++ lib.optional noKswapdWake patches.zfs.each.no-kswapd-wake
         ++ lib.optional deadlockInject patches.zfs.each.arc-lru-deadlock-inject
-        ++ lib.optional zplReadahead patches.zfs.each.zpl-readahead-batch;
+        ++ lib.optionals zplReadahead [
+          patches.zfs.each.zpl-readahead-batch
+          patches.zfs.each.zpl-readahead-default
+        ];
 
       packages = pkgs.linuxPackagesFor kernel;
     in

@@ -1,0 +1,44 @@
+From c3e8423e114d2e5301bef515f789693341189615 Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Fri, 30 Oct 2026 21:40:16 +0300
+Subject: [PATCH] Linux: leave mmap readahead at the kernel default
+
+Every mount zeroes the readahead window of its bdi, so a fault on a
+mapped file reads one page and nothing around it. The line came in
+with the per filesystem bdi in 2011, "Disable Linux read-ahead handled
+by lower layers": read(2) never goes through the page cache, the DMU
+prefetcher already streams blocks into the ARC, and the only reader of
+the window, readahead into the page cache, filled one page at a time
+through zfs_getpage().
+
+With the batch filled from one hold of its dbufs that last reason is
+gone, and a mapping pays for every page on its own instead. Starting
+clang cold with libLLVM and libclang-cpp mapped from a dataset of 128K
+records took 0.35 s with the window at zero and 0.28 s at the kernel
+default of 128K, for 9 MiB more read from the disk; medians of three
+machines, seven cold starts each. The same window on the page at a time
+path was a regression, 0.40 s.
+
+Leave the window as the kernel sets it up, like any other filesystem.
+It can still be tuned per mount through
+/sys/class/bdi/zfs-*/read_ahead_kb.
+---
+ module/os/linux/zfs/zfs_vfsops.c | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/module/os/linux/zfs/zfs_vfsops.c b/module/os/linux/zfs/zfs_vfsops.c
+index 2e2e65c..2828b08 100644
+--- a/module/os/linux/zfs/zfs_vfsops.c
++++ b/module/os/linux/zfs/zfs_vfsops.c
+@@ -1395,8 +1395,6 @@ zfs_domount(struct super_block *sb, const char *osname,
+ 	if (error)
+ 		goto out;
+ 
+-	sb->s_bdi->ra_pages = 0;
+-
+ 	/* Set callback operations for the file system. */
+ 	sb->s_op = &zpl_super_operations;
+ 	sb->s_xattr = zpl_xattr_handlers;
+-- 
+2.56.0
+

@@ -42,6 +42,7 @@ let
     "arc-hdr-accounting"
     "arc-folio-lru"
     "zpl-readahead-batch"
+    "zpl-readahead-default"
   ];
 
   # The one probe that still applies on the folio backend.
@@ -70,6 +71,7 @@ let
     ++ [
       "arc-folio-lru"
       "zpl-readahead-batch"
+      "zpl-readahead-default"
     ];
 
   byName = builtins.listToAttrs (
