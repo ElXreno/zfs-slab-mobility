@@ -8,6 +8,7 @@
   lib,
   stdenv,
   kernel,
+  kernelModuleMakeFlags,
 }:
 
 stdenv.mkDerivation {
@@ -19,16 +20,20 @@ stdenv.mkDerivation {
   nativeBuildInputs = kernel.moduleBuildDependencies;
   hardeningDisable = [ "pic" ];
 
-  makeFlags = [
+  makeFlags = kernelModuleMakeFlags ++ [
     "-C"
     "${kernel.dev}/lib/modules/${kernel.modDirVersion}/build"
     "M=$(PWD)"
-    "modules"
   ];
 
-  installPhase = ''
-    install -Dm444 slabwho.ko "$out/lib/modules/${kernel.modDirVersion}/extra/slabwho.ko"
-  '';
+  buildFlags = [ "modules" ];
+
+  # kbuild signs the module and writes the slabwho.ko.cer that aggregateModules expects.
+  installFlags = [
+    "INSTALL_MOD_PATH=${placeholder "out"}"
+    "INSTALL_MOD_DIR=extra"
+  ];
+  installTargets = [ "modules_install" ];
 
   meta = {
     description = "Per cache pageblock accounting for SLUB";

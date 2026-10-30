@@ -3,7 +3,7 @@
 # Each variant is the same vanilla kernel and the same OpenZFS release with a
 # different set of patches on top, so a difference between two runs can only
 # come from the patches. Nothing here is specific to any machine: the kernel is
-# whatever nixpkgs calls latest, with no microarchitecture flags.
+# the newest series the OpenZFS release supports, with no microarchitecture flags.
 { pkgs, lib }:
 
 let
@@ -49,7 +49,7 @@ let
         SHUFFLE_PAGE_ALLOCATOR = lib.mkForce lib.kernel.no;
       };
 
-      base = if xanmod then pkgs.linux_xanmod_latest else pkgs.linux_latest;
+      base = if xanmod then pkgs.linux_xanmod_latest else pkgs.linux_7_2;
 
       standConfig =
           deterministic
@@ -86,21 +86,24 @@ let
 
       # xanmod's own config wins over an overridden structuredExtraConfig, so
       # there the stand's settings ride along as a patch without a diff.
-      kernel = base.override (
-        {
-          stdenv = ccache.wrapStdenv pkgs.stdenv;
-          kernelPatches =
-            base.kernelPatches
-            ++ extraPatches
-            ++ lib.optional xanmod {
-              name = "stand-config";
-              patch = null;
-              structuredExtraConfig = standConfig;
-            };
-          # KASAN removes the Rust support the shared nixpkgs config asks for.
-          ignoreConfigErrors = kasan;
-        }
-        // lib.optionalAttrs (!xanmod) { structuredExtraConfig = standConfig; }
+      kernel = ccache.linkSource (
+        base.override (
+          prev:
+          ccache.kernelArgs prev
+          // {
+            kernelPatches =
+              base.kernelPatches
+              ++ extraPatches
+              ++ lib.optional xanmod {
+                name = "stand-config";
+                patch = null;
+                structuredExtraConfig = standConfig;
+              };
+            # KASAN removes the Rust support the shared nixpkgs config asks for.
+            ignoreConfigErrors = kasan;
+          }
+          // lib.optionalAttrs (!xanmod) { structuredExtraConfig = standConfig; }
+        )
       );
 
       zfsExtra =
@@ -207,4 +210,5 @@ in
   };
 
   stockXanmod = mkVariant { xanmod = true; };
+
 }

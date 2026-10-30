@@ -20,9 +20,6 @@
 
 let
   cacheDir = "/nix/ccache";
-in
-{
-  inherit cacheDir;
 
   # Replaces the unwrapped compiler rather than the wrapper: kbuild passes CC as
   # an absolute path to the unwrapped one.
@@ -51,4 +48,36 @@ in
         };
       }
     );
+
+  cachedStdenv = wrapStdenv pkgs.stdenv;
+
+  # workaround for https://github.com/NixOS/nixpkgs/commit/42f4cc3a70dfee64ba246bcb2be5764414432201
+  kernelCC = pkgs.writeShellScript "kernel-cc" ''
+    if [ -n "''${KSRC_REAL-}" ]; then
+      args=()
+      for arg; do
+        args+=("''${arg//"$KSRC_REAL"/"$KSRC_LINK"}")
+      done
+      set -- "''${args[@]}"
+    fi
+    exec ${pkgs.lib.getExe cachedStdenv.cc.cc} "$@"
+  '';
+in
+{
+  inherit cacheDir wrapStdenv;
+
+  kernelArgs = prev: {
+    stdenv = cachedStdenv;
+    extraMakeFlags = (prev.extraMakeFlags or [ ]) ++ [ "CC=${kernelCC}" ];
+  };
+
+  linkSource =
+    kernel:
+    kernel.overrideAttrs (prev: {
+      preConfigure = (prev.preConfigure or "") + ''
+        export KSRC_REAL=$PWD KSRC_LINK=$NIX_BUILD_TOP/ksrc
+        ln -s -- "$KSRC_REAL" "$KSRC_LINK"
+        echo "kernel-cc: $KSRC_REAL -> $KSRC_LINK"
+      '';
+    });
 }
