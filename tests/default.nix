@@ -13,6 +13,7 @@
   fragload,
   fragcheck,
   fragspike,
+  mmapcheck,
 }:
 
 let
@@ -80,7 +81,110 @@ let
       variant = "arclru";
       readAheadKB = 1024;
     };
+    zfs-stock-ra1024 = mkMmapSparse {
+      variant = "stock";
+      readAheadKB = 1024;
+    };
+    zfs-stockRa-ra1024 = mkMmapSparse {
+      variant = "stockRa";
+      readAheadKB = 1024;
+    };
+    zfs-stockRa-ra128 = mkMmapSparse {
+      variant = "stockRa";
+      readAheadKB = 128;
+    };
+    zfs-arclruRa-ra1024 = mkMmapSparse {
+      variant = "arclruRa";
+      readAheadKB = 1024;
+    };
+    xfs-stock-dense = mkMmapSparse (dense // {
+      variant = "stock";
+      fs = "xfs";
+    });
+    zfs-stock-dense = mkMmapSparse (dense // { variant = "stock"; });
+    zfs-stock-dense-ra1024 = mkMmapSparse (dense // {
+      variant = "stock";
+      readAheadKB = 1024;
+    });
+    zfs-stockRa-dense-ra1024 = mkMmapSparse (dense // {
+      variant = "stockRa";
+      readAheadKB = 1024;
+    });
   };
+
+  dense = {
+    sparseGB = 4;
+    strideMB = 64;
+    chunkMB = 64;
+  };
+
+  mkZplReadahead = import ./zpl-readahead.nix {
+    inherit
+      pkgs
+      lib
+      variants
+      mmapcheck
+      ;
+  };
+
+  zplDeadlockRuns =
+    lib.listToAttrs (
+      lib.concatMap (
+        variant:
+        map (seed: {
+          name = "${variant}-seed${toString seed}";
+          value = mkZplReadahead {
+            inherit variant seed;
+            scene = "deadlock";
+          };
+        }) seeds
+      ) [
+        "stock"
+        "stockRa"
+      ]
+    )
+    // {
+      arclruRa-seed1 = mkZplReadahead {
+        variant = "arclruRa";
+        scene = "deadlock";
+      };
+    };
+
+  zplBytesRuns = {
+    stock-ra1024 = mkZplReadahead {
+      variant = "stock";
+      scene = "bytes";
+      readAheadKB = 1024;
+    };
+    stockRa-ra1024 = mkZplReadahead {
+      variant = "stockRa";
+      scene = "bytes";
+      readAheadKB = 1024;
+    };
+    stockRa-ra128 = mkZplReadahead {
+      variant = "stockRa";
+      scene = "bytes";
+      readAheadKB = 128;
+    };
+    arclruRa-ra1024 = mkZplReadahead {
+      variant = "arclruRa";
+      scene = "bytes";
+      readAheadKB = 1024;
+    };
+  };
+
+  collect =
+    name: runs: columns:
+    pkgs.runCommand name
+      {
+        nativeBuildInputs = [ pkgs.jq ];
+        passthru = runs;
+      }
+      ''
+        mkdir -p $out
+        ${lib.concatStrings (lib.mapAttrsToList (n: r: "ln -s ${r} $out/${n}\n") runs)}
+        jq -r -s '${columns}' $out/*/result.json | tee $out/report.tsv
+      '';
 
   seeds = [
     1
@@ -555,6 +659,16 @@ let
               .compaction_s, .pgmigrate_fail, .mthp_split])
             | @tsv' $out/*/result.json | tee $out/report.tsv
         '';
+
+    # A readahead batch against writers to the same file, openzfs/zfs#19447.
+    zpl-readahead-deadlock = collect "zpl-readahead-deadlock" zplDeadlockRuns ''
+      ["run", "verdict", "blocked_tasks", "last_progress"],
+      (.[] | [.name, .verdict, .blocked_tasks, .last_progress]) | @tsv'';
+
+    # The bytes a readahead batch fills against read(), across record sizes and file shapes.
+    zpl-readahead-bytes = collect "zpl-readahead-bytes" zplBytesRuns ''
+      ["run", "files", "wrong", "big_pages", "big_majflt"],
+      (.[] | [.name, .files, (.wrong | length), .big_pages, (.big_majflt | tostring)]) | @tsv'';
 
     # A use-once mmap stream against idle anonymous memory and a warm cache, ZFS beside XFS.
     mmap-sparse =

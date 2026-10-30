@@ -1,0 +1,208 @@
+From 06276a9960462aea4c74155447fd16b77a7fa2cb Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Fri, 30 Oct 2026 17:07:48 +0300
+Subject: [PATCH] Linux: fill a readahead batch from one hold of its dbufs
+
+zpl_readahead() filled a batch one page at a time through zfs_getpage(),
+so every 4K page entered the filesystem, took and dropped the range
+lock, held and released the dbufs behind it and told the prefetcher
+about a one page read. With recordsize=128K that is 32 rounds of all of
+it per block, and the readers of one file queue on the mutex of its
+range lock.
+
+It could also hang the pool. The kernel hands ->readahead() the whole
+batch locked, and zfs_getpage() unlocks only its own page before it
+waits for the range lock. zfs_write() holds the range lock while
+update_pages() locks the pages of the range it wrote, so a writer
+waiting for a page further down the batch and a readahead waiting for
+the writer's range never move again (#19447). posix_fadvise(WILLNEED)
+reaches it with the readahead window at zero, through bdi->io_pages.
+
+Fill the batch in zfs_getpages() instead: enter the filesystem once, try
+the range lock over the whole batch, hold every dbuf behind it with one
+dmu_buf_hold_array_by_bonus() and copy into each page in turn. The lock
+is only tried. When someone else holds it, or the hold fails, the pages
+are left unread; the kernel drops them, and a fault that needs one comes
+back through zfs_getpage(), which waits for the lock with its page
+unlocked. Pages past the end of the file are zeroed as zfs_fillpage()
+does. A file of one block whose size is not a power of two is left to
+zfs_getpage(), since that block cannot be held past its own end.
+---
+ include/os/linux/zfs/sys/zfs_vnops_os.h |  4 +
+ module/os/linux/zfs/zfs_vnops_os.c      | 97 +++++++++++++++++++++++++
+ module/os/linux/zfs/zpl_file.c          | 15 +---
+ 3 files changed, 105 insertions(+), 11 deletions(-)
+
+diff --git a/include/os/linux/zfs/sys/zfs_vnops_os.h b/include/os/linux/zfs/sys/zfs_vnops_os.h
+index b41ffcc..30285e8 100644
+--- a/include/os/linux/zfs/sys/zfs_vnops_os.h
++++ b/include/os/linux/zfs/sys/zfs_vnops_os.h
+@@ -79,6 +79,10 @@ extern int zfs_space(znode_t *zp, int cmd, flock64_t *bfp, int flag,
+     offset_t offset, cred_t *cr);
+ extern int zfs_fid(struct inode *ip, fid_t *fidp);
+ extern int zfs_getpage(struct inode *ip, struct page *pp);
++#ifndef HAVE_VFS_READPAGES
++struct readahead_control;
++extern void zfs_getpages(struct inode *ip, struct readahead_control *ractl);
++#endif
+ extern int zfs_putpage(struct inode *ip, struct page *pp,
+     struct writeback_control *wbc, boolean_t for_sync);
+ extern int zfs_dirty_inode(struct inode *ip, int flags);
+diff --git a/module/os/linux/zfs/zfs_vnops_os.c b/module/os/linux/zfs/zfs_vnops_os.c
+index cb6321e..7a6d6e0 100644
+--- a/module/os/linux/zfs/zfs_vnops_os.c
++++ b/module/os/linux/zfs/zfs_vnops_os.c
+@@ -71,6 +71,7 @@
+ #include <sys/zil.h>
+ #include <sys/sa_impl.h>
+ #include <linux/mm_compat.h>
++#include <linux/pagemap_compat.h>
+ 
+ /*
+  * Programming rules.
+@@ -4281,6 +4282,102 @@ zfs_getpage(struct inode *ip, struct page *pp)
+ 	return (error);
+ }
+ 
++#ifndef HAVE_VFS_READPAGES
++/*
++ * Fill a readahead batch from one hold of the dbufs behind it, rather than
++ * one zfs_getpage() per page.
++ *
++ * The pages of the batch arrive locked, so the range lock is only tried:
++ * waiting for it with the batch held would deadlock against zfs_write() ->
++ * update_pages(), which holds the range lock and then locks pages. On
++ * contention, or anything else in the way, the remaining pages are left
++ * unread. The kernel drops them, and an access that needs one comes back
++ * through zfs_getpage(), which can wait safely.
++ *
++ * A file of a single block that is not a power of two in size is left to
++ * zfs_getpage() as well: such a block cannot be held past its own end.
++ */
++void
++zfs_getpages(struct inode *ip, struct readahead_control *ractl)
++{
++	znode_t *zp = ITOZ(ip);
++	zfsvfs_t *zfsvfs = ITOZSB(ip);
++	uint64_t start = readahead_pos(ractl);
++	uint64_t limit = start + MIN(readahead_length(ractl),
++	    DMU_MAX_ACCESS / 2);
++	zfs_locked_range_t *lr;
++	dmu_buf_t **dbp = NULL;
++	int numbufs = 0, di = 0;
++	uint64_t end, filled = 0;
++	struct page *pp;
++
++	if (limit == start || zfs_enter_verify_zp(zfsvfs, zp, FTAG) != 0)
++		return;
++
++	lr = zfs_rangelock_tryenter(&zp->z_rangelock, start, limit - start,
++	    RL_READER);
++	if (lr == NULL)
++		goto out;
++
++	end = MIN(limit, (uint64_t)i_size_read(ip));
++	if (end > start) {
++		if (!ISP2(zp->z_blksz))
++			goto unlock;
++		if (dmu_buf_hold_array_by_bonus(sa_get_db(zp->z_sa_hdl), start,
++		    end - start, B_TRUE, FTAG, &numbufs, &dbp,
++		    DMU_READ_PREFETCH) != 0)
++			goto unlock;
++	}
++
++	while ((pp = readahead_page(ractl)) != NULL) {
++		uint64_t off = page_offset(pp);
++		uint64_t pgoff = 0;
++		void *va;
++
++		if (off >= limit) {
++			unlock_page(pp);
++			put_page(pp);
++			break;
++		}
++
++		va = kmap(pp);
++		while (pgoff < PAGE_SIZE && off + pgoff < end) {
++			dmu_buf_t *db;
++			uint64_t bufoff, tocpy;
++
++			ASSERT3S(di, <, numbufs);
++			db = dbp[di];
++			bufoff = off + pgoff - db->db_offset;
++			tocpy = MIN(db->db_size - bufoff, PAGE_SIZE - pgoff);
++			tocpy = MIN(tocpy, end - off - pgoff);
++			ASSERT(db->db_data != NULL);
++			memcpy((char *)va + pgoff, (char *)db->db_data + bufoff,
++			    tocpy);
++			pgoff += tocpy;
++			if (bufoff + tocpy == db->db_size)
++				di++;
++		}
++		if (pgoff < PAGE_SIZE)
++			memset((char *)va + pgoff, 0, PAGE_SIZE - pgoff);
++		kunmap(pp);
++
++		ClearPageError(pp);
++		SetPageUptodate(pp);
++		unlock_page(pp);
++		put_page(pp);
++		filled += pgoff;
++	}
++
++	dmu_buf_rele_array(dbp, numbufs, FTAG);
++	if (filled > 0)
++		dataset_kstats_update_read_kstats(&zfsvfs->z_kstat, filled);
++unlock:
++	zfs_rangelock_exit(lr);
++out:
++	zfs_exit(zfsvfs, FTAG);
++}
++#endif
++
+ /*
+  * Check ZFS specific permissions to memory map a section of a file.
+  *
+diff --git a/module/os/linux/zfs/zpl_file.c b/module/os/linux/zfs/zpl_file.c
+index a971aab..b9996fe 100644
+--- a/module/os/linux/zfs/zpl_file.c
++++ b/module/os/linux/zfs/zpl_file.c
+@@ -429,6 +429,7 @@ zpl_readpage(struct file *filp, struct page *pp)
+ }
+ #endif
+ 
++#ifdef HAVE_VFS_READPAGES
+ static int
+ zpl_readpage_filler(void *data, struct page *pp)
+ {
+@@ -441,7 +442,6 @@ zpl_readpage_filler(void *data, struct page *pp)
+  * paging.  For simplicity, the code relies on read_cache_pages() to
+  * correctly lock each page for IO and call zpl_readpage().
+  */
+-#ifdef HAVE_VFS_READPAGES
+ static int
+ zpl_readpages(struct file *filp, struct address_space *mapping,
+     struct list_head *pages, unsigned nr_pages)
+@@ -452,16 +452,9 @@ zpl_readpages(struct file *filp, struct address_space *mapping,
+ static void
+ zpl_readahead(struct readahead_control *ractl)
+ {
+-	struct page *page;
+-
+-	while ((page = readahead_page(ractl)) != NULL) {
+-		int ret;
+-
+-		ret = zpl_readpage_filler(NULL, page);
+-		put_page(page);
+-		if (ret)
+-			break;
+-	}
++	fstrans_cookie_t cookie = spl_fstrans_mark();
++	zfs_getpages(ractl->mapping->host, ractl);
++	spl_fstrans_unmark(cookie);
+ }
+ #endif
+ 
+-- 
+2.56.0
+

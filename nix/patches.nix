@@ -60,6 +60,7 @@ let
   alone = [
     "no-kswapd-wake"
     "arc-lru-deadlock-inject"
+    "zpl-readahead-batch"
   ];
 
   named = relocation ++ probes ++ alone ++ [ "arc-folio-lru" ];

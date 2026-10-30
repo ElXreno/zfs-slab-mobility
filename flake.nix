@@ -38,6 +38,7 @@
           fragload = pkgs.callPackage ./packages/fragload/package.nix { };
           fragcheck = pkgs.callPackage ./packages/fragcheck/package.nix { };
           fragspike = pkgs.callPackage ./packages/fragspike/package.nix { };
+          mmapcheck = pkgs.callPackage ./packages/mmapcheck/package.nix { };
 
           suite = import ./tests {
             inherit
@@ -47,6 +48,7 @@
               fragload
               fragcheck
               fragspike
+              mmapcheck
               ;
           };
         in
@@ -54,7 +56,13 @@
           checks = lib.optionalAttrs (system == "x86_64-linux") suite.checks;
 
           packages = {
-            inherit fragview fragload fragcheck fragspike;
+            inherit
+              fragview
+              fragload
+              fragcheck
+              fragspike
+              mmapcheck
+              ;
             default = fragview;
           }
           // lib.optionalAttrs (system == "x86_64-linux") {

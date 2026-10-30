@@ -32,6 +32,7 @@ let
       memProfiling ? false,
       kasan ? false,
       zfsDebug ? false,
+      zplReadahead ? false,
       # The kernel the hung desktop runs, working set protection included.
       xanmod ? false,
     }:
@@ -116,7 +117,8 @@ let
             lib.optional noReclaimAccount patches.zfs.each.no-reclaim-account
         )
         ++ lib.optional noKswapdWake patches.zfs.each.no-kswapd-wake
-        ++ lib.optional deadlockInject patches.zfs.each.arc-lru-deadlock-inject;
+        ++ lib.optional deadlockInject patches.zfs.each.arc-lru-deadlock-inject
+        ++ lib.optional zplReadahead patches.zfs.each.zpl-readahead-batch;
 
       packages = pkgs.linuxPackagesFor kernel;
     in
@@ -211,4 +213,14 @@ in
 
   stockXanmod = mkVariant { xanmod = true; };
 
+  # Readahead filled per block instead of per page, on stock and on the backend.
+  stockRa = mkVariant { zplReadahead = true; };
+
+  arclruRa = mkVariant {
+    slabMobility = true;
+    filemapExports = true;
+    largeFolioCompaction = true;
+    arcLru = true;
+    zplReadahead = true;
+  };
 }
