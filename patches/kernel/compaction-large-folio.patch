@@ -1,4 +1,4 @@
-From d64e5186b1e4d981d5bbac2a842b8bee04be1649 Mon Sep 17 00:00:00 2001
+From 0b32ac2b944c535459e32987b3b8a2e0c197fae6 Mon Sep 17 00:00:00 2001
 From: ElXreno <elxreno@gmail.com>
 Date: Mon, 7 Sep 2026 01:19:57 +0300
 Subject: [PATCH] mm/compaction: find targets for large folios and keep the
@@ -22,24 +22,30 @@ with the holes still there, and a second pass finds nothing either.
 
 Let the free scanner keep going for a large folio until a page of its
 order is isolated, the scanners meet, the zone lock is contended, a
-thousand pages are isolated or a call makes no progress. Order-0 folios
-keep the single attempt. Keep the samples stride-aligned after a compound
-page or a taken free page. For MR_COMPACTION a large folio that neither
-gets a target nor splits is a permanent failure of that folio alone
-instead of the end of the pass. Research build only.
+thousand pages are isolated or a call makes no progress. The limit holds
+inside the scanner as well as between its calls, or a zone without a
+free page of the folio's order is isolated whole and held until the pass
+ends. Order-0 folios keep the single attempt. Keep the samples
+stride-aligned after a compound page or a taken free page. For
+MR_COMPACTION a large folio that neither gets a target nor splits is a
+permanent failure of that folio alone instead of the end of the pass.
+Research build only.
 ---
- mm/compaction.c | 80 ++++++++++++++++++++++++++++++++++++++-----------
- mm/migrate.c    | 10 +++++++
- 2 files changed, 72 insertions(+), 18 deletions(-)
+ mm/compaction.c | 93 +++++++++++++++++++++++++++++++++++++++----------
+ mm/migrate.c    | 10 ++++++
+ 2 files changed, 85 insertions(+), 18 deletions(-)
 
 diff --git a/mm/compaction.c b/mm/compaction.c
-index f9225de..c9bd648 100644
+index b9f9d23..a438215 100644
 --- a/mm/compaction.c
 +++ b/mm/compaction.c
-@@ -566,17 +566,30 @@ static bool compact_unlock_should_abort(spinlock_t *lock,
+@@ -566,17 +566,44 @@ static bool compact_unlock_should_abort(spinlock_t *lock,
  	return false;
  }
  
++/* Free pages a large folio may hold isolated while it looks for a target */
++#define COMPACT_FREE_LIMIT	(COMPACT_CLUSTER_MAX << 5)
++
 +/* Whether a free page of at least @order is isolated, ready to be a target. */
 +static bool compact_has_free_order(struct compact_control *cc,
 +				unsigned int order)
@@ -50,13 +56,24 @@ index f9225de..c9bd648 100644
 +	return false;
 +}
 +
++/*
++ * Whether the free scanner can stop: the isolated pages cover the migration
++ * list, and one of them is of at least @order or the limit is reached.
++ */
++static bool compact_free_enough(struct compact_control *cc, unsigned int order)
++{
++	if (cc->nr_freepages < cc->nr_migratepages)
++		return false;
++	return compact_has_free_order(cc, order) ||
++	       cc->nr_freepages >= COMPACT_FREE_LIMIT;
++}
++
  /*
   * Isolate free pages onto a private freelist. If @strict is true, will abort
   * returning 0 on any invalid PFNs or non-free pages inside of the pageblock
 - * (even though it may still end up isolating some pages).
 + * (even though it may still end up isolating some pages). Unless @strict,
-+ * stop once the isolated pages cover the migration list and one of them is
-+ * of at least @min_order.
++ * stop once compact_free_enough() holds for @min_order.
   */
  static unsigned long isolate_freepages_block(struct compact_control *cc,
  				unsigned long *start_pfn,
@@ -69,7 +86,7 @@ index f9225de..c9bd648 100644
  {
  	int nr_scanned = 0, total_isolated = 0;
  	struct page *page;
-@@ -616,11 +629,19 @@ static unsigned long isolate_freepages_block(struct compact_control *cc,
+@@ -616,11 +643,19 @@ static unsigned long isolate_freepages_block(struct compact_control *cc,
  		if (PageCompound(page)) {
  			const unsigned int order = compound_order(page);
  
@@ -91,13 +108,12 @@ index f9225de..c9bd648 100644
  			}
  
  			goto isolate_fail;
-@@ -651,13 +672,19 @@ static unsigned long isolate_freepages_block(struct compact_control *cc,
+@@ -651,13 +686,18 @@ static unsigned long isolate_freepages_block(struct compact_control *cc,
  		cc->nr_freepages += isolated;
  		list_add_tail(&page->lru, &freelist[order]);
  
 -		if (!strict && cc->nr_migratepages <= cc->nr_freepages) {
-+		if (!strict && cc->nr_migratepages <= cc->nr_freepages &&
-+		    compact_has_free_order(cc, min_order)) {
++		if (!strict && compact_free_enough(cc, min_order)) {
  			blockpfn += isolated;
  			break;
  		}
@@ -115,7 +131,7 @@ index f9225de..c9bd648 100644
  		continue;
  
  isolate_fail:
-@@ -748,7 +775,7 @@ isolate_freepages_range(struct compact_control *cc,
+@@ -748,7 +788,7 @@ isolate_freepages_range(struct compact_control *cc,
  			break;
  
  		isolated = isolate_freepages_block(cc, &isolate_start_pfn,
@@ -124,7 +140,7 @@ index f9225de..c9bd648 100644
  
  		/*
  		 * In strict mode, isolate_freepages_block() returns 0 if
-@@ -1493,7 +1520,8 @@ fast_isolate_around(struct compact_control *cc, unsigned long pfn)
+@@ -1525,7 +1565,8 @@ fast_isolate_around(struct compact_control *cc, unsigned long pfn)
  	if (!page)
  		return;
  
@@ -134,7 +150,7 @@ index f9225de..c9bd648 100644
  
  	/* Skip this pageblock in the future as it's full or nearly full */
  	if (start_pfn == end_pfn && !cc->no_set_skip_hint)
-@@ -1689,9 +1717,10 @@ static void fast_isolate_freepages(struct compact_control *cc)
+@@ -1721,9 +1762,10 @@ static void fast_isolate_freepages(struct compact_control *cc)
  
  /*
   * Based on information in the current compact_control, find blocks
@@ -147,16 +163,17 @@ index f9225de..c9bd648 100644
  {
  	struct zone *zone = cc->zone;
  	struct page *page;
-@@ -1703,7 +1732,7 @@ static void isolate_freepages(struct compact_control *cc)
+@@ -1735,7 +1777,8 @@ static void isolate_freepages(struct compact_control *cc)
  
  	/* Try a small search of the free lists for a candidate */
  	fast_isolate_freepages(cc);
 -	if (cc->nr_freepages)
-+	if (cc->nr_freepages && compact_has_free_order(cc, order))
++	if (cc->nr_freepages && (compact_has_free_order(cc, order) ||
++				 cc->nr_freepages >= COMPACT_FREE_LIMIT))
  		return;
  
  	/*
-@@ -1764,7 +1793,8 @@ static void isolate_freepages(struct compact_control *cc)
+@@ -1796,7 +1839,8 @@ static void isolate_freepages(struct compact_control *cc)
  
  		/* Found a block suitable for isolating free pages from. */
  		nr_isolated = isolate_freepages_block(cc, &isolate_start_pfn,
@@ -166,17 +183,16 @@ index f9225de..c9bd648 100644
  
  		/* Update the skip hint if the full pageblock was scanned */
  		if (isolate_start_pfn == block_end_pfn)
-@@ -1772,7 +1802,8 @@ static void isolate_freepages(struct compact_control *cc)
+@@ -1804,7 +1848,7 @@ static void isolate_freepages(struct compact_control *cc)
  					      pageblock_nr_pages);
  
  		/* Are enough freepages isolated? */
 -		if (cc->nr_freepages >= cc->nr_migratepages) {
-+		if (cc->nr_freepages >= cc->nr_migratepages &&
-+		    compact_has_free_order(cc, order)) {
++		if (compact_free_enough(cc, order)) {
  			if (isolate_start_pfn >= block_end_pfn) {
  				/*
  				 * Restart at previous pageblock if more
-@@ -1826,11 +1857,24 @@ again:
+@@ -1858,11 +1902,24 @@ again:
  		if (!list_empty(&cc->freepages[start_order]))
  			break;
  
@@ -194,7 +210,7 @@ index f9225de..c9bd648 100644
 +
 +		if (has_isolated_pages &&
 +		    (!order || cc->contended || compact_scanners_met(cc) ||
-+		     cc->nr_freepages >= COMPACT_CLUSTER_MAX << 5))
++		     cc->nr_freepages >= COMPACT_FREE_LIMIT))
 +			return NULL;
 +		isolate_freepages(cc, order);
 +		if (has_isolated_pages && cc->free_pfn == free_pfn &&
@@ -205,10 +221,10 @@ index f9225de..c9bd648 100644
  		goto again;
  	}
 diff --git a/mm/migrate.c b/mm/migrate.c
-index 8a64291..1e45a6d 100644
+index 35381ce..2994ace 100644
 --- a/mm/migrate.c
 +++ b/mm/migrate.c
-@@ -1945,6 +1945,16 @@ static int migrate_pages_batch(struct list_head *from,
+@@ -1948,6 +1948,16 @@ static int migrate_pages_batch(struct list_head *from,
  						nr_failed--;
  						stats->nr_thp_failed -= is_thp;
  						break;
@@ -226,5 +242,5 @@ index 8a64291..1e45a6d 100644
  				}
  
 -- 
-2.55.0
+2.56.0
 
