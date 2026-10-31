@@ -1,0 +1,53 @@
+From 9e60ab8bab35e703aa6e5f7153969b0e80c9ac77 Mon Sep 17 00:00:00 2001
+From: Tigerblue77 <37409593+tigerblue77@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 15:01:37 +0000
+Subject: [PATCH] Linux: leave unfilled pages to their filler in update_pages()
+
+update_pages() copies only the bytes a write covered into each cached
+page and then marks the page up to date.  For a page that was never
+filled, the rest of the page is whatever the allocator left there, and
+it becomes visible to mmap and to mappedread().
+
+Such pages exist.  zfs_getpage() unlocks its page while it waits for
+the range lock, so a writer holding that lock can reach the page before
+it is filled, and other readers can see it after the writer is done and
+before zfs_getpage() relocks it.  Readahead that stops early also
+leaves its unconsumed pages cached and not up to date on kernels before
+6.14, whose read_pages() removes only the async part of the window.
+
+Skip a page that is neither up to date nor dirty.  Every filler
+(zfs_getpage(), mappedread(), readahead) takes the range lock, which
+our callers hold as writer, so the filler reads this write from the
+DMU once it is done.  This is also needed before readahead may stop
+early on range lock contention.
+
+Signed-off-by: Tigerblue77 <37409593+tigerblue77@users.noreply.github.com>
+---
+ module/os/linux/zfs/zfs_vnops_os.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/module/os/linux/zfs/zfs_vnops_os.c b/module/os/linux/zfs/zfs_vnops_os.c
+index cb6321e..3ba997b 100644
+--- a/module/os/linux/zfs/zfs_vnops_os.c
++++ b/module/os/linux/zfs/zfs_vnops_os.c
+@@ -249,6 +249,17 @@ update_pages(znode_t *zp, int64_t start, int len, objset_t *os)
+ 		uint64_t nbytes = MIN(PAGE_SIZE - off, len);
+ 
+ 		struct page *pp = find_lock_page(mp, start >> PAGE_SHIFT);
++		if (pp != NULL && !PageUptodate(pp) && !PageDirty(pp)) {
++			/*
++			 * Nobody has filled this page yet.  Copying in only
++			 * the bytes written here would mark the rest of it up
++			 * to date.  Its filler needs the range lock our caller
++			 * holds as writer, so it will read this data instead.
++			 */
++			unlock_page(pp);
++			put_page(pp);
++			pp = NULL;
++		}
+ 		if (pp) {
+ 			if (mapping_writably_mapped(mp))
+ 				flush_dcache_page(pp);
+-- 
+2.56.0
+

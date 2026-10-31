@@ -41,6 +41,7 @@ let
     "eio-diag"
     "arc-hdr-accounting"
     "arc-folio-lru"
+    "update-pages-unfilled"
     "zpl-readahead-batch"
     "zpl-readahead-default"
   ];
@@ -70,6 +71,7 @@ let
     ++ alone
     ++ [
       "arc-folio-lru"
+      "update-pages-unfilled"
       "zpl-readahead-batch"
       "zpl-readahead-default"
     ];

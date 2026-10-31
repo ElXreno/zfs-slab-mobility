@@ -1,4 +1,4 @@
-From 06276a9960462aea4c74155447fd16b77a7fa2cb Mon Sep 17 00:00:00 2001
+From eb075a09773df90c428636513b1f958d25faf037 Mon Sep 17 00:00:00 2001
 From: ElXreno <elxreno@gmail.com>
 Date: Fri, 30 Oct 2026 17:07:48 +0300
 Subject: [PATCH] Linux: fill a readahead batch from one hold of its dbufs
@@ -19,19 +19,23 @@ the writer's range never move again (#19447). posix_fadvise(WILLNEED)
 reaches it with the readahead window at zero, through bdi->io_pages.
 
 Fill the batch in zfs_getpages() instead: enter the filesystem once, try
-the range lock over the whole batch, hold every dbuf behind it with one
-dmu_buf_hold_array_by_bonus() and copy into each page in turn. The lock
-is only tried. When someone else holds it, or the hold fails, the pages
-are left unread; the kernel drops them, and a fault that needs one comes
-back through zfs_getpage(), which waits for the lock with its page
-unlocked. Pages past the end of the file are zeroed as zfs_fillpage()
-does. A file of one block whose size is not a power of two is left to
-zfs_getpage(), since that block cannot be held past its own end.
+the range lock over the whole batch, hold the dbufs behind it with
+dmu_buf_hold_array_by_bonus(), in pieces of at most half of
+DMU_MAX_ACCESS, and copy into each page in turn. Every page taken from
+the batch is filled and marked up to date. The lock is only tried: when
+someone else holds it, or a hold fails, the pages not taken yet are left
+to the kernel, and a fault that needs one comes back through
+zfs_getpage(), which waits for the lock with its page unlocked. Since
+6.14 read_pages() drops those pages; before that it keeps them, not up
+to date, which update_pages() has to leave to their filler. Pages past
+the end of the file are zeroed as zfs_fillpage() does. A file of one
+block whose size is not a power of two is left to zfs_getpage(), since
+that block cannot be held past its own end.
 ---
- include/os/linux/zfs/sys/zfs_vnops_os.h |  4 +
- module/os/linux/zfs/zfs_vnops_os.c      | 97 +++++++++++++++++++++++++
- module/os/linux/zfs/zpl_file.c          | 15 +---
- 3 files changed, 105 insertions(+), 11 deletions(-)
+ include/os/linux/zfs/sys/zfs_vnops_os.h |   4 +
+ module/os/linux/zfs/zfs_vnops_os.c      | 102 ++++++++++++++++++++++++
+ module/os/linux/zfs/zpl_file.c          |  15 +---
+ 3 files changed, 110 insertions(+), 11 deletions(-)
 
 diff --git a/include/os/linux/zfs/sys/zfs_vnops_os.h b/include/os/linux/zfs/sys/zfs_vnops_os.h
 index b41ffcc..30285e8 100644
@@ -49,7 +53,7 @@ index b41ffcc..30285e8 100644
      struct writeback_control *wbc, boolean_t for_sync);
  extern int zfs_dirty_inode(struct inode *ip, int flags);
 diff --git a/module/os/linux/zfs/zfs_vnops_os.c b/module/os/linux/zfs/zfs_vnops_os.c
-index cb6321e..7a6d6e0 100644
+index 3ba997b..831e2e2 100644
 --- a/module/os/linux/zfs/zfs_vnops_os.c
 +++ b/module/os/linux/zfs/zfs_vnops_os.c
 @@ -71,6 +71,7 @@
@@ -60,7 +64,7 @@ index cb6321e..7a6d6e0 100644
  
  /*
   * Programming rules.
-@@ -4281,6 +4282,102 @@ zfs_getpage(struct inode *ip, struct page *pp)
+@@ -4292,6 +4293,107 @@ zfs_getpage(struct inode *ip, struct page *pp)
  	return (error);
  }
  
@@ -72,9 +76,9 @@ index cb6321e..7a6d6e0 100644
 + * The pages of the batch arrive locked, so the range lock is only tried:
 + * waiting for it with the batch held would deadlock against zfs_write() ->
 + * update_pages(), which holds the range lock and then locks pages. On
-+ * contention, or anything else in the way, the remaining pages are left
-+ * unread. The kernel drops them, and an access that needs one comes back
-+ * through zfs_getpage(), which can wait safely.
++ * contention, or anything else in the way, the pages not yet filled are
++ * left where they are, untaken. Every page taken from the batch is filled
++ * and marked up to date, so none is left behind locked out of its data.
 + *
 + * A file of a single block that is not a power of two in size is left to
 + * zfs_getpage() as well: such a block cannot be held past its own end.
@@ -84,73 +88,78 @@ index cb6321e..7a6d6e0 100644
 +{
 +	znode_t *zp = ITOZ(ip);
 +	zfsvfs_t *zfsvfs = ITOZSB(ip);
-+	uint64_t start = readahead_pos(ractl);
-+	uint64_t limit = start + MIN(readahead_length(ractl),
-+	    DMU_MAX_ACCESS / 2);
++	uint64_t off = readahead_pos(ractl);
++	uint64_t stop = off + readahead_length(ractl);
 +	zfs_locked_range_t *lr;
-+	dmu_buf_t **dbp = NULL;
-+	int numbufs = 0, di = 0;
-+	uint64_t end, filled = 0;
-+	struct page *pp;
++	uint64_t isize, filled = 0;
 +
-+	if (limit == start || zfs_enter_verify_zp(zfsvfs, zp, FTAG) != 0)
++	if (stop == off || zfs_enter_verify_zp(zfsvfs, zp, FTAG) != 0)
 +		return;
 +
-+	lr = zfs_rangelock_tryenter(&zp->z_rangelock, start, limit - start,
++	lr = zfs_rangelock_tryenter(&zp->z_rangelock, off, stop - off,
 +	    RL_READER);
 +	if (lr == NULL)
 +		goto out;
 +
-+	end = MIN(limit, (uint64_t)i_size_read(ip));
-+	if (end > start) {
-+		if (!ISP2(zp->z_blksz))
-+			goto unlock;
-+		if (dmu_buf_hold_array_by_bonus(sa_get_db(zp->z_sa_hdl), start,
-+		    end - start, B_TRUE, FTAG, &numbufs, &dbp,
-+		    DMU_READ_PREFETCH) != 0)
-+			goto unlock;
-+	}
++	isize = i_size_read(ip);
++	if (off < isize && !ISP2(zp->z_blksz))
++		goto unlock;
 +
-+	while ((pp = readahead_page(ractl)) != NULL) {
-+		uint64_t off = page_offset(pp);
-+		uint64_t pgoff = 0;
-+		void *va;
++	while (off < stop) {
++		uint64_t limit = MIN(stop, off + DMU_MAX_ACCESS / 2);
++		uint64_t end = MIN(limit, isize);
++		dmu_buf_t **dbp = NULL;
++		int numbufs = 0, di = 0;
 +
-+		if (off >= limit) {
++		if (end > off && dmu_buf_hold_array_by_bonus(
++		    sa_get_db(zp->z_sa_hdl), off, end - off, B_TRUE, FTAG,
++		    &numbufs, &dbp, DMU_READ_PREFETCH) != 0)
++			break;
++
++		for (; off < limit; off += PAGE_SIZE) {
++			struct page *pp = readahead_page(ractl);
++			uint64_t pgoff = 0;
++			void *va;
++
++			if (pp == NULL) {
++				stop = off;
++				break;
++			}
++			ASSERT3U(page_offset(pp), ==, off);
++
++			va = kmap(pp);
++			while (pgoff < PAGE_SIZE && off + pgoff < end) {
++				dmu_buf_t *db;
++				uint64_t bufoff, tocpy;
++
++				ASSERT3S(di, <, numbufs);
++				db = dbp[di];
++				bufoff = off + pgoff - db->db_offset;
++				tocpy = MIN(db->db_size - bufoff,
++				    PAGE_SIZE - pgoff);
++				tocpy = MIN(tocpy, end - off - pgoff);
++				ASSERT(db->db_data != NULL);
++				memcpy((char *)va + pgoff,
++				    (char *)db->db_data + bufoff, tocpy);
++				pgoff += tocpy;
++				if (bufoff + tocpy == db->db_size)
++					di++;
++			}
++			if (pgoff < PAGE_SIZE)
++				memset((char *)va + pgoff, 0,
++				    PAGE_SIZE - pgoff);
++			kunmap(pp);
++
++			ClearPageError(pp);
++			SetPageUptodate(pp);
 +			unlock_page(pp);
 +			put_page(pp);
-+			break;
++			filled += pgoff;
 +		}
 +
-+		va = kmap(pp);
-+		while (pgoff < PAGE_SIZE && off + pgoff < end) {
-+			dmu_buf_t *db;
-+			uint64_t bufoff, tocpy;
-+
-+			ASSERT3S(di, <, numbufs);
-+			db = dbp[di];
-+			bufoff = off + pgoff - db->db_offset;
-+			tocpy = MIN(db->db_size - bufoff, PAGE_SIZE - pgoff);
-+			tocpy = MIN(tocpy, end - off - pgoff);
-+			ASSERT(db->db_data != NULL);
-+			memcpy((char *)va + pgoff, (char *)db->db_data + bufoff,
-+			    tocpy);
-+			pgoff += tocpy;
-+			if (bufoff + tocpy == db->db_size)
-+				di++;
-+		}
-+		if (pgoff < PAGE_SIZE)
-+			memset((char *)va + pgoff, 0, PAGE_SIZE - pgoff);
-+		kunmap(pp);
-+
-+		ClearPageError(pp);
-+		SetPageUptodate(pp);
-+		unlock_page(pp);
-+		put_page(pp);
-+		filled += pgoff;
++		dmu_buf_rele_array(dbp, numbufs, FTAG);
 +	}
 +
-+	dmu_buf_rele_array(dbp, numbufs, FTAG);
 +	if (filled > 0)
 +		dataset_kstats_update_read_kstats(&zfsvfs->z_kstat, filled);
 +unlock:
