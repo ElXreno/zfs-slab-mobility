@@ -15,6 +15,11 @@
   cores ? 4,
   seconds ? 120,
   stall ? 20,
+  rounds ? 10,
+  holdMs ? 1000,
+  trace ? false,
+  expectWrong ? false,
+  expectStall ? false,
 }:
 
 let
@@ -104,8 +109,70 @@ in
             "verdict": verdict,
             "last_progress": progress[-1] if progress else "",
             "blocked_tasks": stacks.count("== /proc/"),
+            "expect_stall": ${py expectStall},
         })
-        assert verdict.startswith("OK"), f"readahead against writers: {verdict}"
+        if stacks:
+            machine.crash()
+        if ${py expectStall}:
+            assert verdict.startswith("STALLED"), f"readahead against writers did not hang: {verdict}"
+        else:
+            assert verdict.startswith("OK"), f"readahead against writers: {verdict}"
+
+    elif "${scene}" == "subpage":
+        machine.succeed("zfs create -o recordsize=128k -o compression=off -o atime=off tank/fs")
+        if ${py trace}:
+            machine.succeed(
+                "cd /sys/kernel/tracing"
+                " && echo 'p:zra zpl_readahead' >> kprobe_events"
+                " && echo 'r:ztry zfs_rangelock_tryenter ret=$retval' >> kprobe_events"
+                " && (echo 'p:zup update_pages' >> kprobe_events || true)"
+                " && (echo 'p:zfp zfs_fillpage' >> kprobe_events || true)"
+                " && echo 1 > events/kprobes/enable"
+                " && echo 1 > events/filemap/mm_filemap_add_to_page_cache/enable"
+                " && echo 1 > events/filemap/mm_filemap_delete_from_page_cache/enable"
+            )
+        runs = []
+        for i in range(${toString rounds}):
+            machine.succeed(
+                "head -c 262144 /dev/urandom > /run/orig.bin && cp /run/orig.bin /tank/fs/file"
+                " && sync && zpool sync tank && zpool export tank && zpool import -d /dev tank"
+            )
+            set_readahead()
+            if ${py trace}:
+                machine.succeed("echo > /sys/kernel/tracing/trace")
+            line = machine.succeed(
+                f"{BIN}/mmapcheck -orig /run/orig.bin -hold ${toString holdMs}"
+                " -inject 'zinject -d vdb -D ${toString holdMs}:1 -T read tank' subpage /tank/fs/file",
+                timeout=120,
+            )
+            runs.append(json.loads(line.strip().splitlines()[-1]))
+            if ${py trace}:
+                ino = machine.succeed("stat -c %i /tank/fs/file").strip()
+                trace = machine.succeed("cat /sys/kernel/tracing/trace")
+                print(f"TRACE round {i} ino {ino}\n{trace}")
+                with open(os.path.join(out, f"trace-{i}.txt"), "w") as f:
+                    f.write(f"ino {ino} {int(ino):x}\n" + trace)
+        held = [
+            r for r in runs
+            if r["cached"] and r["writer_ms"] >= ${toString (holdMs * 8 / 10)} and r["fadvise_done_ms"] < r["writer_ms"]
+        ]
+        wrong = [r for r in runs if r["pread_wrong"] or r["mmap_wrong"]]
+        save({
+            "name": "${name}",
+            "variant": "${variant}",
+            "scene": "subpage",
+            "read_ahead_kb": ${if readAheadKB == null then "None" else toString readAheadKB},
+            "rounds": len(runs),
+            "held": len(held),
+            "wrong": len(wrong),
+            "expect_wrong": ${py expectWrong},
+            "runs": runs,
+        })
+        assert len(held) * 2 >= len(runs), f"the write was held across WILLNEED in only {len(held)} of {len(runs)} rounds"
+        if ${py expectWrong}:
+            assert len(wrong) * 2 >= len(held), f"only {len(wrong)} of {len(held)} held rounds read back other bytes"
+        else:
+            assert not wrong, f"{len(wrong)} of {len(runs)} rounds read back other bytes: {wrong[0]}"
 
     else:
         datasets = {

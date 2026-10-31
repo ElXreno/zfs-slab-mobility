@@ -9,9 +9,12 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"os"
+	"os/exec"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 const (
@@ -35,8 +38,8 @@ func fadvise(fd int, off, length int64, advice int) error {
 }
 
 func report(out *os.File, format string, args ...any) {
-	fmt.Fprintf(out, format+"\n", args...)
-	out.Sync()
+	_, _ = fmt.Fprintf(out, format+"\n", args...)
+	_ = out.Sync()
 }
 
 // Writers rewrite 64K at random offsets while readers drop a 4M span from the
@@ -96,10 +99,10 @@ func deadlock(path, result string, writers, readers, seconds, stall int) error {
 			r := rand.New(rand.NewPCG(uint64(rd)+101, 0xbf58476d1ce4e5b9))
 			for {
 				off := r.Int64N((deadlockSize-deadlockSpan)/page) * page
-				syscall.Madvise(m[off:off+deadlockSpan], madvDontneed)
-				fadvise(fd, off, deadlockSpan, fadvDontneed)
+				_ = syscall.Madvise(m[off:off+deadlockSpan], madvDontneed)
+				_ = fadvise(fd, off, deadlockSpan, fadvDontneed)
 				sink.Add(uint64(m[off]))
-				fadvise(fd, off, deadlockSpan, fadvWillneed)
+				_ = fadvise(fd, off, deadlockSpan, fadvWillneed)
 				readaheads.Add(1)
 			}
 		}()
@@ -128,7 +131,7 @@ func deadlock(path, result string, writers, readers, seconds, stall int) error {
 
 func majorFaults() int64 {
 	var ru syscall.Rusage
-	syscall.Getrusage(syscall.RUSAGE_SELF, &ru)
+	_ = syscall.Getrusage(syscall.RUSAGE_SELF, &ru)
 	return ru.Majflt
 }
 
@@ -153,11 +156,107 @@ func sum(paths []string) error {
 				return fmt.Errorf("%s: %w", path, err)
 			}
 			h.Write(m)
-			syscall.Munmap(m)
+			_ = syscall.Munmap(m)
 		}
-		f.Close()
+		_ = f.Close()
 		fmt.Printf("%s  %s  %d\n", hex.EncodeToString(h.Sum(nil)), path, majorFaults()-before)
 	}
+	return nil
+}
+
+// A 512 byte write held in the read-modify-write of a cold record while
+// WILLNEED reads that record ahead, then the page written into compared,
+// through the mapping and through pread(), with what the file has to hold.
+// The page that makes WILLNEED reach the page cache is in the next record,
+// so the first one stays cold for the write.
+func subpage(path, orig, inject string, holdMs int) error {
+	const (
+		record = 128 << 10
+		span   = 2 * record
+		at     = 1000
+		size   = 512
+	)
+	want, err := os.ReadFile(orig)
+	if err != nil {
+		return err
+	}
+	for i := at; i < at+size; i++ {
+		want[i] = 'W'
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	fd := int(f.Fd())
+	m, err := syscall.Mmap(fd, 0, span, syscall.PROT_READ, syscall.MAP_SHARED)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = syscall.Munmap(m) }()
+	if err := syscall.Madvise(m, madvRandom); err != nil {
+		return err
+	}
+	var sink atomic.Uint64
+	sink.Add(uint64(m[span-page]))
+	resident := []byte{0}
+	if _, _, e := syscall.Syscall(syscall.SYS_MINCORE, uintptr(unsafe.Pointer(&m[span-page])),
+		page, uintptr(unsafe.Pointer(&resident[0]))); e != 0 {
+		return e
+	}
+
+	run := func(cmd string) error {
+		args := strings.Fields(cmd)
+		out, err := exec.Command(args[0], args[1:]...).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("%s: %w: %s", cmd, err, out)
+		}
+		return nil
+	}
+	if err := run(inject); err != nil {
+		return err
+	}
+	pool := strings.Fields(inject)[len(strings.Fields(inject))-1]
+
+	t0 := time.Now()
+	done := make(chan time.Duration, 1)
+	go func() {
+		buf := make([]byte, size)
+		for i := range buf {
+			buf[i] = 'W'
+		}
+		if _, err := f.WriteAt(buf, at); err != nil {
+			fmt.Fprintln(os.Stderr, "pwrite:", err)
+			os.Exit(1)
+		}
+		done <- time.Since(t0)
+	}()
+	time.Sleep(time.Duration(holdMs/4) * time.Millisecond)
+	fadviseAt := time.Since(t0)
+	if err := fadvise(fd, 0, span, fadvWillneed); err != nil {
+		return err
+	}
+	fadviseDone := time.Since(t0)
+	writer := <-done
+	if err := run("zinject -c all"); err != nil {
+		return err
+	}
+
+	got := make([]byte, page)
+	if _, err := f.ReadAt(got, 0); err != nil {
+		return err
+	}
+	diff := func(b []byte) int {
+		n := 0
+		for i := range page {
+			if b[i] != want[i] {
+				n++
+			}
+		}
+		return n
+	}
+	fmt.Printf("{\"pool\": %q, \"cached\": %t, \"writer_ms\": %d, \"fadvise_at_ms\": %d, \"fadvise_done_ms\": %d, \"pread_wrong\": %d, \"mmap_wrong\": %d}\n",
+		pool, resident[0]&1 == 1, writer.Milliseconds(), fadviseAt.Milliseconds(), fadviseDone.Milliseconds(), diff(got), diff(m[:page]))
 	return nil
 }
 
@@ -167,8 +266,11 @@ func main() {
 	seconds := flag.Int("seconds", 120, "deadlock: how long to run")
 	stall := flag.Int("stall", 20, "deadlock: seconds without progress that count as a hang")
 	result := flag.String("result", "/run/mmapcheck.result", "deadlock: progress and verdict")
+	orig := flag.String("orig", "", "subpage: copy of the file kept outside the pool")
+	inject := flag.String("inject", "", "subpage: zinject command that delays reads of the pool")
+	hold := flag.Int("hold", 1000, "subpage: read delay the inject command sets, ms")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: mmapcheck [flags] deadlock FILE | sum FILE...\n")
+		fmt.Fprintf(os.Stderr, "usage: mmapcheck [flags] deadlock FILE | sum FILE... | subpage FILE\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -179,6 +281,8 @@ func main() {
 		err = deadlock(args[1], *result, *writers, *readers, *seconds, *stall)
 	case len(args) >= 2 && args[0] == "sum":
 		err = sum(args[1:])
+	case len(args) == 2 && args[0] == "subpage" && *orig != "" && *inject != "":
+		err = subpage(args[1], *orig, *inject, *hold)
 	default:
 		flag.Usage()
 		os.Exit(2)

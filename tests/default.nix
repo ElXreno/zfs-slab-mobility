@@ -132,6 +132,7 @@ let
           value = mkZplReadahead {
             inherit variant seed;
             scene = "deadlock";
+            expectStall = variant == "stock";
           };
         }) seeds
       ) [
@@ -168,6 +169,18 @@ let
       readAheadKB = 1024;
     };
   };
+
+  zplSubpageRuns = lib.genAttrs [
+    "stockLtsRaNoGuard"
+    "stockLtsRa"
+    "stockRaNoGuard"
+    "stockRa"
+    "arclru"
+  ] (variant: mkZplReadahead {
+    inherit variant;
+    scene = "subpage";
+    expectWrong = variant == "stockLtsRaNoGuard";
+  });
 
   mkExecStart = import ./exec-start.nix { inherit pkgs variants; };
 
@@ -739,8 +752,13 @@ let
 
     # A readahead batch against writers to the same file, openzfs/zfs#19447.
     zpl-readahead-deadlock = collect "zpl-readahead-deadlock" zplDeadlockRuns ''
-      ["run", "verdict", "blocked_tasks", "last_progress"],
-      (.[] | [.name, .verdict, .blocked_tasks, .last_progress]) | @tsv'';
+      ["run", "verdict", "blocked_tasks", "expect_stall", "last_progress"],
+      (.[] | [.name, .verdict, .blocked_tasks, .expect_stall, .last_progress]) | @tsv'';
+
+    # A partial write held while WILLNEED reads its record ahead, then the page it wrote into.
+    zpl-readahead-subpage = collect "zpl-readahead-subpage" zplSubpageRuns ''
+      ["run", "rounds", "held", "wrong", "expect_wrong"],
+      (.[] | [.name, .rounds, .held, .wrong, .expect_wrong]) | @tsv'';
 
     # The bytes a readahead batch fills against read(), across record sizes and file shapes.
     zpl-readahead-bytes = collect "zpl-readahead-bytes" zplBytesRuns ''

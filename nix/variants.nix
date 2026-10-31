@@ -33,8 +33,11 @@ let
       kasan ? false,
       zfsDebug ? false,
       zplReadahead ? false,
+      updatePagesGuard ? false,
       # The kernel the hung desktop runs, working set protection included.
       xanmod ? false,
+      # Before 6.14 read_pages() keeps the pages ->readahead() left untaken.
+      lts ? false,
     }:
     let
       extraPatches =
@@ -45,12 +48,25 @@ let
       # Boot-time shuffling of object and page placement, none of it switchable at runtime.
       deterministic = {
         SLAB_FREELIST_RANDOM = lib.mkForce lib.kernel.no;
-        KMALLOC_PARTITION_CACHES = lib.mkForce lib.kernel.no;
-        KMALLOC_PARTITION_RANDOM = lib.mkForce lib.kernel.unset;
         SHUFFLE_PAGE_ALLOCATOR = lib.mkForce lib.kernel.no;
-      };
+      }
+      // (
+        if lts then
+          { RANDOM_KMALLOC_CACHES = lib.mkForce lib.kernel.no; }
+        else
+          {
+            KMALLOC_PARTITION_CACHES = lib.mkForce lib.kernel.no;
+            KMALLOC_PARTITION_RANDOM = lib.mkForce lib.kernel.unset;
+          }
+      );
 
-      base = if xanmod then pkgs.linux_xanmod_latest else pkgs.linux_7_2;
+      base =
+        if xanmod then
+          pkgs.linux_xanmod_latest
+        else if lts then
+          pkgs.linux_6_12
+        else
+          pkgs.linux_7_2;
 
       standConfig =
           deterministic
@@ -118,6 +134,7 @@ let
         )
         ++ lib.optional noKswapdWake patches.zfs.each.no-kswapd-wake
         ++ lib.optional deadlockInject patches.zfs.each.arc-lru-deadlock-inject
+        ++ lib.optional updatePagesGuard patches.zfs.each.update-pages-unfilled
         ++ lib.optionals zplReadahead [
           patches.zfs.each.zpl-readahead-batch
           patches.zfs.each.zpl-readahead-default
@@ -217,5 +234,22 @@ in
   stockXanmod = mkVariant { xanmod = true; };
 
   # Readahead filled per block instead of per page, on stock; the backend carries it in its series.
-  stockRa = mkVariant { zplReadahead = true; };
+  stockRa = mkVariant {
+    zplReadahead = true;
+    updatePagesGuard = true;
+  };
+
+  stockRaNoGuard = mkVariant { zplReadahead = true; };
+
+  # The same on 6.12, where untaken readahead pages stay in the cache.
+  stockLtsRa = mkVariant {
+    lts = true;
+    zplReadahead = true;
+    updatePagesGuard = true;
+  };
+
+  stockLtsRaNoGuard = mkVariant {
+    lts = true;
+    zplReadahead = true;
+  };
 }
