@@ -1,5 +1,5 @@
 {
-  description = "Measuring and fixing the memory fragmentation ZFS causes on Linux";
+  description = "Patches and VM tests for smoother OpenZFS behaviour under Linux memory management";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
