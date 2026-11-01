@@ -1,4 +1,4 @@
-From eb075a09773df90c428636513b1f958d25faf037 Mon Sep 17 00:00:00 2001
+From 2489268a1b37bdeca3ce0a11540ac312d6aef339 Mon Sep 17 00:00:00 2001
 From: ElXreno <elxreno@gmail.com>
 Date: Fri, 30 Oct 2026 17:07:48 +0300
 Subject: [PATCH] Linux: fill a readahead batch from one hold of its dbufs
@@ -27,15 +27,18 @@ someone else holds it, or a hold fails, the pages not taken yet are left
 to the kernel, and a fault that needs one comes back through
 zfs_getpage(), which waits for the lock with its page unlocked. Since
 6.14 read_pages() drops those pages; before that it keeps them, not up
-to date, which update_pages() has to leave to their filler. Pages past
-the end of the file are zeroed as zfs_fillpage() does. A file of one
-block whose size is not a power of two is left to zfs_getpage(), since
-that block cannot be held past its own end.
+to date, which update_pages() and zfs_zero_partial_page() have to leave
+to their filler. Pages past the end of the file are zeroed as
+zfs_fillpage() does, and so is the rest of a file of a single block
+whose size is not a power of two, which cannot be held past the end of
+that block.
+
+Signed-off-by: ElXreno <elxreno@gmail.com>
 ---
  include/os/linux/zfs/sys/zfs_vnops_os.h |   4 +
- module/os/linux/zfs/zfs_vnops_os.c      | 102 ++++++++++++++++++++++++
+ module/os/linux/zfs/zfs_vnops_os.c      | 103 ++++++++++++++++++++++++
  module/os/linux/zfs/zpl_file.c          |  15 +---
- 3 files changed, 110 insertions(+), 11 deletions(-)
+ 3 files changed, 111 insertions(+), 11 deletions(-)
 
 diff --git a/include/os/linux/zfs/sys/zfs_vnops_os.h b/include/os/linux/zfs/sys/zfs_vnops_os.h
 index b41ffcc..30285e8 100644
@@ -53,7 +56,7 @@ index b41ffcc..30285e8 100644
      struct writeback_control *wbc, boolean_t for_sync);
  extern int zfs_dirty_inode(struct inode *ip, int flags);
 diff --git a/module/os/linux/zfs/zfs_vnops_os.c b/module/os/linux/zfs/zfs_vnops_os.c
-index 3ba997b..831e2e2 100644
+index 3ba997b..d68b3f7 100644
 --- a/module/os/linux/zfs/zfs_vnops_os.c
 +++ b/module/os/linux/zfs/zfs_vnops_os.c
 @@ -71,6 +71,7 @@
@@ -64,7 +67,7 @@ index 3ba997b..831e2e2 100644
  
  /*
   * Programming rules.
-@@ -4292,6 +4293,107 @@ zfs_getpage(struct inode *ip, struct page *pp)
+@@ -4292,6 +4293,108 @@ zfs_getpage(struct inode *ip, struct page *pp)
  	return (error);
  }
  
@@ -79,9 +82,6 @@ index 3ba997b..831e2e2 100644
 + * contention, or anything else in the way, the pages not yet filled are
 + * left where they are, untaken. Every page taken from the batch is filled
 + * and marked up to date, so none is left behind locked out of its data.
-+ *
-+ * A file of a single block that is not a power of two in size is left to
-+ * zfs_getpage() as well: such a block cannot be held past its own end.
 + */
 +void
 +zfs_getpages(struct inode *ip, struct readahead_control *ractl)
@@ -101,9 +101,14 @@ index 3ba997b..831e2e2 100644
 +	if (lr == NULL)
 +		goto out;
 +
++	/*
++	 * A file of a single block whose size is not a power of two cannot
++	 * be held past the end of that block: read zeroes there, as
++	 * dmu_read() does.
++	 */
 +	isize = i_size_read(ip);
-+	if (off < isize && !ISP2(zp->z_blksz))
-+		goto unlock;
++	if (!ISP2(zp->z_blksz))
++		isize = MIN(isize, zp->z_blksz);
 +
 +	while (off < stop) {
 +		uint64_t limit = MIN(stop, off + DMU_MAX_ACCESS / 2);
@@ -162,7 +167,6 @@ index 3ba997b..831e2e2 100644
 +
 +	if (filled > 0)
 +		dataset_kstats_update_read_kstats(&zfsvfs->z_kstat, filled);
-+unlock:
 +	zfs_rangelock_exit(lr);
 +out:
 +	zfs_exit(zfsvfs, FTAG);

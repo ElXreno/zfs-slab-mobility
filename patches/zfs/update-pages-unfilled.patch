@@ -1,4 +1,4 @@
-From 9e60ab8bab35e703aa6e5f7153969b0e80c9ac77 Mon Sep 17 00:00:00 2001
+From 53233e159bec35e1973a39ff1c5732ad39fd1461 Mon Sep 17 00:00:00 2001
 From: Tigerblue77 <37409593+tigerblue77@users.noreply.github.com>
 Date: Mon, 19 Oct 2026 15:01:37 +0000
 Subject: [PATCH] Linux: leave unfilled pages to their filler in update_pages()
@@ -21,10 +21,17 @@ our callers hold as writer, so the filler reads this write from the
 DMU once it is done.  This is also needed before readahead may stop
 early on range lock contention.
 
+zfs_zero_partial_page() zeroes part of a cached page and marks the
+whole page up to date in the same way, for a hole punched in the file
+and for the last page past the end of the file before the file is
+extended.  Skip such a page there too; its filler reads the zeroes
+from the DMU.
+
 Signed-off-by: Tigerblue77 <37409593+tigerblue77@users.noreply.github.com>
 ---
  module/os/linux/zfs/zfs_vnops_os.c | 11 +++++++++++
- 1 file changed, 11 insertions(+)
+ module/os/linux/zfs/zfs_znode_os.c | 10 ++++++++++
+ 2 files changed, 21 insertions(+)
 
 diff --git a/module/os/linux/zfs/zfs_vnops_os.c b/module/os/linux/zfs/zfs_vnops_os.c
 index cb6321e..3ba997b 100644
@@ -48,6 +55,27 @@ index cb6321e..3ba997b 100644
  		if (pp) {
  			if (mapping_writably_mapped(mp))
  				flush_dcache_page(pp);
+diff --git a/module/os/linux/zfs/zfs_znode_os.c b/module/os/linux/zfs/zfs_znode_os.c
+index dd6bd21..271e668 100644
+--- a/module/os/linux/zfs/zfs_znode_os.c
++++ b/module/os/linux/zfs/zfs_znode_os.c
+@@ -1580,6 +1580,16 @@ zfs_zero_partial_page(znode_t *zp, uint64_t start, uint64_t len)
+ 	start &= PAGE_MASK;
+ 
+ 	pp = find_lock_page(mp, start >> PAGE_SHIFT);
++	if (pp != NULL && !PageUptodate(pp) && !PageDirty(pp)) {
++		/*
++		 * Nobody has filled this page yet.  Its filler needs the
++		 * range lock our caller holds as writer, so it will read
++		 * the zeroes from the DMU instead.
++		 */
++		unlock_page(pp);
++		put_page(pp);
++		pp = NULL;
++	}
+ 	if (pp) {
+ 		if (mapping_writably_mapped(mp))
+ 			flush_dcache_page(pp);
 -- 
 2.56.0
 
