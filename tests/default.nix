@@ -182,6 +182,32 @@ let
     expectWrong = variant == "stockLtsRaNoGuard";
   });
 
+  zplZeroPageRuns = lib.listToAttrs (
+    lib.concatMap
+      (variant: [
+        {
+          name = variant;
+          value = mkZplReadahead {
+            inherit variant;
+            scene = "zeropage";
+          };
+        }
+        {
+          name = "${variant}-inject";
+          value = mkZplReadahead {
+            inherit variant;
+            scene = "zeropage";
+            inject = true;
+          };
+        }
+      ])
+      [
+        "stockLts"
+        "stockLtsRa"
+        "stockRa"
+      ]
+  );
+
   mkExecStart = import ./exec-start.nix { inherit pkgs variants; };
 
   execStartRuns = lib.listToAttrs (
@@ -757,6 +783,11 @@ let
 
     # A partial write held while WILLNEED reads its record ahead, then the page it wrote into.
     zpl-readahead-subpage = collect "zpl-readahead-subpage" zplSubpageRuns ''
+      ["run", "rounds", "held", "wrong", "expect_wrong"],
+      (.[] | [.name, .rounds, .held, .wrong, .expect_wrong]) | @tsv'';
+
+    # WILLNEED over a small file, then a hole punched inside a page readahead may have left unfilled.
+    zpl-readahead-zeropage = collect "zpl-readahead-zeropage" zplZeroPageRuns ''
       ["run", "rounds", "held", "wrong", "expect_wrong"],
       (.[] | [.name, .rounds, .held, .wrong, .expect_wrong]) | @tsv'';
 

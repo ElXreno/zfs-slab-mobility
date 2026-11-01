@@ -241,6 +241,8 @@ in
 
   stockRaNoGuard = mkVariant { zplReadahead = true; };
 
+  stockLts = mkVariant { lts = true; };
+
   # The same on 6.12, where untaken readahead pages stay in the cache.
   stockLtsRa = mkVariant {
     lts = true;

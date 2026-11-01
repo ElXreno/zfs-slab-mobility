@@ -18,14 +18,16 @@ import (
 )
 
 const (
-	page          = 4096
-	fadvWillneed  = 3
-	fadvDontneed  = 4
-	madvRandom    = 1
-	madvDontneed  = 4
-	deadlockSize  = 64 << 20
-	deadlockWrite = 64 << 10
-	deadlockSpan  = 4 << 20
+	page            = 4096
+	fadvWillneed    = 3
+	fadvDontneed    = 4
+	madvRandom      = 1
+	madvDontneed    = 4
+	fallocKeepSize  = 0x01
+	fallocPunchHole = 0x02
+	deadlockSize    = 64 << 20
+	deadlockWrite   = 64 << 10
+	deadlockSpan    = 4 << 20
 )
 
 func fadvise(fd int, off, length int64, advice int) error {
@@ -164,6 +166,24 @@ func sum(paths []string) error {
 	return nil
 }
 
+func run(cmd string) error {
+	args := strings.Fields(cmd)
+	out, err := exec.Command(args[0], args[1:]...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s: %w: %s", cmd, err, out)
+	}
+	return nil
+}
+
+func resident(b []byte) (bool, error) {
+	vec := []byte{0}
+	if _, _, e := syscall.Syscall(syscall.SYS_MINCORE, uintptr(unsafe.Pointer(&b[0])),
+		page, uintptr(unsafe.Pointer(&vec[0]))); e != 0 {
+		return false, e
+	}
+	return vec[0]&1 == 1, nil
+}
+
 // A 512 byte write held in the read-modify-write of a cold record while
 // WILLNEED reads that record ahead, then the page written into compared,
 // through the mapping and through pread(), with what the file has to hold.
@@ -199,20 +219,11 @@ func subpage(path, orig, inject string, holdMs int) error {
 	}
 	var sink atomic.Uint64
 	sink.Add(uint64(m[span-page]))
-	resident := []byte{0}
-	if _, _, e := syscall.Syscall(syscall.SYS_MINCORE, uintptr(unsafe.Pointer(&m[span-page])),
-		page, uintptr(unsafe.Pointer(&resident[0]))); e != 0 {
-		return e
+	cached, err := resident(m[span-page:])
+	if err != nil {
+		return err
 	}
 
-	run := func(cmd string) error {
-		args := strings.Fields(cmd)
-		out, err := exec.Command(args[0], args[1:]...).CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("%s: %w: %s", cmd, err, out)
-		}
-		return nil
-	}
 	if err := run(inject); err != nil {
 		return err
 	}
@@ -256,7 +267,97 @@ func subpage(path, orig, inject string, holdMs int) error {
 		return n
 	}
 	fmt.Printf("{\"pool\": %q, \"cached\": %t, \"writer_ms\": %d, \"fadvise_at_ms\": %d, \"fadvise_done_ms\": %d, \"pread_wrong\": %d, \"mmap_wrong\": %d}\n",
-		pool, resident[0]&1 == 1, writer.Milliseconds(), fadviseAt.Milliseconds(), fadviseDone.Milliseconds(), diff(got), diff(m[:page]))
+		pool, cached, writer.Milliseconds(), fadviseAt.Milliseconds(), fadviseDone.Milliseconds(), diff(got), diff(m[:page]))
+	return nil
+}
+
+// WILLNEED over a file of one block that is not a power of two, then a hole
+// punched inside its last page; with inject, a write into the second page
+// holds the range lock across WILLNEED.
+func zeropage(path, orig, inject string, holdMs int) error {
+	const (
+		writeAt  = page + 4
+		punchAt  = 2*page + 8
+		punchLen = 50
+	)
+	want, err := os.ReadFile(orig)
+	if err != nil {
+		return err
+	}
+	size := len(want)
+	if size < punchAt+punchLen+1 || size > 3*page {
+		return fmt.Errorf("%s: %d bytes, want one ending inside the third page", orig, size)
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	fd := int(f.Fd())
+	m, err := syscall.Mmap(fd, 0, size, syscall.PROT_READ, syscall.MAP_SHARED)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = syscall.Munmap(m) }()
+	if err := syscall.Madvise(m, madvRandom); err != nil {
+		return err
+	}
+	var sink atomic.Uint64
+	sink.Add(uint64(m[0]))
+	cached, err := resident(m)
+	if err != nil {
+		return err
+	}
+
+	t0 := time.Now()
+	done := make(chan time.Duration, 1)
+	if inject != "" {
+		if err := run(inject); err != nil {
+			return err
+		}
+		want[writeAt] = 'W'
+		go func() {
+			if _, err := f.WriteAt([]byte{'W'}, writeAt); err != nil {
+				fmt.Fprintln(os.Stderr, "pwrite:", err)
+				os.Exit(1)
+			}
+			done <- time.Since(t0)
+		}()
+		time.Sleep(time.Duration(holdMs/4) * time.Millisecond)
+	}
+	if err := fadvise(fd, 0, 0, fadvWillneed); err != nil {
+		return err
+	}
+	fadviseDone := time.Since(t0)
+	var writer time.Duration
+	if inject != "" {
+		writer = <-done
+		if err := run("zinject -c all"); err != nil {
+			return err
+		}
+	}
+	if err := syscall.Fallocate(fd, fallocPunchHole|fallocKeepSize, punchAt, punchLen); err != nil {
+		return err
+	}
+	for i := punchAt; i < punchAt+punchLen; i++ {
+		want[i] = 0
+	}
+
+	got := make([]byte, size)
+	if _, err := f.ReadAt(got, 0); err != nil {
+		return err
+	}
+	diff := func(b []byte) int {
+		n := 0
+		for i := range size {
+			if b[i] != want[i] {
+				n++
+			}
+		}
+		return n
+	}
+	fmt.Printf("{\"cached\": %t, \"writer_ms\": %d, \"fadvise_done_ms\": %d, \"pread_wrong\": %d, \"mmap_wrong\": %d}\n",
+		cached, writer.Milliseconds(), fadviseDone.Milliseconds(), diff(got), diff(m))
 	return nil
 }
 
@@ -266,11 +367,11 @@ func main() {
 	seconds := flag.Int("seconds", 120, "deadlock: how long to run")
 	stall := flag.Int("stall", 20, "deadlock: seconds without progress that count as a hang")
 	result := flag.String("result", "/run/mmapcheck.result", "deadlock: progress and verdict")
-	orig := flag.String("orig", "", "subpage: copy of the file kept outside the pool")
-	inject := flag.String("inject", "", "subpage: zinject command that delays reads of the pool")
-	hold := flag.Int("hold", 1000, "subpage: read delay the inject command sets, ms")
+	orig := flag.String("orig", "", "subpage, zeropage: copy of the file kept outside the pool")
+	inject := flag.String("inject", "", "subpage, zeropage: zinject command that delays reads of the pool")
+	hold := flag.Int("hold", 1000, "subpage, zeropage: read delay the inject command sets, ms")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: mmapcheck [flags] deadlock FILE | sum FILE... | subpage FILE\n")
+		fmt.Fprintf(os.Stderr, "usage: mmapcheck [flags] deadlock FILE | sum FILE... | subpage FILE | zeropage FILE\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -283,6 +384,8 @@ func main() {
 		err = sum(args[1:])
 	case len(args) == 2 && args[0] == "subpage" && *orig != "" && *inject != "":
 		err = subpage(args[1], *orig, *inject, *hold)
+	case len(args) == 2 && args[0] == "zeropage" && *orig != "":
+		err = zeropage(args[1], *orig, *inject, *hold)
 	default:
 		flag.Usage()
 		os.Exit(2)

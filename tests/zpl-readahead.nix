@@ -20,15 +20,19 @@
   trace ? false,
   expectWrong ? false,
   expectStall ? false,
+  inject ? false,
 }:
 
 let
   name =
     "zpl-readahead-${scene}-${variant}"
+    + lib.optionalString inject "-inject"
     + lib.optionalString (readAheadKB != null) "-ra${toString readAheadKB}"
     + "-seed${toString seed}";
 
   py = b: if b then "True" else "False";
+
+  injectArg = lib.optionalString inject " -inject 'zinject -d vdb -D ${toString holdMs}:1 -T read tank'";
 in
 (pkgs.testers.runNixOSTest {
   inherit name;
@@ -169,6 +173,46 @@ in
             "runs": runs,
         })
         assert len(held) * 2 >= len(runs), f"the write was held across WILLNEED in only {len(held)} of {len(runs)} rounds"
+        if ${py expectWrong}:
+            assert len(wrong) * 2 >= len(held), f"only {len(wrong)} of {len(held)} held rounds read back other bytes"
+        else:
+            assert not wrong, f"{len(wrong)} of {len(runs)} rounds read back other bytes: {wrong[0]}"
+
+    elif "${scene}" == "zeropage":
+        machine.succeed("zfs create -o recordsize=128k -o compression=off -o atime=off -o primarycache=metadata tank/fs")
+        runs = []
+        for _ in range(${toString rounds}):
+            machine.succeed(
+                "head -c 8292 /dev/urandom > /run/orig.bin && cp /run/orig.bin /tank/fs/file"
+                " && sync && zpool sync tank && zpool export tank && zpool import -d /dev tank"
+            )
+            set_readahead()
+            blksz = int(machine.succeed("stat -c %o /tank/fs/file").strip())
+            line = machine.succeed(
+                f"{BIN}/mmapcheck -orig /run/orig.bin -hold ${toString holdMs}${injectArg} zeropage /tank/fs/file",
+                timeout=120,
+            )
+            res = json.loads(line.strip().splitlines()[-1])
+            res["blksz"] = blksz
+            runs.append(res)
+        if ${py inject}:
+            held = [r for r in runs if r["cached"] and r["writer_ms"] >= ${toString (holdMs * 8 / 10)}]
+        else:
+            held = [r for r in runs if r["cached"]]
+        wrong = [r for r in runs if r["pread_wrong"] or r["mmap_wrong"]]
+        save({
+            "name": "${name}",
+            "variant": "${variant}",
+            "scene": "zeropage",
+            "inject": ${py inject},
+            "read_ahead_kb": ${if readAheadKB == null then "None" else toString readAheadKB},
+            "rounds": len(runs),
+            "held": len(held),
+            "wrong": len(wrong),
+            "expect_wrong": ${py expectWrong},
+            "runs": runs,
+        })
+        assert len(held) * 2 >= len(runs), f"the precondition held in only {len(held)} of {len(runs)} rounds"
         if ${py expectWrong}:
             assert len(wrong) * 2 >= len(held), f"only {len(wrong)} of {len(held)} held rounds read back other bytes"
         else:
