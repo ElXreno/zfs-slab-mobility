@@ -1,0 +1,68 @@
+From 531d8232b9f2c56f67694babf894ac19e4a7f4ef Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Wed, 11 Nov 2026 01:38:03 +0300
+Subject: [PATCH] abd: map the sg entry's own page, not its folio head
+
+abd_iter_map() and abd_iter_page() take the page from the folio that
+abd_sg_grab() referenced, which is the head of that folio. That equals
+sg_page() only when every entry starts at a folio head, as the chunks
+abd_alloc_chunks() makes do. abd_alloc_from_pages() builds its table from
+the pages of a Direct I/O request, and an entry starts wherever the user
+buffer does. Inside a transparent huge page that is a tail page, so the
+copy and the bio both address the head plus the offset, k pages below the
+buffer: a read leaves the last k pages of the entry untouched and
+overwrites k pages before it, a write sends the bytes k pages below. The
+checksum is computed through the same iterator and passes.
+
+Keep the reference and take the page from sg_page() again. The reference
+keeps the entry from being repointed: migration refuses a folio with an
+extra count, so sg_page() still names the page abd_sg_grab() checked.
+---
+ module/os/linux/zfs/abd_os.c | 13 ++-----------
+ 1 file changed, 2 insertions(+), 11 deletions(-)
+
+diff --git a/module/os/linux/zfs/abd_os.c b/module/os/linux/zfs/abd_os.c
+index 4471211..2d73e13 100644
+--- a/module/os/linux/zfs/abd_os.c
++++ b/module/os/linux/zfs/abd_os.c
+@@ -1786,10 +1786,8 @@ abd_iter_map(struct abd_iter *aiter)
+ 
+ #ifdef ABD_LRU
+ 		aiter->iter_folio = abd_sg_grab(aiter->iter_sg);
+-		struct page *page = &aiter->iter_folio->page;
+-#else
+-		struct page *page = sg_page(aiter->iter_sg);
+ #endif
++		struct page *page = sg_page(aiter->iter_sg);
+ 		if (PageHighMem(page)) {
+ 			page = nth_page(page, offset / PAGE_SIZE);
+ 			offset &= PAGE_SIZE - 1;
+@@ -1816,11 +1814,7 @@ abd_iter_unmap(struct abd_iter *aiter)
+ 	if (!abd_is_linear(aiter->iter_abd)) {
+ 		size_t offset = aiter->iter_offset;
+ 
+-#ifdef ABD_LRU
+-		struct page *page = &aiter->iter_folio->page;
+-#else
+ 		struct page *page = sg_page(aiter->iter_sg);
+-#endif
+ 		if (PageHighMem(page))
+ 			offset &= PAGE_SIZE - 1;
+ 
+@@ -2062,12 +2056,9 @@ abd_iter_page(struct abd_iter *aiter)
+ 		/* current scatter page */
+ #ifdef ABD_LRU
+ 		aiter->iter_folio = abd_sg_grab(aiter->iter_sg);
+-		page = nth_page(&aiter->iter_folio->page,
+-		    aiter->iter_offset >> PAGE_SHIFT);
+-#else
++#endif
+ 		page = nth_page(sg_page(aiter->iter_sg),
+ 		    aiter->iter_offset >> PAGE_SHIFT);
+-#endif
+ 
+ 		/* position within page */
+ 		doff = aiter->iter_offset & (PAGESIZE - 1);
+-- 
+2.56.0
+

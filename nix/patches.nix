@@ -44,6 +44,7 @@ let
     "update-pages-unfilled"
     "zpl-readahead-batch"
     "zpl-readahead-default"
+    "arc-folio-lru-dio-tail-pages"
   ];
 
   # The one probe that still applies on the folio backend.
@@ -74,6 +75,7 @@ let
       "update-pages-unfilled"
       "zpl-readahead-batch"
       "zpl-readahead-default"
+      "arc-folio-lru-dio-tail-pages"
     ];
 
   byName = builtins.listToAttrs (
