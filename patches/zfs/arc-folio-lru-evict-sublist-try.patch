@@ -1,0 +1,163 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Sun, 15 Nov 2026 10:28:16 +0300
+Subject: [PATCH] arc: take the sublists with a try when the kernel evicts a
+ buffer
+
+arc_lru_evict() runs under folio locks its caller holds. A reclaimer holds
+one, but release_folio is also reached from __folio_split() inside
+migrate_pages_batch(), which keeps every folio it has already unmapped
+locked. arc_evict_hdr() then moves the header to the ghost list, and
+arc_change_state() takes both sublists with mutex_enter(). The evict
+thread holds a sublist across up to zfs_arc_evict_batch_limit headers and
+frees each buffer under the folio locks of its chunks, so once it meets a
+folio of that batch neither of the two returns, and every allocation
+queues up in arc_wait_for_eviction(). A compact_memory writer and the
+evict thread of a guest with 8 GiB, random reads of 128K records and a
+second compaction loop, after 75 s:
+
+  == /proc/1657/task/1657 sh D
+  [<0>] multilist_remove+0x56/0xe0 [zfs]
+  [<0>] arc_change_state+0x184/0x4f0 [zfs]
+  [<0>] arc_evict_hdr+0x12b/0x2e0 [zfs]
+  [<0>] arc_lru_evict+0x1a0/0x2e0 [zfs]
+  [<0>] abd_lru_release_folio+0x2c8/0x3b0 [zfs]
+  [<0>] __folio_split+0x45f/0xb20
+  [<0>] migrate_pages_batch+0x471/0xf30
+  [<0>] migrate_pages_sync+0xa5/0x280
+  [<0>] migrate_pages+0xacd/0xb80
+  [<0>] compact_zone+0x6ac/0x10e0
+  [<0>] compact_node+0xb9/0x130
+  [<0>] sysctl_compaction_handler+0x82/0xf0
+  [<0>] proc_sys_call_handler+0x1ee/0x330
+  [<0>] vfs_write+0x281/0x560
+  [<0>] ksys_write+0x7b/0x110
+  [<0>] do_syscall_64+0x134/0x6b0
+  [<0>] entry_SYSCALL_64_after_hwframe+0x77/0x7f
+
+  == /proc/546/task/546 arc_evict D
+  [<0>] folio_wait_bit_common+0x15b/0x340
+  [<0>] abd_free_chunks+0x585/0x5c0 [zfs]
+  [<0>] abd_free+0x5c/0x210 [zfs]
+  [<0>] arc_hdr_free_abd+0x123/0x3e0 [zfs]
+  [<0>] arc_evict_hdr+0x110/0x2e0 [zfs]
+  [<0>] arc_evict_state_impl+0x180/0x360 [zfs]
+  [<0>] arc_evict_state+0x374/0x620 [zfs]
+  [<0>] arc_evict_cb+0x8f9/0x9b0 [zfs]
+  [<0>] zthr_procedure+0x138/0x150 [zfs]
+  [<0>] thread_generic_wrapper+0x5e/0x80 [spl]
+  [<0>] kthread+0xe4/0x120
+  [<0>] ret_from_fork+0x250/0x330
+  [<0>] ret_from_fork_asm+0x1a/0x30
+
+Take the sublist the header is on and the ghost sublist it goes to with
+multilist_sublist_trylock_obj() before evicting, so that multilist_remove()
+and multilist_insert() find them held, and leave the folio alone otherwise.
+A header of the uncached state is destroyed instead of moved, which for one
+on the l2arc takes l2ad_mtx: that is tried the same way. The refusal of a
+sublist held by the current task becomes a case of the first try.
+---
+ module/zfs/arc.c | 63 +++++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 52 insertions(+), 11 deletions(-)
+
+diff --git a/module/zfs/arc.c b/module/zfs/arc.c
+index 62e211b..b9cca64 100644
+--- a/module/zfs/arc.c
++++ b/module/zfs/arc.c
+@@ -4130,8 +4130,11 @@ arc_lru_evict(void *arg, abd_t *abd)
+ {
+ 	arc_buf_hdr_t *hdr = arg;
+ 	arc_state_t *state;
++	arc_buf_contents_t type;
++	multilist_sublist_t *from, *to = NULL;
++	l2arc_dev_t *dev = NULL;
+ 	abd_t *other;
+-	uint64_t evicted, real_evicted;
++	uint64_t evicted = 0, real_evicted;
+ 
+ 	ASSERT(MUTEX_HELD(HDR_LOCK(hdr)));
+ 
+@@ -4153,15 +4156,47 @@ arc_lru_evict(void *arg, abd_t *abd)
+ 	}
+ 
+ 	/*
+-	 * Reclaim entered from an allocation made while walking this very
+-	 * list, or the l2arc device list, with a neighbour pointer in hand.
++	 * Reclaim entered from an allocation made while walking the l2arc
++	 * device list, with a neighbour pointer in hand.
++	 */
++	if (HDR_HAS_L2HDR(hdr) &&
++	    MUTEX_HELD(&hdr->b_l2hdr.b_dev->l2ad_mtx)) {
++		ARCSTAT_BUMP(arcstat_lru_evict_held);
++		return (B_FALSE);
++	}
++
++	/*
++	 * Eviction takes the header off its list and puts it on the ghost
++	 * list, or destroys one of the uncached state, which for a header on
++	 * the l2arc takes the device list lock. The caller may hold folios of
++	 * other buffers, a migration batch does, and whoever holds one of
++	 * these locks may be waiting for such a folio, so each is taken here
++	 * with a try. That refuses as well a reclaim entered from an
++	 * allocation made while walking this very list.
+ 	 */
+-	if (multilist_sublist_held_obj(&state->arcs_list[arc_buf_type(hdr)],
+-	    hdr) || (HDR_HAS_L2HDR(hdr) &&
+-	    MUTEX_HELD(&hdr->b_l2hdr.b_dev->l2ad_mtx))) {
++	type = arc_buf_type(hdr);
++	from = multilist_sublist_trylock_obj(&state->arcs_list[type], hdr);
++	if (from == NULL) {
+ 		ARCSTAT_BUMP(arcstat_lru_evict_held);
+ 		return (B_FALSE);
+ 	}
++	if (state != arc_uncached) {
++		arc_state_t *ghost =
++		    (state == arc_mru) ? arc_mru_ghost : arc_mfu_ghost;
++
++		to = multilist_sublist_trylock_obj(&ghost->arcs_list[type],
++		    hdr);
++		if (to == NULL) {
++			ARCSTAT_BUMP(arcstat_lru_evict_held);
++			goto out;
++		}
++	} else if (HDR_HAS_L2HDR(hdr)) {
++		if (!mutex_tryenter(&hdr->b_l2hdr.b_dev->l2ad_mtx)) {
++			ARCSTAT_BUMP(arcstat_lru_evict_held);
++			goto out;
++		}
++		dev = hdr->b_l2hdr.b_dev;
++	}
+ 
+ 	/*
+ 	 * Eviction frees every buffer of the header, not just the one the page
+@@ -4176,19 +4211,25 @@ arc_lru_evict(void *arg, abd_t *abd)
+ 	    hdr->b_crypt_hdr.b_rabd : NULL;
+ 	if (!abd_lru_try_prelock(other)) {
+ 		ARCSTAT_BUMP(arcstat_lru_evict_busy);
+-		return (B_FALSE);
++		goto out;
+ 	}
+ 
+ 	evicted = arc_evict_hdr(hdr, &real_evicted);
+ 	if (evicted == 0) {
+ 		abd_lru_prelock_release(other);
+ 		ARCSTAT_BUMP(arcstat_lru_evict_skip);
+-		return (B_FALSE);
++	} else {
++		ARCSTAT_BUMP(arcstat_lru_evict);
++		ARCSTAT_INCR(arcstat_lru_evict_bytes, evicted);
+ 	}
+ 
+-	ARCSTAT_BUMP(arcstat_lru_evict);
+-	ARCSTAT_INCR(arcstat_lru_evict_bytes, evicted);
+-	return (B_TRUE);
++out:
++	if (dev != NULL)
++		mutex_exit(&dev->l2ad_mtx);
++	if (to != NULL)
++		multilist_sublist_unlock(to);
++	multilist_sublist_unlock(from);
++	return (evicted != 0);
+ }
+ 
+ static const abd_lru_ops_t arc_lru_ops = {

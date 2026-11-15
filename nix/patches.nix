@@ -45,6 +45,9 @@ let
     "zpl-readahead-batch"
     "zpl-readahead-default"
     "arc-folio-lru-dio-tail-pages"
+    "arc-folio-lru-evict-sublist-try"
+    "arc-folio-lru-evict-prelock"
+    "arc-folio-lru-mapping-gfp"
   ];
 
   # The one probe that still applies on the folio backend.
@@ -76,6 +79,9 @@ let
       "zpl-readahead-batch"
       "zpl-readahead-default"
       "arc-folio-lru-dio-tail-pages"
+      "arc-folio-lru-evict-sublist-try"
+      "arc-folio-lru-evict-prelock"
+      "arc-folio-lru-mapping-gfp"
     ];
 
   byName = builtins.listToAttrs (

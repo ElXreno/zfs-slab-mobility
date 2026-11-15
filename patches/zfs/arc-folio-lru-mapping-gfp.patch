@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Sun, 15 Nov 2026 10:29:09 +0300
+Subject: [PATCH] abd: keep allocations for the ARC mapping out of the
+ shrinker's wait
+
+__folio_split() allocates xarray nodes with the gfp mask of the mapping
+once release_folio has let a chunk of order 6 or more go, while the
+migration batch it runs in still holds its other folios. A new inode gets
+GFP_HIGHUSER_MOVABLE, and under __GFP_FS direct reclaim makes
+arc_shrinker_scan() wait for eviction, with those folios locked.
+
+Drop __GFP_FS from the mask of the mapping. Joining a buffer already
+allocates with GFP_NOIO, and nothing else allocates for this inode.
+---
+ module/os/linux/zfs/abd_os.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/module/os/linux/zfs/abd_os.c b/module/os/linux/zfs/abd_os.c
+index 7397006..711c7bc 100644
+--- a/module/os/linux/zfs/abd_os.c
++++ b/module/os/linux/zfs/abd_os.c
+@@ -1157,6 +1157,12 @@ abd_lru_init(void)
+ 	/* Indices are never reused, so a shadow of what left would only pile up. */
+ 	mapping_set_exiting(inode->i_mapping);
+ 	set_bit(AS_KERNEL_FILE, &inode->i_mapping->flags);
++	/*
++	 * A split allocates for the mapping while the migration batch it runs
++	 * in holds other folios: not with a mask the ARC shrinker waits under.
++	 */
++	mapping_set_gfp_mask(inode->i_mapping,
++	    mapping_gfp_mask(inode->i_mapping) & ~__GFP_FS);
+ 	atomic64_set(&abd_lru_next_index, 0);
+ 	abd_lru_inode = inode;
+ 	abd_lru_mapping = inode->i_mapping;

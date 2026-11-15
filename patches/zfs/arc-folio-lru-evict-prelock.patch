@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ElXreno <elxreno@gmail.com>
+Date: Sun, 15 Nov 2026 10:28:57 +0300
+Subject: [PATCH] arc: take a buffer's chunks with a try before evicting it
+
+The evict thread frees a buffer chunk by chunk, waiting for the folio lock
+of each with a sublist and the hash lock held. A folio stays locked for as
+long as its holder sleeps, and the holder can be a migration batch that
+keeps hundreds of them: it sleeps on the sublist when it evicts through
+release_folio, and when it allocates for a split with __GFP_FS it can end
+up in arc_shrinker_scan() waiting for the eviction that is waiting for its
+folio. Taking the sublists with a try closes the first of the two; the
+thread everything else queues behind should not depend on why a folio is
+held at all.
+
+Take every chunk of both buffers with abd_lru_try_prelock() before any of
+the header is given up, which is what the kernel side already does for the
+second buffer, and leave a header with a busy chunk for the next pass, as
+for a hash lock that is taken. The free path then finds the chunks held
+and waits for nothing. arc_lru_evict() arrives with all of them and says
+so. A header being written to the l2arc hands its buffers to the free on
+write list instead of freeing them and is left as it was.
+
+abd_lru_prelock_release() is now called for a buffer that may not be in
+the page cache, where the try took nothing, so it looks at who holds the
+mutex before it looks at the flag.
+---
+ module/os/linux/zfs/abd_os.c |  9 ++++++---
+ module/zfs/arc.c             | 30 +++++++++++++++++++++++++++---
+ 2 files changed, 33 insertions(+), 6 deletions(-)
+
+diff --git a/module/os/linux/zfs/abd_os.c b/module/os/linux/zfs/abd_os.c
+index 2d73e13..7397006 100644
+--- a/module/os/linux/zfs/abd_os.c
++++ b/module/os/linux/zfs/abd_os.c
+@@ -808,14 +808,17 @@ abd_lru_try_prelock(abd_t *abd)
+ 	return (B_TRUE);
+ }
+ 
+-/* Undoes a prelock the owner ended up not freeing. */
++/*
++ * Undoes a prelock the owner ended up not freeing. A buffer that was never in
++ * the page cache had nothing taken, so only the task holding it lets go.
++ */
+ void
+ abd_lru_prelock_release(abd_t *abd)
+ {
+-	if (abd == NULL || !(abd->abd_flags & ABD_FLAG_PRELOCKED))
++	if (abd == NULL || !MUTEX_HELD(&abd->abd_mtx) ||
++	    !(abd->abd_flags & ABD_FLAG_PRELOCKED))
+ 		return;
+ 
+-	ASSERT(MUTEX_HELD(&abd->abd_mtx));
+ 	abd->abd_flags &= ~ABD_FLAG_PRELOCKED;
+ 	abd_lru_unlock_siblings(abd, NULL, ABD_SCATTER(abd).abd_nents);
+ 	mutex_exit(&abd->abd_mtx);
+diff --git a/module/zfs/arc.c b/module/zfs/arc.c
+index b9cca64..33aaf17 100644
+--- a/module/zfs/arc.c
++++ b/module/zfs/arc.c
+@@ -3976,7 +3976,7 @@ arc_buf_destroy(arc_buf_t *buf, const void *tag)
+  * only the evicted headers size.
+  */
+ static int64_t
+-arc_evict_hdr(arc_buf_hdr_t *hdr, uint64_t *real_evicted)
++arc_evict_hdr(arc_buf_hdr_t *hdr, uint64_t *real_evicted, boolean_t prelocked)
+ {
+ 	arc_state_t *evicted_state, *state;
+ 	int64_t bytes_evicted = 0;
+@@ -4044,6 +4044,29 @@ arc_evict_hdr(arc_buf_hdr_t *hdr, uint64_t *real_evicted)
+ 		return (bytes_evicted);
+ 	}
+ 
++	/*
++	 * A buffer in the page cache is freed under the folio lock of every
++	 * chunk, and a folio stays locked for as long as its holder sleeps: a
++	 * migration batch keeps its folios across a wait for the sublist held
++	 * here, or for this eviction to finish. So nothing here waits for a
++	 * folio. The chunks of both buffers are taken with a try before any of
++	 * the header is given up, and a header with a busy chunk stays for the
++	 * next pass, like one whose hash lock is taken. The kernel side comes
++	 * with all of them held. A buffer being written to the l2arc is not
++	 * freed here but handed to the free on write list.
++	 */
++	if (!prelocked && !HDR_L2_WRITING(hdr)) {
++		abd_t *rabd = HDR_HAS_RABD(hdr) ?
++		    hdr->b_crypt_hdr.b_rabd : NULL;
++
++		if (!abd_lru_try_prelock(hdr->b_l1hdr.b_pabd))
++			return (bytes_evicted);
++		if (!abd_lru_try_prelock(rabd)) {
++			abd_lru_prelock_release(hdr->b_l1hdr.b_pabd);
++			return (bytes_evicted);
++		}
++	}
++
+ 	if (HDR_HAS_L2HDR(hdr)) {
+ 		ARCSTAT_INCR(arcstat_evict_l2_cached, HDR_GET_LSIZE(hdr));
+ 	} else {
+@@ -4214,7 +4237,7 @@ arc_lru_evict(void *arg, abd_t *abd)
+ 		goto out;
+ 	}
+ 
+-	evicted = arc_evict_hdr(hdr, &real_evicted);
++	evicted = arc_evict_hdr(hdr, &real_evicted, B_TRUE);
+ 	if (evicted == 0) {
+ 		abd_lru_prelock_release(other);
+ 		ARCSTAT_BUMP(arcstat_lru_evict_skip);
+@@ -4335,7 +4358,8 @@ arc_evict_state_impl(multilist_t *ml, int idx, arc_buf_hdr_t *marker,
+ 
+ 		if (mutex_tryenter(hash_lock)) {
+ 			uint64_t revicted;
+-			uint64_t evicted = arc_evict_hdr(hdr, &revicted);
++			uint64_t evicted = arc_evict_hdr(hdr, &revicted,
++			    B_FALSE);
+ 			mutex_exit(hash_lock);
+ 
+ 			bytes_evicted += evicted;

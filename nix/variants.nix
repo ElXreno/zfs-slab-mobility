@@ -38,6 +38,8 @@ let
       xanmod ? false,
       # Before 6.14 read_pages() keeps the pages ->readahead() left untaken.
       lts ? false,
+      # Patches of the folio backend series to leave out, by name.
+      without ? [ ],
     }:
     let
       extraPatches =
@@ -126,7 +128,14 @@ let
       zfsExtra =
         (
           if arcLru then
-            (if withProbes then patches.zfs.arclruWithProbes else patches.zfs.arclru)
+            (
+              if withProbes then
+                patches.zfs.arclruWithProbes
+              else if without == [ ] then
+                patches.zfs.arclru
+              else
+                map (name: patches.zfs.each.${name}) (lib.subtractLists without patches.zfs.names.arclru)
+            )
           else if slabMobilityZfs then
             (if withProbes then patches.zfs.withProbes else patches.zfs.relocation)
           else
@@ -185,6 +194,20 @@ in
     filemapExports = true;
     largeFolioCompaction = true;
     arcLru = true;
+  };
+
+  # The folio backend before eviction stopped waiting for locks the kernel
+  # side holds, which is what keeps the hang it fixed reproducible.
+  arclruEvictWait = mkVariant {
+    slabMobility = true;
+    filemapExports = true;
+    largeFolioCompaction = true;
+    arcLru = true;
+    without = [
+      "arc-folio-lru-evict-sublist-try"
+      "arc-folio-lru-evict-prelock"
+      "arc-folio-lru-mapping-gfp"
+    ];
   };
 
   # Relocation under KASAN. A bad-page report says only that the allocator
