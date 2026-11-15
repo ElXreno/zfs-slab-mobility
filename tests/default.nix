@@ -208,6 +208,29 @@ let
       ]
   );
 
+  mkEvictStall = import ./evict-stall.nix {
+    inherit
+      pkgs
+      lib
+      variants
+      fragload
+      fragcheck
+      ;
+  };
+
+  evictStallRuns = {
+    arclru = mkEvictStall { variant = "arclru"; };
+    arclru-sub4 = mkEvictStall {
+      variant = "arclru";
+      sublists = 4;
+    };
+    arclruEvictWait = mkEvictStall {
+      variant = "arclruEvictWait";
+      expectStall = true;
+    };
+    stock = mkEvictStall { variant = "stock"; };
+  };
+
   mkExecStart = import ./exec-start.nix { inherit pkgs variants; };
 
   execStartRuns = lib.listToAttrs (
@@ -775,6 +798,12 @@ let
     exec-start = collect "exec-start" execStartRuns ''
       ["run", "read_ahead_kb", "median_wall_s", "median_disk_mib", "median_majflt", "walls"],
       (.[] | [.name, .read_ahead_kb, .median_wall, (.median_disk_mib | floor), .median_majflt, (.walls | tostring)]) | @tsv'';
+
+    # A directory walk against database io on a full ARC, the SMOK hang of 2026-11-15.
+    evict-stall = collect "evict-stall" evictStallRuns ''
+      ["run", "verdict", "expect_stall", "phase", "seconds", "stuck_tasks", "folio_splits", "prelock_busy", "evict_held"],
+      (.[] | [.name, .verdict, .expect_stall, .phase, .seconds, .stuck_tasks, (.delta.folio_split_calls // 0),
+        (.delta.abd_lru_prelock_busy // 0), (.delta.lru_evict_held // 0)]) | @tsv'';
 
     # A readahead batch against writers to the same file, openzfs/zfs#19447.
     zpl-readahead-deadlock = collect "zpl-readahead-deadlock" zplDeadlockRuns ''
